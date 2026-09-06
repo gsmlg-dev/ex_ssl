@@ -7,7 +7,7 @@
 
 The OTP application is `:ex_ssl`. The public compatibility module is `SSL` (`Elixir.SSL`), which does not conflict with Erlang's built-in `:ssl` module.
 
-> **Status:** architecture / initial implementation. Do not treat `ex_ssl` as a production replacement for OTP `:ssl` until the compatibility and security milestones documented in this repository are complete.
+> **Status:** foundation subset. The repository is establishing the OTP application, pure protocol primitives, WireProfile validation, and compatibility-test scaffolding. It does not yet implement ClientHello serialization or TLS connection APIs. Do not treat `ex_ssl` as a production replacement for OTP `:ssl` until the compatibility and security milestones documented here are complete.
 
 ## Why ex_ssl?
 
@@ -55,6 +55,10 @@ SSL.connect(host, port,
   ]
 )
 ```
+
+## Runtime baseline
+
+The supported runtime baselines are Elixir 1.19 on Erlang/OTP 28 and Elixir 1.20 on Erlang/OTP 29. CI covers both tuples. OTP 29 remains the behavioral reference target for the implemented `:ssl`-compatible client feature subset.
 
 ## Compatibility target
 
@@ -287,4 +291,3 @@ Primary references:
 ## License
 
 TBD before public release.
-
