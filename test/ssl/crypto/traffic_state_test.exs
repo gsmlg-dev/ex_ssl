@@ -60,6 +60,26 @@ defmodule SSL.Crypto.TrafficStateTest do
              TrafficState.nonce(%{state | sequence: 0x10000000000000000})
   end
 
+  test "advances without wrapping and reports sequence exhaustion" do
+    state = %TrafficState{
+      secret: <<1>>,
+      key: <<2>>,
+      iv: <<0::96>>,
+      sequence: 7,
+      cipher_suite: :tls_aes_128_gcm_sha256
+    }
+
+    assert {:ok, %TrafficState{sequence: 8}} = TrafficState.advance(state)
+
+    assert {:error, :sequence_exhausted} =
+             TrafficState.advance(%{state | sequence: 0xFFFFFFFFFFFFFFFF})
+
+    assert {:error, {:invalid_sequence, :out_of_range}} =
+             TrafficState.advance(%{state | sequence: -1})
+
+    assert {:error, :invalid_traffic_state} = TrafficState.advance(nil)
+  end
+
   test "inspection redacts traffic secrets and derived key material" do
     state = %TrafficState{
       secret: "unique traffic secret",

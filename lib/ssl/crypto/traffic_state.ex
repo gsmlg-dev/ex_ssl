@@ -47,4 +47,15 @@ defmodule SSL.Crypto.TrafficState do
   def nonce(%__MODULE__{iv: iv, sequence: sequence})
       when is_binary(iv) and byte_size(iv) == 12 and not is_integer(sequence),
       do: {:error, {:invalid_sequence, :out_of_range}}
+
+  @spec advance(term()) :: {:ok, t()} | {:error, term()}
+  def advance(%__MODULE__{sequence: sequence} = state)
+      when is_integer(sequence) and sequence >= 0 and sequence < @maximum_sequence do
+    {:ok, %{state | sequence: sequence + 1}}
+  end
+
+  def advance(%__MODULE__{sequence: @maximum_sequence}), do: {:error, :sequence_exhausted}
+
+  def advance(%__MODULE__{}), do: {:error, {:invalid_sequence, :out_of_range}}
+  def advance(_state), do: {:error, :invalid_traffic_state}
 end
