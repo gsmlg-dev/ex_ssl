@@ -83,7 +83,7 @@ defmodule SSL.Protocol.RecordFramer do
 
   defp parse(%__MODULE__{frame_size: frame_size} = buffer, records, configured_limit) do
     data = buffered_bytes(buffer)
-    <<record::binary-size(frame_size), remainder::binary>> = data
+    <<record::binary-size(^frame_size), remainder::binary>> = data
     parse(from_binary(remainder), [record | records], configured_limit)
   end
 

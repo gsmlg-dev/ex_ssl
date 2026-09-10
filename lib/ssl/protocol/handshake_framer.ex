@@ -81,7 +81,7 @@ defmodule SSL.Protocol.HandshakeFramer do
 
   defp parse(%__MODULE__{frame_size: frame_size} = buffer, messages, max_length) do
     data = buffered_bytes(buffer)
-    <<message::binary-size(frame_size), remainder::binary>> = data
+    <<message::binary-size(^frame_size), remainder::binary>> = data
     parse(from_binary(remainder), [message | messages], max_length)
   end
 

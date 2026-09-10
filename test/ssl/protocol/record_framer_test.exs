@@ -15,7 +15,7 @@ defmodule SSL.Protocol.RecordFramerTest do
     record = <<22, 3, 3, 0, 7, "payload">>
 
     for split <- 0..byte_size(record) do
-      <<first::binary-size(split), second::binary>> = record
+      <<first::binary-size(^split), second::binary>> = record
 
       assert {[record], <<>>} == feed_chunks([first, second])
     end
@@ -112,7 +112,7 @@ defmodule SSL.Protocol.RecordFramerTest do
 
   defp fragment(data, [size | sizes]) do
     take = min(size, byte_size(data))
-    <<chunk::binary-size(take), remainder::binary>> = data
+    <<chunk::binary-size(^take), remainder::binary>> = data
     [chunk | fragment(remainder, sizes)]
   end
 end

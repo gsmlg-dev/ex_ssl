@@ -17,7 +17,7 @@ defmodule SSL.Protocol.HandshakeFramerTest do
     message = <<8, 0, 0, 7, "payload">>
 
     for split <- 0..byte_size(message) do
-      <<first::binary-size(split), second::binary>> = message
+      <<first::binary-size(^split), second::binary>> = message
 
       assert {[message], <<>>} == feed_chunks([first, second])
     end
@@ -106,7 +106,7 @@ defmodule SSL.Protocol.HandshakeFramerTest do
 
   defp fragment(data, [size | sizes]) do
     take = min(size, byte_size(data))
-    <<chunk::binary-size(take), remainder::binary>> = data
+    <<chunk::binary-size(^take), remainder::binary>> = data
     [chunk | fragment(remainder, sizes)]
   end
 end
