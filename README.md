@@ -7,7 +7,7 @@
 
 The OTP application is `:ex_ssl`. The public compatibility module is `SSL` (`Elixir.SSL`), which does not conflict with Erlang's built-in `:ssl` module.
 
-> **Status:** foundation subset. The repository is establishing the OTP application, pure protocol primitives, WireProfile validation, and compatibility-test scaffolding. It does not yet implement ClientHello serialization or TLS connection APIs. Do not treat `ex_ssl` as a production replacement for OTP `:ssl` until the compatibility and security milestones documented here are complete.
+> **Status:** foundation complete. The repository contains the OTP application, pure protocol primitives, WireProfile structural validation, and compatibility-test scaffolding. It does not yet implement ClientHello serialization, TLS connection APIs, or live interoperability. Do not treat `ex_ssl` as a production replacement for OTP `:ssl` until the compatibility and security milestones documented here are complete.
 
 ## Why ex_ssl?
 
@@ -233,7 +233,7 @@ The implementation uses OTP `:crypto` and `:public_key` for cryptographic primit
 
 ## Development status
 
-Development is organized into staged gates:
+The foundation gate is complete. Development continues through these staged gates:
 
 1. stream framing + transcript + HKDF;
 2. WireProfile + deterministic ClientHello;
@@ -266,13 +266,15 @@ Cryptographic and transcript operations are checked against independent known re
 
 Parsers are tested across arbitrary TCP, record, and handshake fragmentation boundaries.
 
-### Interoperability tests
+### Planned interoperability tests
 
-`ex_ssl` connects to independent TLS implementations such as OTP `:ssl` and OpenSSL.
+The compatibility harness is currently a skeleton. Future phases will connect
+`ex_ssl` to independent TLS implementations such as OTP `:ssl` and OpenSSL.
 
-### Differential compatibility tests
+### Planned differential compatibility tests
 
-Equivalent socket/API scenarios are run against `:ssl` and `SSL`, comparing externally visible behavior.
+Future phases will run equivalent socket/API scenarios against `:ssl` and `SSL`,
+comparing externally visible behavior.
 
 A compatibility claim is not complete until covered by tests.
 
