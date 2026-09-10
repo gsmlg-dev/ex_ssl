@@ -1,5 +1,6 @@
 defmodule SSL.ClientHello.ProfileTest do
   use ExUnit.Case, async: true
+  use ExUnitProperties
 
   alias SSL.ClientHello.{GreasePolicy, Profile, RecordPolicy, WireProfile}
 
@@ -68,6 +69,71 @@ defmodule SSL.ClientHello.ProfileTest do
 
     assert {:error, {:invalid_extension, {:unknown_extension, <<>>}}} =
              Profile.validate(profile, @capabilities)
+  end
+
+  test "rejects nil and false extensions without crashing" do
+    for extension <- [nil, false] do
+      profile = struct(WireProfile, extensions: [extension])
+
+      assert {:error, {:invalid_extension, ^extension}} =
+               Profile.validate(profile, @capabilities)
+    end
+  end
+
+  test "rejects malformed extension tuples and wrong arities" do
+    invalid_extensions = [
+      {},
+      {:alpn},
+      {:alpn, ["h2"], :extra},
+      {:raw, 0xFE0D},
+      {:raw, 0xFE0D, <<>>, :extra}
+    ]
+
+    for extension <- invalid_extensions do
+      profile = struct(WireProfile, extensions: [extension])
+
+      assert {:error, {:invalid_extension, ^extension}} =
+               Profile.validate(profile, @capabilities)
+    end
+  end
+
+  test "rejects non-list extensions" do
+    profile = struct(WireProfile, extensions: %{alpn: ["h2"]})
+
+    assert {:error, {:invalid_profile, :extensions}} =
+             Profile.validate(profile, @capabilities)
+  end
+
+  test "rejects malformed capability structures" do
+    invalid_capabilities = [
+      {nil, :structure},
+      {%{@capabilities | versions: :tlsv1_3}, :versions},
+      {%{@capabilities | ciphers: 0x1301}, :ciphers},
+      {%{@capabilities | groups: :x25519}, :groups},
+      {Map.put(@capabilities, :signature_algorithms, :all), :signature_algorithms},
+      {Map.put(@capabilities, :psk_key_exchange_modes, :all), :psk_key_exchange_modes},
+      {Map.put(@capabilities, :raw_extensions, [0x1_0000]), :raw_extensions},
+      {Map.put(@capabilities, :key_share_sizes, %{x25519: 0}), :key_share_sizes}
+    ]
+
+    profile = struct(WireProfile)
+
+    for {capabilities, field} <- invalid_capabilities do
+      assert {:error, {:invalid_capabilities, ^field}} =
+               Profile.validate(profile, capabilities)
+    end
+  end
+
+  property "bounded malformed extension inputs return tagged errors" do
+    check all(
+            extensions <- list_of(malformed_extension(), min_length: 1, max_length: 8),
+            max_runs: 100
+          ) do
+      profile = struct(WireProfile, extensions: extensions)
+
+      assert {:error, {:invalid_extension, _extension}} =
+               Profile.validate(profile, @capabilities)
+    end
   end
 
   test "rejects duplicate extension identities" do
@@ -280,5 +346,14 @@ defmodule SSL.ClientHello.ProfileTest do
 
   defp profile(attrs) do
     struct(WireProfile, Keyword.put_new(attrs, :cipher_suites, [0x1301]))
+  end
+
+  defp malformed_extension do
+    one_of([
+      member_of([nil, false, :not_a_tuple, {}, {:alpn}, {:raw, 0xFE0D}]),
+      map(binary(max_length: 8), &{:unknown_extension, &1}),
+      map(integer(-1_000..1_000), &{:supported_versions, &1}),
+      map(list_of(binary(max_length: 4), max_length: 4), &{:alpn, &1, :extra})
+    ])
   end
 end

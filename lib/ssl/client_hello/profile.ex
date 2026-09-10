@@ -158,10 +158,13 @@ defmodule SSL.ClientHello.Profile do
   defp valid_cipher_suites?(_cipher_suites), do: false
 
   defp validate_extension_shapes(extensions) do
-    case Enum.find(extensions, &(not valid_extension?(&1))) do
-      nil -> :ok
-      extension -> {:error, {:invalid_extension, extension}}
-    end
+    Enum.reduce_while(extensions, :ok, fn extension, :ok ->
+      if valid_extension?(extension) do
+        {:cont, :ok}
+      else
+        {:halt, {:error, {:invalid_extension, extension}}}
+      end
+    end)
   end
 
   defp valid_extension?({:server_name, :from_connection}), do: true
