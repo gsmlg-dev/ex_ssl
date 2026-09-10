@@ -9,9 +9,10 @@ defmodule SSL.ClientHello.WireProfile do
   alias SSL.ClientHello.{GreasePolicy, RecordPolicy}
 
   @type session_id_policy :: :random_32 | :empty | {:fixed, binary()}
-  @type cipher_suite :: atom() | 0..0xFFFF
-  @type version :: atom() | 0..0xFFFF
-  @type group :: atom() | 0..0xFFFF
+  @type grease_slot :: {:grease, atom()}
+  @type cipher_suite :: atom() | 0..0xFFFF | grease_slot()
+  @type version :: atom() | 0..0xFFFF | grease_slot()
+  @type group :: atom() | 0..0xFFFF | grease_slot()
 
   @type extension_spec ::
           {:server_name, :from_connection}
@@ -19,9 +20,9 @@ defmodule SSL.ClientHello.WireProfile do
           | {:ec_point_formats, [0..0xFF]}
           | {:signature_algorithms, [term()]}
           | {:signature_algorithms_cert, [term()]}
-          | {:alpn, [binary()]}
+          | {:alpn, [binary() | grease_slot()]}
           | {:supported_versions, [version()]}
-          | {:psk_key_exchange_modes, [term()]}
+          | {:psk_key_exchange_modes, [atom() | 0..0xFF | grease_slot()]}
           | {:key_share, [group()]}
           | {:pre_shared_key, term()}
           | {:padding, :none | non_neg_integer() | {:fixed, non_neg_integer()}}

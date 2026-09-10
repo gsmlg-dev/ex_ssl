@@ -44,7 +44,7 @@ defmodule SSL.ClientHello.Profile do
          :ok <- validate_duplicate_extensions(profile.extensions),
          :ok <- validate_pre_shared_key_position(profile.extensions),
          :ok <- validate_alpn(profile.extensions),
-         :ok <- validate_grease(profile.extensions),
+         :ok <- validate_grease(profile),
          :ok <- validate_raw_extensions(profile.extensions, capabilities),
          :ok <- validate_versions(profile.extensions, capabilities.versions),
          :ok <- validate_ciphers(profile.cipher_suites, capabilities.ciphers),
@@ -132,7 +132,7 @@ defmodule SSL.ClientHello.Profile do
          :ok <- require_profile(valid_cipher_suites?(profile.cipher_suites), :cipher_suites),
          :ok <- require_profile(profile.compression_methods == [0], :compression_methods),
          :ok <- require_profile(is_list(profile.extensions), :extensions),
-         :ok <- require_profile(profile.grease == %GreasePolicy{mode: :disabled}, :grease),
+         :ok <- require_profile(valid_grease_policy?(profile.grease), :grease),
          :ok <- require_profile(profile.record == %RecordPolicy{mode: :default}, :record) do
       :ok
     end
@@ -148,6 +148,14 @@ defmodule SSL.ClientHello.Profile do
     do: byte_size(session_id) <= 32
 
   defp valid_session_id?(_policy), do: false
+
+  defp valid_grease_policy?(%GreasePolicy{mode: :disabled}), do: true
+  defp valid_grease_policy?(%GreasePolicy{mode: :random}), do: true
+
+  defp valid_grease_policy?(%GreasePolicy{mode: {:deterministic, seed}}),
+    do: is_integer(seed) and seed >= 0
+
+  defp valid_grease_policy?(_policy), do: false
 
   defp valid_cipher_suites?(cipher_suites) when is_list(cipher_suites) do
     length(cipher_suites) in 1..32_767 and
@@ -200,6 +208,7 @@ defmodule SSL.ClientHello.Profile do
 
   defp protocol_identifier_list?(_values), do: false
 
+  defp valid_protocol_identifier?({:grease, slot}) when is_atom(slot), do: true
   defp valid_protocol_identifier?(value) when is_atom(value), do: true
   defp valid_protocol_identifier?(value), do: valid_uint16?(value)
 
@@ -217,7 +226,11 @@ defmodule SSL.ClientHello.Profile do
 
   defp uint8_vector?(values) when is_list(values) do
     length(values) in 1..255 and
-      Enum.all?(values, &(is_atom(&1) or (is_integer(&1) and &1 in 0..0xFF)))
+      Enum.all?(values, fn
+        {:grease, slot} when is_atom(slot) -> true
+        value when is_atom(value) -> true
+        value -> is_integer(value) and value in 0..0xFF
+      end)
   end
 
   defp uint8_vector?(_values), do: false
@@ -277,18 +290,56 @@ defmodule SSL.ClientHello.Profile do
   defp valid_alpn?([]), do: false
 
   defp valid_alpn?(protocols) do
-    Enum.all?(protocols, &(is_binary(&1) and byte_size(&1) in 1..255)) and
-      Enum.reduce(protocols, 0, fn protocol, size -> size + 1 + byte_size(protocol) end) <=
+    Enum.all?(protocols, fn
+      protocol when is_binary(protocol) -> byte_size(protocol) in 1..255
+      {:grease, slot} -> is_atom(slot)
+      _protocol -> false
+    end) and
+      Enum.reduce(protocols, 0, fn
+        protocol, size when is_binary(protocol) -> size + 1 + byte_size(protocol)
+        {:grease, _slot}, size -> size + 3
+      end) <=
         0xFFFF - 2
   end
 
-  defp validate_grease(extensions) do
-    if Enum.any?(extensions, &match?({:grease, _slot}, &1)) do
-      {:error, :grease_not_supported}
-    else
-      :ok
+  defp validate_grease(%WireProfile{} = profile) do
+    slots = grease_slots(profile)
+
+    cond do
+      slots != [] and profile.grease.mode == :disabled ->
+        {:error, :grease_not_supported}
+
+      length(Enum.uniq(slots)) > 16 ->
+        {:error, {:too_many_grease_slots, length(Enum.uniq(slots)), 16}}
+
+      true ->
+        :ok
     end
   end
+
+  defp grease_slots(profile) do
+    Enum.flat_map(profile.cipher_suites, &identifier_grease_slot/1) ++
+      Enum.flat_map(profile.extensions, &extension_grease_slots/1)
+  end
+
+  defp extension_grease_slots({:grease, slot}), do: [slot]
+
+  defp extension_grease_slots({tag, values})
+       when tag in [
+              :supported_groups,
+              :signature_algorithms,
+              :signature_algorithms_cert,
+              :alpn,
+              :supported_versions,
+              :psk_key_exchange_modes,
+              :key_share
+            ] and is_list(values),
+       do: Enum.flat_map(values, &identifier_grease_slot/1)
+
+  defp extension_grease_slots(_extension), do: []
+
+  defp identifier_grease_slot({:grease, slot}), do: [slot]
+  defp identifier_grease_slot(_identifier), do: []
 
   defp validate_raw_extensions(extensions, capabilities) do
     allowed = Map.get(capabilities, :raw_extensions, [])
@@ -316,11 +367,11 @@ defmodule SSL.ClientHello.Profile do
         _extension -> []
       end)
 
-    reject_unsupported(versions, supported_versions, :unsupported_versions)
+    reject_unsupported(without_grease(versions), supported_versions, :unsupported_versions)
   end
 
   defp validate_ciphers(cipher_suites, supported_ciphers) do
-    reject_unsupported(cipher_suites, supported_ciphers, :unsupported_ciphers)
+    reject_unsupported(without_grease(cipher_suites), supported_ciphers, :unsupported_ciphers)
   end
 
   defp validate_groups(extensions, supported_groups) do
@@ -331,7 +382,7 @@ defmodule SSL.ClientHello.Profile do
         _extension -> []
       end)
 
-    reject_unsupported(groups, supported_groups, :unsupported_groups)
+    reject_unsupported(without_grease(groups), supported_groups, :unsupported_groups)
   end
 
   defp validate_signature_algorithms(extensions, capabilities) do
@@ -343,7 +394,7 @@ defmodule SSL.ClientHello.Profile do
       end)
 
     reject_unsupported(
-      algorithms,
+      without_grease(algorithms),
       Map.get(capabilities, :signature_algorithms, []),
       :unsupported_signature_algorithms
     )
@@ -357,7 +408,7 @@ defmodule SSL.ClientHello.Profile do
       end)
 
     reject_unsupported(
-      modes,
+      without_grease(modes),
       Map.get(capabilities, :psk_key_exchange_modes, []),
       :unsupported_psk_key_exchange_modes
     )
@@ -435,7 +486,7 @@ defmodule SSL.ClientHello.Profile do
   end
 
   defp require_key_share_sizes(groups, capabilities) do
-    case Enum.find(groups, &is_nil(key_share_size(&1, capabilities))) do
+    case Enum.find(without_grease(groups), &is_nil(key_share_size(&1, capabilities))) do
       nil -> :ok
       group -> {:error, {:unknown_key_share_size, group}}
     end
@@ -474,7 +525,11 @@ defmodule SSL.ClientHello.Profile do
     do: 2 + 2 * length(algorithms)
 
   defp extension_payload_length({:alpn, protocols}, _capabilities) do
-    2 + Enum.reduce(protocols, 0, fn protocol, size -> size + 1 + byte_size(protocol) end)
+    2 +
+      Enum.reduce(protocols, 0, fn
+        protocol, size when is_binary(protocol) -> size + 1 + byte_size(protocol)
+        {:grease, _slot}, size -> size + 3
+      end)
   end
 
   defp extension_payload_length({:supported_versions, versions}, _capabilities),
@@ -488,6 +543,7 @@ defmodule SSL.ClientHello.Profile do
   end
 
   defp extension_payload_length({:pre_shared_key, :deferred}, _capabilities), do: 0
+  defp extension_payload_length({:grease, _slot}, _capabilities), do: 0
   defp extension_payload_length({:padding, :none}, _capabilities), do: 0
   defp extension_payload_length({:padding, size}, _capabilities) when is_integer(size), do: size
 
@@ -496,11 +552,15 @@ defmodule SSL.ClientHello.Profile do
   defp extension_payload_length({:raw, _extension_id, payload}, _capabilities),
     do: byte_size(payload)
 
+  defp key_share_size({:grease, _slot}, _capabilities), do: 2
+
   defp key_share_size(group, capabilities) do
     capabilities
     |> Map.get(:key_share_sizes, %{})
     |> Map.get(group, Map.get(@known_key_share_sizes, group))
   end
+
+  defp without_grease(values), do: Enum.reject(values, &match?({:grease, _slot}, &1))
 
   defp reject_unsupported(advertised, supported, error_tag) do
     supported = MapSet.new(supported)

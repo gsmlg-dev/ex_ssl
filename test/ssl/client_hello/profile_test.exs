@@ -55,12 +55,23 @@ defmodule SSL.ClientHello.ProfileTest do
       {struct(WireProfile, cipher_suites: :unordered), :cipher_suites},
       {struct(WireProfile, compression_methods: [1]), :compression_methods},
       {struct(WireProfile, extensions: %{}), :extensions},
-      {struct(WireProfile, grease: %GreasePolicy{mode: :random}), :grease},
+      {struct(WireProfile, grease: %GreasePolicy{mode: {:deterministic, -1}}), :grease},
       {struct(WireProfile, record: %RecordPolicy{mode: {:split, 128}}), :record}
     ]
 
     for {profile, field} <- invalid_profiles do
       assert {:error, {:invalid_profile, ^field}} = Profile.validate(profile, @capabilities)
+    end
+  end
+
+  test "requires an enabled GREASE policy for symbolic slots" do
+    profile = struct(WireProfile, cipher_suites: [{:grease, :a}, 0x1301])
+
+    assert {:error, :grease_not_supported} = Profile.validate(profile, @capabilities)
+
+    for mode <- [:random, {:deterministic, 0}] do
+      enabled = %{profile | grease: %GreasePolicy{mode: mode}}
+      assert {:ok, ^enabled} = Profile.validate(enabled, @capabilities)
     end
   end
 
