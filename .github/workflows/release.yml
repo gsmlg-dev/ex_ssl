@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (e.g. 1.2.3)
+        required: true
+        type: string
+      git_ref:
+        description: Git ref to release from
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_GIT_REF: ${{ inputs.git_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 0
+
+      - uses: erlef/setup-beam@v1.24.1
+        with:
+          elixir-version: "1.20"
+          otp-version: "29"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-release-1.20-29-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-release-1.20-29-
+
+      - name: Validate release inputs
+        run: |
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $RELEASE_VERSION" >&2
+            exit 1
+          fi
+          git ls-remote --exit-code --heads origin "refs/heads/$RELEASE_GIT_REF"
+          if git rev-parse "v$RELEASE_VERSION" >/dev/null 2>&1; then
+            echo "Tag v$RELEASE_VERSION already exists" >&2
+            exit 1
+          fi
+
+      - name: Update package version
+        run: |
+          sed -i -E 's/version: "[^"]+"/version: "'"$RELEASE_VERSION"'"/' mix.exs
+          grep -F "version: \"$RELEASE_VERSION\"" mix.exs
+
+      - run: mix deps.get
+      - run: mix format --check-formatted
+      - run: mix compile --warnings-as-errors
+      - run: MIX_ENV=test mix compile --warnings-as-errors
+      - run: mix test
+
+      - name: Build Hex package
+        run: mix hex.build --output "ex_ssl-$RELEASE_VERSION.tar"
+
+      - name: Publish ex_ssl to Hex
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: mix hex.publish package --yes
+
+      - name: Commit release version and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mix.exs
+          git commit -m "chore(release): v$RELEASE_VERSION"
+          git tag -a "v$RELEASE_VERSION" -m "v$RELEASE_VERSION"
+          git push origin "HEAD:refs/heads/$RELEASE_GIT_REF"
+          git push origin "v$RELEASE_VERSION"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$RELEASE_VERSION" \
+            "ex_ssl-$RELEASE_VERSION.tar" \
+            --generate-notes \
+            --title "v$RELEASE_VERSION"

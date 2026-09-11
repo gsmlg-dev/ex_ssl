@@ -9,6 +9,20 @@ The OTP application is `:ex_ssl`. The public compatibility module is `SSL` (`Eli
 
 > **Status:** foundation, deterministic ClientHello/ServerHello parsing, and the pure authenticated server-flight milestone are complete. The repository contains bounded record and handshake protection, a byte-bound normal ServerHello negotiation path, Certificate/CertificateVerify/Finished verification, and SAN-only service identity checks. It does not yet implement TLS connection APIs, a complete HRR transition, or live interoperability. Do not treat `ex_ssl` as a production replacement for OTP `:ssl` until the compatibility and security milestones documented here are complete.
 
+## Installation
+
+Once published, add the `ex_ssl` package to your dependencies:
+
+```elixir
+def deps do
+  [
+    {:ex_ssl, "~> 0.1.0"}
+  ]
+end
+```
+
+The Hex package name is [`ex_ssl`](https://hex.pm/packages/ex_ssl).
+
 ## Why ex_ssl?
 
 OTP `:ssl` is the correct default TLS implementation for normal Erlang/Elixir applications. `ex_ssl` exists for cases where an application also needs deterministic or profile-driven control of the ClientHello wire representation, including characteristics such as:
@@ -58,7 +72,10 @@ SSL.connect(host, port,
 
 ## Runtime baseline
 
-The supported runtime baselines are Elixir 1.19 on Erlang/OTP 28 and Elixir 1.20 on Erlang/OTP 29. CI covers both tuples. OTP 29 remains the behavioral reference target for the implemented `:ssl`-compatible client feature subset.
+The supported runtime baselines are Elixir 1.18 on Erlang/OTP 28, Elixir 1.19 on
+Erlang/OTP 28, and Elixir 1.20 on Erlang/OTP 29. CI covers all three tuples. OTP 29
+remains the behavioral reference target for the implemented `:ssl`-compatible client
+feature subset.
 
 ## Compatibility target
 
@@ -289,4 +306,4 @@ Primary references:
 
 ## License
 
-TBD before public release.
+Licensed under the [Apache License 2.0](LICENSE).

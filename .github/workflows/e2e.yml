@@ -1,0 +1,24 @@
+name: E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version to test
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pending:
+    name: E2E test TODO
+    runs-on: ubuntu-latest
+    steps:
+      # TODO: Download the requested release and run independent TLS interoperability tests.
+      - run: echo "E2E tests are not implemented for ex_ssl yet"
