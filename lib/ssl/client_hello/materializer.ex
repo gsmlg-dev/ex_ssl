@@ -47,7 +47,8 @@ defmodule SSL.ClientHello.Materializer do
          {:ok, grease} <- grease_values(profile),
          {:ok, random} <- connection_random(opts),
          {:ok, session_id} <- session_id(profile.session_id, opts),
-         {:ok, cipher_suites} <- resolve_uint16_list(profile.cipher_suites, :cipher_suite, grease),
+         {:ok, cipher_suites} <-
+           resolve_uint16_list(profile.cipher_suites, :cipher_suite, grease),
          :ok <- reject_duplicates(cipher_suites, :cipher_suites),
          {:ok, extensions, key_pairs} <-
            materialize_extensions(profile.extensions, context, opts, grease),
