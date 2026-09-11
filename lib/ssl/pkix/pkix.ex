@@ -37,6 +37,7 @@ defmodule SSL.PKIX do
   @rsa_encryption_oid {1, 2, 840, 113_549, 1, 1, 1}
   @ec_public_key_oid {1, 2, 840, 10_045, 2, 1}
   @subject_alt_name_oid {2, 5, 29, 17}
+  @maximum_dns_name_length 253
   @option_keys [
     :max_certificates,
     :max_der_bytes,
@@ -307,20 +308,62 @@ defmodule SSL.PKIX do
     do: dns_name_matches?(List.to_string(name), reference)
 
   defp dns_name_matches?(name, reference) when is_binary(name) and is_binary(reference) do
-    presented_labels = name |> String.downcase() |> String.split(".")
-    reference_labels = reference |> String.downcase() |> String.split(".")
+    with {:ok, presented_labels} <- presented_dns_labels(name),
+         {:ok, reference_labels} <- dns_labels(reference) do
+      case {presented_labels, reference_labels} do
+        {["*" | presented_suffix], [_reference_label | reference_suffix]} ->
+          presented_suffix == reference_suffix
 
-    case {presented_labels, reference_labels} do
-      {["*" | presented_suffix], [_reference_label | reference_suffix]}
-      when presented_suffix != [] ->
-        presented_suffix == reference_suffix
-
-      {presented, reference_labels} ->
-        "*" not in presented and presented == reference_labels
+        {presented_labels, reference_labels} ->
+          presented_labels == reference_labels
+      end
+    else
+      :error -> false
     end
   end
 
   defp dns_name_matches?(_name, _reference), do: false
+
+  defp presented_dns_labels(name) when byte_size(name) <= @maximum_dns_name_length do
+    case :binary.split(name, ".", [:global]) do
+      ["*" | suffix] when suffix != [] ->
+        normalize_dns_labels(suffix, ["*"])
+
+      labels ->
+        normalize_dns_labels(labels, [])
+    end
+  end
+
+  defp presented_dns_labels(_name), do: :error
+
+  defp dns_labels(name) when byte_size(name) <= @maximum_dns_name_length do
+    name
+    |> :binary.split(".", [:global])
+    |> normalize_dns_labels([])
+  end
+
+  defp dns_labels(_name), do: :error
+
+  defp normalize_dns_labels(labels, prefix) do
+    if Enum.all?(labels, &valid_dns_label?/1) do
+      {:ok, prefix ++ Enum.map(labels, &String.downcase/1)}
+    else
+      :error
+    end
+  end
+
+  defp valid_dns_label?(label) when byte_size(label) in 1..63 do
+    first = :binary.first(label)
+    last = :binary.last(label)
+
+    ascii_alphanumeric?(first) and ascii_alphanumeric?(last) and
+      Enum.all?(:binary.bin_to_list(label), &(ascii_alphanumeric?(&1) or &1 == ?-))
+  end
+
+  defp valid_dns_label?(_label), do: false
+
+  defp ascii_alphanumeric?(character),
+    do: character in ?0..?9 or character in ?A..?Z or character in ?a..?z
 
   defp ip_reference_bytes(reference) when is_binary(reference) do
     case :inet.parse_address(String.to_charlist(reference)) do
@@ -365,10 +408,7 @@ defmodule SSL.PKIX do
   defp validate_identity(identity), do: {:error, {:invalid_identity, identity}}
 
   defp valid_dns_reference?(hostname) do
-    String.valid?(hostname) and
-      hostname
-      |> String.split(".")
-      |> Enum.all?(&(byte_size(&1) > 0 and not String.contains?(&1, "*")))
+    match?({:ok, _labels}, dns_labels(hostname))
   end
 
   defp nonempty_list([], :certificate_chain), do: {:error, :empty_certificate_chain}

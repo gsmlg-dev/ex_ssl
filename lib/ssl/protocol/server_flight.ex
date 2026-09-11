@@ -61,6 +61,11 @@ defmodule SSL.Protocol.ServerFlight do
   @encrypted_extension_ids [0, 1, 10, 16, 19, 20, 28, 42]
   @certificate_extension_ids [5, 18]
   @certificate_request_extension_ids [13, 47, 48, 50]
+  @recognized_extension_ids Enum.uniq(
+                              @encrypted_extension_ids ++
+                                @certificate_extension_ids ++
+                                @certificate_request_extension_ids ++ [41, 43, 51]
+                            )
   @tls13_signature_schemes [
     0x0403,
     0x0503,
@@ -434,8 +439,12 @@ defmodule SSL.Protocol.ServerFlight do
        when extension_id in @certificate_request_extension_ids,
        do: :ok
 
+  defp require_known_extension(extension_id, context)
+       when extension_id in @recognized_extension_ids,
+       do: {:error, {:forbidden_extension, context, extension_id}}
+
   defp require_known_extension(extension_id, context),
-    do: {:error, {:forbidden_extension, context, extension_id}}
+    do: {:error, {:unsupported_extension, context, extension_id}}
 
   defp require_offered_extension(extension_id, offered_extension_ids) do
     if extension_id in offered_extension_ids,

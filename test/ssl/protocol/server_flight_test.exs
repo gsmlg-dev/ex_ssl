@@ -103,6 +103,7 @@ defmodule SSL.Protocol.ServerFlightTest do
   test "rejects duplicate, forbidden, unoffered, and malformed EncryptedExtensions" do
     duplicate = handshake(8, extensions([extension(0, <<>>), extension(0, <<>>)]))
     forbidden = handshake(8, extensions([extension(43, <<0x0304::16>>)]))
+    unsupported = handshake(8, extensions([extension(0xFE0D, <<>>)]))
     unoffered = handshake(8, extensions([extension(16, <<3::16, 2, "h2">>)]))
     malformed_alpn = handshake(8, extensions([extension(16, <<2::16, 0, 0>>)]))
 
@@ -111,6 +112,9 @@ defmodule SSL.Protocol.ServerFlightTest do
 
     assert {:error, {:forbidden_extension, :encrypted_extensions, 43}} =
              ServerFlight.decode(forbidden, @decode_options)
+
+    assert {:error, {:unsupported_extension, :encrypted_extensions, 0xFE0D}} =
+             ServerFlight.decode(unsupported, @decode_options)
 
     assert {:error, {:extension_not_offered, 16}} =
              ServerFlight.decode(

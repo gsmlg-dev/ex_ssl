@@ -14,7 +14,7 @@ defmodule SSL.Protocol.Record do
   @application_data 23
   @legacy_record_version 0x0303
   @tag_length 16
-  @minimum_ciphertext_length 17
+  @minimum_ciphertext_length @tag_length
   @maximum_ciphertext_length 16_640
 
   @spec encrypt(TrafficState.t(), term(), term(), keyword()) ::

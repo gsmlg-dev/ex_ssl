@@ -77,6 +77,15 @@ defmodule SSL.Protocol.RecordTest do
     assert state.sequence == 0
   end
 
+  test "authenticates a tag-only record before rejecting empty inner plaintext" do
+    state = state()
+    record = authenticate_raw(<<>>)
+
+    assert {:error, :empty_inner_plaintext} = Record.decrypt(state, record)
+    assert {:error, :authentication_failed} = Record.decrypt(state, flip_last_bit(record))
+    assert state.sequence == 0
+  end
+
   test "rejects authenticated oversized and empty handshake or alert inner plaintext" do
     maximum_content = :binary.copy(<<1>>, 16_384)
 
@@ -97,6 +106,17 @@ defmodule SSL.Protocol.RecordTest do
              Record.decrypt(state(), authenticate_raw(<<23>>))
   end
 
+  test "rejects authenticated prohibited and unknown inner content types" do
+    state = state()
+
+    for type <- [20, 25] do
+      assert {:error, {:unsupported_inner_content_type, ^type}} =
+               Record.decrypt(state, authenticate_raw(<<1, type>>))
+    end
+
+    assert state.sequence == 0
+  end
+
   test "validates the exact TLSCiphertext framing contract" do
     state = state()
 
@@ -112,7 +132,10 @@ defmodule SSL.Protocol.RecordTest do
     assert {:error, {:record_length_mismatch, 26, 25}} =
              Record.decrypt(state, replace_header(@record, 23, 0x0303, 26))
 
-    assert {:error, {:ciphertext_length_too_short, 16, 17}} =
+    assert {:error, {:ciphertext_length_too_short, 15, 16}} =
+             Record.decrypt(state, <<23, 3, 3, 15::16, 0::120>>)
+
+    assert {:error, :authentication_failed} =
              Record.decrypt(state, <<23, 3, 3, 16::16, 0::128>>)
 
     assert {:error, {:record_length_exceeded, 16_641, 16_640}} =

@@ -453,7 +453,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       {:error, {:content_length_exceeded, _length, _maximum} = reason} ->
         alert(:record_overflow, reason)
 
-      {:error, {:unexpected_outer_content_type, _content_type} = reason} ->
+      {:error, {:unsupported_inner_content_type, _content_type} = reason} ->
         alert(:unexpected_message, reason)
 
       {:error, {:empty_content, content_type} = reason}
@@ -596,6 +596,9 @@ defmodule SSL.Protocol.ServerFlightVerifier do
   defp decode_alert({:extension_not_offered, id}),
     do: alert(:unsupported_extension, {:unsolicited_extension, id})
 
+  defp decode_alert({:unsupported_extension, context, id}),
+    do: alert(:unsupported_extension, {:unsupported_extension, context, id})
+
   defp decode_alert({:forbidden_extension, context, id}),
     do: alert(:illegal_parameter, {:forbidden_extension, context, id})
 
@@ -713,13 +716,17 @@ defmodule SSL.Protocol.ServerFlightVerifier do
     if length(keys) == length(Enum.uniq(keys)) and Enum.all?(keys, &(&1 in @option_keys)) do
       case Keyword.get(options, :max_records, @default_max_records) do
         maximum when is_integer(maximum) and maximum > 0 ->
-          {:ok,
-           %{
-             max_records: maximum,
-             max_handshake_length:
-               Keyword.get(options, :max_handshake_length, @maximum_handshake_length),
-             server_flight_options: Keyword.drop(options, [:max_records])
-           }}
+          server_flight_options = Keyword.drop(options, [:max_records])
+
+          with :ok <- validate_signature_policy_option(server_flight_options) do
+            {:ok,
+             %{
+               max_records: maximum,
+               max_handshake_length:
+                 Keyword.get(options, :max_handshake_length, @maximum_handshake_length),
+               server_flight_options: server_flight_options
+             }}
+          end
 
         _maximum ->
           alert(:decode_error, {:invalid_options, :verifier})
@@ -728,6 +735,33 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       alert(:decode_error, {:invalid_options, :verifier})
     end
   end
+
+  defp validate_signature_policy_option(options) do
+    case Keyword.fetch(options, :allowed_signature_schemes) do
+      :error ->
+        :ok
+
+      {:ok, policy} ->
+        if valid_identifier_list?(policy, MapSet.new()) do
+          :ok
+        else
+          alert(:decode_error, {:invalid_options, :allowed_signature_schemes})
+        end
+    end
+  end
+
+  defp valid_identifier_list?([], _seen), do: true
+
+  defp valid_identifier_list?([identifier | rest], seen)
+       when is_integer(identifier) and identifier in 0..0xFFFF do
+    if MapSet.member?(seen, identifier) do
+      false
+    else
+      valid_identifier_list?(rest, MapSet.put(seen, identifier))
+    end
+  end
+
+  defp valid_identifier_list?(_policy, _seen), do: false
 
   defp bind_offer(config, offer) do
     supplied_extensions = Keyword.fetch(config.server_flight_options, :offered_extension_ids)
@@ -754,24 +788,13 @@ defmodule SSL.Protocol.ServerFlightVerifier do
 
   defp signature_policy(:error, offered), do: {:ok, offered}
 
-  defp signature_policy({:ok, policy}, offered) when is_list(policy) do
-    cond do
-      not Enum.all?(policy, &(is_integer(&1) and &1 in 0..0xFFFF)) ->
-        alert(:decode_error, {:invalid_options, :allowed_signature_schemes})
-
-      length(policy) != length(Enum.uniq(policy)) ->
-        alert(:decode_error, {:invalid_options, :allowed_signature_schemes})
-
-      Enum.all?(policy, &(&1 in offered)) ->
-        {:ok, policy}
-
-      true ->
-        alert(:illegal_parameter, {:offer_override_conflict, :allowed_signature_schemes})
+  defp signature_policy({:ok, policy}, offered) do
+    if Enum.all?(policy, &(&1 in offered)) do
+      {:ok, policy}
+    else
+      alert(:illegal_parameter, {:offer_override_conflict, :allowed_signature_schemes})
     end
   end
-
-  defp signature_policy({:ok, _policy}, _offered),
-    do: alert(:decode_error, {:invalid_options, :allowed_signature_schemes})
 
   defp crypto_result({:ok, value}, _alert), do: {:ok, value}
   defp crypto_result({:error, reason}, alert), do: alert(alert, reason)

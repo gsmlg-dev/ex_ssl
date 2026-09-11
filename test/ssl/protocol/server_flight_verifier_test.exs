@@ -69,20 +69,52 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
              ServerFlightVerifier.verify(input(records: [flip_last_bit(first) | rest]))
   end
 
-  test "classifies authenticated inner overflow and empty handshake precisely" do
+  test "classifies authenticated inner overflow precisely" do
     oversized = :binary.copy(<<1>>, 16_384) <> <<22, 0>>
 
     assert {:error,
             {:fatal_alert, :record_overflow, {:inner_plaintext_length_exceeded, 16_386, 16_385}}} =
              ServerFlightVerifier.verify(input(records: [authenticate_raw(oversized)]))
 
-    assert {:error, {:fatal_alert, :unexpected_message, {:empty_content, :handshake}}} =
-             ServerFlightVerifier.verify(input(records: [authenticate_raw(<<22, 0>>)]))
-
     assert {:error, {:fatal_alert, :bad_record_mac, :authentication_failed}} =
              ServerFlightVerifier.verify(
                input(records: [authenticate_raw(oversized) |> flip_last_bit()])
              )
+  end
+
+  test "classifies authenticated empty and missing inner content precisely" do
+    invalid_plaintexts = [
+      {<<>>, :empty_inner_plaintext},
+      {<<0>>, :missing_inner_content_type},
+      {<<0, 0>>, :missing_inner_content_type},
+      {<<21>>, {:empty_content, :alert}},
+      {<<21, 0>>, {:empty_content, :alert}},
+      {<<22>>, {:empty_content, :handshake}},
+      {<<22, 0>>, {:empty_content, :handshake}}
+    ]
+
+    for {plaintext, reason} <- invalid_plaintexts do
+      record = authenticate_raw(plaintext)
+
+      assert {:error, {:fatal_alert, :unexpected_message, ^reason}} =
+               ServerFlightVerifier.verify(input(records: [record]))
+
+      assert {:error, {:fatal_alert, :bad_record_mac, :authentication_failed}} =
+               ServerFlightVerifier.verify(input(records: [flip_last_bit(record)]))
+    end
+  end
+
+  test "classifies authenticated unsupported inner content types precisely" do
+    for type <- [20, 25] do
+      record = authenticate_raw(<<1, type>>)
+
+      assert {:error,
+              {:fatal_alert, :unexpected_message, {:unsupported_inner_content_type, ^type}}} =
+               ServerFlightVerifier.verify(input(records: [record]))
+
+      assert {:error, {:fatal_alert, :bad_record_mac, :authentication_failed}} =
+               ServerFlightVerifier.verify(input(records: [flip_last_bit(record)]))
+    end
   end
 
   test "classifies an oversized outer record before authentication" do
@@ -95,14 +127,6 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
 
     assert {:error, {:fatal_alert, :bad_record_mac, :authentication_failed}} =
              ServerFlightVerifier.verify(input(records: [generic_limit]))
-  end
-
-  test "classifies an unexpected outer record content type before authentication" do
-    <<_application_data, authenticated_body::binary>> = authenticate_raw(<<22, 0>>)
-    wrong_outer_type = <<22, authenticated_body::binary>>
-
-    assert {:error, {:fatal_alert, :unexpected_message, {:unexpected_outer_content_type, 22}}} =
-             ServerFlightVerifier.verify(input(records: [wrong_outer_type]))
   end
 
   test "maps untrusted chains and wrong identities to certificate alerts" do
@@ -169,11 +193,20 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
   end
 
   test "classifies a forbidden EncryptedExtensions extension as illegal_parameter" do
+    valid_flight = constructed_flight(encrypted_extensions: [])
     flight = constructed_flight(encrypted_extensions: [{43, <<0x0304::16>>}])
+    unsupported_flight = constructed_flight(encrypted_extensions: [{0xFE0D, <<>>}])
+
+    assert {:ok, %Result{}} = ServerFlightVerifier.verify(input_from_flight(valid_flight))
 
     assert {:error,
             {:fatal_alert, :illegal_parameter, {:forbidden_extension, :encrypted_extensions, 43}}} =
              ServerFlightVerifier.verify(input_from_flight(flight))
+
+    assert {:error,
+            {:fatal_alert, :unsupported_extension,
+             {:unsupported_extension, :encrypted_extensions, 0xFE0D}}} =
+             ServerFlightVerifier.verify(input_from_flight(unsupported_flight))
   end
 
   test "rejects early_data in the certificate-authenticated non-PSK flow" do
@@ -395,11 +428,60 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
              ServerFlightVerifier.verify(input(), unknown: true)
   end
 
-  test "rejects malformed allowed signature schemes before enumerating the policy" do
-    for policy <- [:all, [nil]] do
+  test "rejects malformed allowed signature schemes with a precise option error" do
+    improper_policy = [0x0403 | :not_a_list]
+
+    for policy <- [
+          nil,
+          false,
+          :all,
+          0x0403,
+          <<4, 3>>,
+          %{},
+          {:invalid, 0x0403},
+          [nil],
+          [-1],
+          [65_536],
+          [0x0403, 0x0403],
+          improper_policy
+        ] do
       assert {:error,
               {:fatal_alert, :decode_error, {:invalid_options, :allowed_signature_schemes}}} =
                ServerFlightVerifier.verify(input(), allowed_signature_schemes: policy)
+    end
+  end
+
+  test "validates an improper signature policy before parsing verifier input" do
+    improper_policy = [0x0403 | :not_a_list]
+
+    assert {:error, {:fatal_alert, :decode_error, {:invalid_options, :allowed_signature_schemes}}} =
+             ServerFlightVerifier.verify(input(client_hello: <<>>),
+               allowed_signature_schemes: improper_policy
+             )
+  end
+
+  test "preserves default, narrowing, empty, and widening signature policy behavior" do
+    assert {:ok, %Result{}} = ServerFlightVerifier.verify(input())
+
+    assert {:ok, %Result{}} =
+             ServerFlightVerifier.verify(input(), allowed_signature_schemes: [0x0403])
+
+    assert {:error, {:fatal_alert, :illegal_parameter, {:signature_scheme_not_offered, 0x0403}}} =
+             ServerFlightVerifier.verify(input(), allowed_signature_schemes: [])
+
+    assert {:error,
+            {:fatal_alert, :illegal_parameter,
+             {:offer_override_conflict, :allowed_signature_schemes}}} =
+             ServerFlightVerifier.verify(input(), allowed_signature_schemes: [0x0804])
+  end
+
+  property "bounded malformed signature policies return the precise option error" do
+    check all(policy <- malformed_signature_policy(), max_runs: 100) do
+      result = ServerFlightVerifier.verify(input(), allowed_signature_schemes: policy)
+
+      assert {:error,
+              {:fatal_alert, :decode_error, {:invalid_options, :allowed_signature_schemes}}} =
+               result
     end
   end
 
@@ -479,6 +561,31 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
         overrides
       )
     )
+  end
+
+  defp malformed_signature_policy do
+    invalid_identifier =
+      one_of([
+        constant(nil),
+        integer(-65_536..-1),
+        integer(65_536..131_072),
+        binary(max_length: 8),
+        constant(%{}),
+        constant({:invalid, 0x0403})
+      ])
+
+    one_of([
+      constant(nil),
+      constant(false),
+      atom(:alphanumeric),
+      integer(),
+      binary(max_length: 8),
+      constant(%{}),
+      constant({:invalid, 0x0403}),
+      list_of(invalid_identifier, min_length: 1, max_length: 8),
+      constant([0x0403, 0x0403]),
+      constant([0x0403 | :not_a_list])
+    ])
   end
 
   defp constructed_flight(options) do

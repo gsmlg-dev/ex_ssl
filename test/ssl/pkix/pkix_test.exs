@@ -15,6 +15,7 @@ defmodule SSL.PKIXTest do
   @wrong_root_der @wrong_root_pem |> :public_key.pem_decode() |> hd() |> elem(1)
   @identity_fixture_dir Path.expand("../../fixtures/pkix_identity", __DIR__)
   @identity_root_pem File.read!(Path.join(@identity_fixture_dir, "root.pem"))
+  @invalid_sans_root_pem File.read!(Path.join(@identity_fixture_dir, "invalid_sans_root.pem"))
 
   test "decodes an ordered leaf-first DER chain without discarding exact bytes" do
     assert {:ok, [%Certificate{der: @leaf_der}, %Certificate{der: @root_der}]} =
@@ -78,8 +79,13 @@ defmodule SSL.PKIXTest do
   end
 
   test "supports only a complete leftmost DNS wildcard matching one label" do
-    assert {:ok, %VerifiedPeer{}} =
-             verify_identity("wildcard.pem", {:dns_id, "www.example.test"})
+    for reference <- ["www.example.test", "WWW.EXAMPLE.TEST", "xn--bcher-kva.example.test"] do
+      assert {:ok, %VerifiedPeer{}} =
+               verify_identity("wildcard.pem", {:dns_id, reference})
+    end
+
+    assert {:error, :hostname_mismatch} =
+             verify_identity("wildcard.pem", {:dns_id, "example.test"})
 
     assert {:error, :hostname_mismatch} =
              verify_identity("wildcard.pem", {:dns_id, "a.b.example.test"})
@@ -88,13 +94,56 @@ defmodule SSL.PKIXTest do
              verify_identity("partial_wildcard.pem", {:dns_id, "foo.example.test"})
   end
 
-  test "rejects DNS references with empty or wildcard labels before identity matching" do
-    for reference <- [".example.test", "www..example.test", "*.example.test"] do
+  test "rejects invalid ASCII DNS references before identity matching" do
+    oversized_label = String.duplicate("a", 64) <> ".example.test"
+    oversized_name = Enum.join(List.duplicate(String.duplicate("a", 63), 4), ".")
+
+    invalid_references = [
+      ".example.test",
+      "www..example.test",
+      "*.example.test",
+      "w*w.example.test",
+      "www.example.test.",
+      " www.example.test",
+      "www .example.test",
+      "www\texample.test",
+      "www\nexample.test",
+      "bücher.example.test",
+      "-www.example.test",
+      "www-.example.test",
+      oversized_label,
+      oversized_name
+    ]
+
+    for reference <- invalid_references do
       identity = {:dns_id, reference}
 
       assert {:error, {:invalid_identity, ^identity}} =
                verify_identity("wildcard.pem", identity)
     end
+  end
+
+  test "ignores invalid presented wildcard patterns while allowing another valid SAN" do
+    assert {:error, :hostname_mismatch} =
+             verify_identity(
+               "invalid_sans.pem",
+               {:dns_id, "foo.bar.example.test"},
+               @invalid_sans_root_pem
+             )
+
+    assert {:error, :hostname_mismatch} =
+             verify_identity(
+               "invalid_sans.pem",
+               {:dns_id, "foo.example.test"},
+               @invalid_sans_root_pem
+             )
+
+    assert {:ok, %VerifiedPeer{}} =
+             verify_identity(
+               "invalid_sans.pem",
+               {:dns_id, "valid.example.test"},
+               @invalid_sans_root_pem
+             )
   end
 
   test "accepts a peer chain that includes the supplied trust anchor" do
@@ -204,6 +253,6 @@ defmodule SSL.PKIXTest do
     elem(entry, 1)
   end
 
-  defp verify_identity(name, identity),
-    do: PKIX.verify([identity_der(name)], @identity_root_pem, identity)
+  defp verify_identity(name, identity, root_pem \\ @identity_root_pem),
+    do: PKIX.verify([identity_der(name)], root_pem, identity)
 end
