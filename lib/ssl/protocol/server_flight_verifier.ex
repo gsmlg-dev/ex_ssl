@@ -453,6 +453,9 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       {:error, {:content_length_exceeded, _length, _maximum} = reason} ->
         alert(:record_overflow, reason)
 
+      {:error, {:unexpected_outer_content_type, _content_type} = reason} ->
+        alert(:unexpected_message, reason)
+
       {:error, {:unsupported_inner_content_type, _content_type} = reason} ->
         alert(:unexpected_message, reason)
 

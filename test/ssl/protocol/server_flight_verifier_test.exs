@@ -69,6 +69,17 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
              ServerFlightVerifier.verify(input(records: [flip_last_bit(first) | rest]))
   end
 
+  test "classifies unexpected outer record content types before authentication" do
+    for outer_type <- [22, 25] do
+      <<_original_type, remainder::binary>> = authenticate_raw(<<1, 22>>)
+      record = <<outer_type, remainder::binary>>
+
+      assert {:error,
+              {:fatal_alert, :unexpected_message, {:unexpected_outer_content_type, ^outer_type}}} =
+               ServerFlightVerifier.verify(input(records: [record]))
+    end
+  end
+
   test "classifies authenticated inner overflow precisely" do
     oversized = :binary.copy(<<1>>, 16_384) <> <<22, 0>>
 
