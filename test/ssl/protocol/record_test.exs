@@ -77,12 +77,27 @@ defmodule SSL.Protocol.RecordTest do
     assert state.sequence == 0
   end
 
-  test "authenticates a tag-only record before rejecting empty inner plaintext" do
+  test "authenticates invalid raw inner plaintext before classifying its exact reason" do
     state = state()
-    record = authenticate_raw(<<>>)
 
-    assert {:error, :empty_inner_plaintext} = Record.decrypt(state, record)
-    assert {:error, :authentication_failed} = Record.decrypt(state, flip_last_bit(record))
+    invalid_plaintexts = [
+      {<<>>, :empty_inner_plaintext},
+      {<<0>>, :missing_inner_content_type},
+      {<<0, 0>>, :missing_inner_content_type},
+      {<<21>>, {:empty_content, :alert}},
+      {<<21, 0>>, {:empty_content, :alert}},
+      {<<21, 0, 0>>, {:empty_content, :alert}},
+      {<<22>>, {:empty_content, :handshake}},
+      {<<22, 0>>, {:empty_content, :handshake}},
+      {<<22, 0, 0>>, {:empty_content, :handshake}}
+    ]
+
+    for {plaintext, reason} <- invalid_plaintexts do
+      record = authenticate_raw(plaintext)
+      assert {:error, ^reason} = Record.decrypt(state, record)
+      assert {:error, :authentication_failed} = Record.decrypt(state, flip_last_bit(record))
+    end
+
     assert state.sequence == 0
   end
 
@@ -92,16 +107,6 @@ defmodule SSL.Protocol.RecordTest do
     assert {:error, {:inner_plaintext_length_exceeded, 16_386, 16_385}} =
              Record.decrypt(state(), authenticate_raw(maximum_content <> <<22, 0>>))
 
-    for type <- [21, 22] do
-      assert {:error, {:empty_content, decoded_type}} =
-               Record.decrypt(state(), authenticate_raw(<<type>>))
-
-      assert decoded_type in [:alert, :handshake]
-
-      assert {:error, {:empty_content, ^decoded_type}} =
-               Record.decrypt(state(), authenticate_raw(<<type, 0>>))
-    end
-
     assert {:ok, :application_data, <<>>, %TrafficState{sequence: 1}} =
              Record.decrypt(state(), authenticate_raw(<<23>>))
   end
@@ -109,9 +114,11 @@ defmodule SSL.Protocol.RecordTest do
   test "rejects authenticated prohibited and unknown inner content types" do
     state = state()
 
-    for type <- [20, 25] do
-      assert {:error, {:unsupported_inner_content_type, ^type}} =
-               Record.decrypt(state, authenticate_raw(<<1, type>>))
+    for type <- [20, 25], padding <- [<<>>, <<0>>, <<0, 0>>] do
+      record = authenticate_raw(<<1, type, padding::binary>>)
+
+      assert {:error, {:unsupported_inner_content_type, ^type}} = Record.decrypt(state, record)
+      assert {:error, :authentication_failed} = Record.decrypt(state, flip_last_bit(record))
     end
 
     assert state.sequence == 0

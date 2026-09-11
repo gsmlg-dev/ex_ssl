@@ -105,8 +105,8 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
   end
 
   test "classifies authenticated unsupported inner content types precisely" do
-    for type <- [20, 25] do
-      record = authenticate_raw(<<1, type>>)
+    for type <- [20, 25], padding <- [<<>>, <<0>>, <<0, 0>>] do
+      record = authenticate_raw(<<1, type, padding::binary>>)
 
       assert {:error,
               {:fatal_alert, :unexpected_message, {:unsupported_inner_content_type, ^type}}} =
@@ -195,7 +195,7 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
   test "classifies a forbidden EncryptedExtensions extension as illegal_parameter" do
     valid_flight = constructed_flight(encrypted_extensions: [])
     flight = constructed_flight(encrypted_extensions: [{43, <<0x0304::16>>}])
-    unsupported_flight = constructed_flight(encrypted_extensions: [{0xFE0D, <<>>}])
+    unsupported_flight = constructed_flight(encrypted_extensions: [{0xFAFA, <<>>}])
 
     assert {:ok, %Result{}} = ServerFlightVerifier.verify(input_from_flight(valid_flight))
 
@@ -205,7 +205,7 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
 
     assert {:error,
             {:fatal_alert, :unsupported_extension,
-             {:unsupported_extension, :encrypted_extensions, 0xFE0D}}} =
+             {:unsupported_extension, :encrypted_extensions, 0xFAFA}}} =
              ServerFlightVerifier.verify(input_from_flight(unsupported_flight))
   end
 
@@ -429,8 +429,6 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
   end
 
   test "rejects malformed allowed signature schemes with a precise option error" do
-    improper_policy = [0x0403 | :not_a_list]
-
     for policy <- [
           nil,
           false,
@@ -443,7 +441,8 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
           [-1],
           [65_536],
           [0x0403, 0x0403],
-          improper_policy
+          [0x0403 | :bad],
+          [0x0403 | "bad"]
         ] do
       assert {:error,
               {:fatal_alert, :decode_error, {:invalid_options, :allowed_signature_schemes}}} =
@@ -452,7 +451,7 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
   end
 
   test "validates an improper signature policy before parsing verifier input" do
-    improper_policy = [0x0403 | :not_a_list]
+    improper_policy = [0x0403 | :bad]
 
     assert {:error, {:fatal_alert, :decode_error, {:invalid_options, :allowed_signature_schemes}}} =
              ServerFlightVerifier.verify(input(client_hello: <<>>),
@@ -584,7 +583,10 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
       constant({:invalid, 0x0403}),
       list_of(invalid_identifier, min_length: 1, max_length: 8),
       constant([0x0403, 0x0403]),
-      constant([0x0403 | :not_a_list])
+      map(
+        one_of([atom(:alphanumeric), binary(min_length: 1, max_length: 8)]),
+        fn tail -> [0x0403 | tail] end
+      )
     ])
   end
 

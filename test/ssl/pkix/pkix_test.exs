@@ -79,7 +79,12 @@ defmodule SSL.PKIXTest do
   end
 
   test "supports only a complete leftmost DNS wildcard matching one label" do
-    for reference <- ["www.example.test", "WWW.EXAMPLE.TEST", "xn--bcher-kva.example.test"] do
+    for reference <- [
+          "www.example.test",
+          "WWW.EXAMPLE.TEST",
+          "valid-host.example.test",
+          "xn--bcher-kva.example.test"
+        ] do
       assert {:ok, %VerifiedPeer{}} =
                verify_identity("wildcard.pem", {:dns_id, reference})
     end
@@ -104,10 +109,15 @@ defmodule SSL.PKIXTest do
       "*.example.test",
       "w*w.example.test",
       "www.example.test.",
+      " .example.test",
+      "\t.example.test",
+      "\n.example.test",
+      "\0.example.test",
       " www.example.test",
       "www .example.test",
       "www\texample.test",
       "www\nexample.test",
+      "www_example.test",
       "bücher.example.test",
       "-www.example.test",
       "www-.example.test",
@@ -144,6 +154,21 @@ defmodule SSL.PKIXTest do
                {:dns_id, "valid.example.test"},
                @invalid_sans_root_pem
              )
+  end
+
+  property "bounded malformed DNS references return the precise identity error" do
+    invalid_label =
+      one_of([
+        member_of(["", " ", "\t", "\n", "\0", "bad_name", "-bad", "bad-", "*"]),
+        binary(min_length: 64, max_length: 70)
+      ])
+
+    check all(label <- invalid_label, max_runs: 100) do
+      identity = {:dns_id, label <> ".example.test"}
+      result = verify_identity("wildcard.pem", identity)
+
+      assert {:error, {:invalid_identity, ^identity}} = result
+    end
   end
 
   test "accepts a peer chain that includes the supplied trust anchor" do
