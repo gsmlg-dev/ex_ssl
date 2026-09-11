@@ -7,7 +7,7 @@
 
 The OTP application is `:ex_ssl`. The public compatibility module is `SSL` (`Elixir.SSL`), which does not conflict with Erlang's built-in `:ssl` module.
 
-> **Status:** foundation and the deterministic ClientHello/ServerHello parsing milestone are complete. The repository contains the OTP application, pure protocol primitives, WireProfile validation, fresh key exchange and ClientHello materialization/serialization, and bounded ServerHello/HelloRetryRequest parsing. It does not yet implement TLS connection APIs, a complete HRR transition, authenticated handshake verification, or live interoperability. Do not treat `ex_ssl` as a production replacement for OTP `:ssl` until the compatibility and security milestones documented here are complete.
+> **Status:** foundation, deterministic ClientHello/ServerHello parsing, and the pure authenticated server-flight milestone are complete. The repository contains bounded record and handshake protection, a byte-bound normal ServerHello negotiation path, Certificate/CertificateVerify/Finished verification, and SAN-only service identity checks. It does not yet implement TLS connection APIs, a complete HRR transition, or live interoperability. Do not treat `ex_ssl` as a production replacement for OTP `:ssl` until the compatibility and security milestones documented here are complete.
 
 ## Why ex_ssl?
 
@@ -233,16 +233,15 @@ The implementation uses OTP `:crypto` and `:public_key` for cryptographic primit
 
 ## Development status
 
-The foundation gate and the Phase 3D/4A deterministic wire/parsing milestone are complete. Development continues through these staged gates:
+The foundation gate, the Phase 3D/4A deterministic wire/parsing milestone, and the pure Phase 4 authenticated server-flight gate are complete. Development continues through these staged gates:
 
-1. TLS 1.3 key schedule, AEAD, and encrypted handshake verification;
-2. first authenticated TLS 1.3 connection;
-3. application data;
-4. OTP active/passive compatibility;
-5. STARTTLS;
-6. broader OTP API/options;
-7. KeyUpdate/exporters/resumption;
-8. verified real-world profiles and hardening.
+1. first authenticated TLS 1.3 connection;
+2. application data;
+3. OTP active/passive compatibility;
+4. STARTTLS;
+5. broader OTP API/options;
+6. KeyUpdate/exporters/resumption;
+7. verified real-world profiles and hardening.
 
 See:
 

@@ -34,45 +34,31 @@ profile-driven materialization, exact ordered ClientHello serialization, final
 materialized-length checks, and pure bounded ServerHello/HRR parsing with semantic,
 negative, fragmentation, and golden-wire tests.
 
-This milestone does not include the Phase 3E ClientHello parser, Phase 3F JA3/JA4
-analyzers, TLS connectivity, OTP socket compatibility, a connection state machine,
-authenticated handshake verification, or the Phase 4B HRR transition. In particular,
-HRR parsing and transcript support do not provide full HRR support: fresh second
-KeyShare and ClientHello2 generation remain future work.
+This milestone does not include the Phase 3F JA3/JA4 analyzers, TLS connectivity,
+OTP socket compatibility, a connection state machine, or the Phase 4B HRR
+transition. In particular, HRR parsing and transcript support do not provide full
+HRR support: fresh second KeyShare and ClientHello2 generation remain future work.
+
+## Pure authenticated-flight milestone
+
+The normal, certificate-authenticated in-memory server-flight path is complete for
+the implemented subset. It derives handshake/application traffic secrets, protects
+TLS 1.3 records, verifies EncryptedExtensions, Certificate, CertificateVerify, and
+Finished, retains exact transcript bytes, and produces the client Finished record.
+
+Security repairs bind negotiation to the exact ClientHello and reparsed ServerHello,
+keep transcript and signature hashes independent, enforce TLSInnerPlaintext and
+TLSCiphertext limits with specific fatal alerts, reject non-PSK early data, validate
+ALPN and CertificateEntry response extensions against the byte-derived offer, and
+require DNS/IP SAN service identities without CN fallback.
+
+Evidence includes fixed known-answer primitive vectors and reproducible constructed
+full flights using disposable test-only certificates, fixed RFC 7748 X25519 scalars,
+SHA-384 transcripts, and both ECDSA-SHA256 and RSA-PSS-RSAE-SHA256 signatures. These
+constructed vectors are not represented as live OpenSSL captures.
 
 ## Next assignment
 
-Implement the pure prerequisites for the first authenticated TLS 1.3 handshake,
-following Phase 2C/2E and Phase 4B-4F of `IMPLEMENTATION_PLAN.md` before Phase 5
-connection orchestration. Keep the work bounded to an in-memory handshake path;
-do not add `SSL.connect`, socket modes, or OTP compatibility claims in this step.
-
-Required dependencies and acceptance requirements:
-
-1. Complete the TLS 1.3 key schedule beyond the existing HKDF helpers, including
-   handshake/application traffic secrets, Finished keys, and the derivations needed
-   for the selected cipher suites.
-2. Implement AEAD TLS record protection with independent sequence state, encrypted
-   handshake codecs, and exact transcript-byte handling. Enforce record/message
-   limits and return structured protocol errors for malformed input and authentication
-   failures.
-3. Implement server-flight verification for EncryptedExtensions, Certificate,
-   CertificateVerify, and Finished, using `:public_key` for PKIX chain and hostname
-   validation, constant-time Finished comparison, and standard signature verification.
-   Define alert/error behavior
-   for invalid certificates, identities, signatures, Finished values, and AEAD tags.
-4. Keep fresh per-connection key material and the no-runtime-`:ssl` rule. Preserve
-   ordered wire bytes and add deterministic vectors, captured-flight fixtures, and
-   negative/fragmentation tests, including malformed certificates and cryptographic
-   failures.
-5. If the first in-memory flow requires HRR, implement Phase 4B validation, transcript
-   rewrite, fresh second KeyShare, and profile-preserving ClientHello2; otherwise keep
-   the HRR transition explicitly deferred and test the normal ServerHello path first.
-6. Add independent interoperability evidence against OTP `:ssl` and OpenSSL once
-   the pure verification path is stable; do not treat ex_ssl-to-ex_ssl tests as
-   interoperability.
-
-The exit gate is a pure/in-memory captured server flight that verifies correctly,
-with exact transcript bytes, bounded parsing, negative vectors, and documented
-failure/alert behavior. Connection orchestration and live socket compatibility
-remain the subsequent Phase 5 assignment.
+Proceed to Phase 5 connection orchestration only after the repaired pure suite and
+both documented CI runtime matrices remain green. `SSL.connect`, socket ownership,
+active/passive delivery, complete HRR, resumption, and 0-RTT remain future work.
