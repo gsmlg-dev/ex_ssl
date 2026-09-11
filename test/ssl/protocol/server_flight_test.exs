@@ -28,6 +28,14 @@ defmodule SSL.Protocol.ServerFlightTest do
             }, ^trailing} = ServerFlight.decode(encoded <> trailing, @decode_options)
   end
 
+  test "generic codec recognizes an offered early_data extension" do
+    encoded = handshake(8, extensions([extension(42, <<>>)]))
+    options = Keyword.put(@decode_options, :offered_extension_ids, [42])
+
+    assert {:ok, %EncryptedExtensions{extensions: [{:early_data}]}, <<>>} =
+             ServerFlight.decode(encoded, options)
+  end
+
   test "decodes a bounded Certificate chain and entry extensions" do
     encoded = certificate()
 
@@ -283,6 +291,11 @@ defmodule SSL.Protocol.ServerFlightTest do
           flunk("unexpected decode result: #{inspect(other)}")
       end
     end
+  end
+
+  test "rejects improper option lists without raising" do
+    assert {:error, {:invalid_options, :structure}} =
+             ServerFlight.decode(<<>>, [{:hash, :sha256} | :not_a_list])
   end
 
   defp handshake(type, body), do: <<type, byte_size(body)::24, body::binary>>

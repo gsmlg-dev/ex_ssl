@@ -10,12 +10,33 @@ defmodule SSL.PKIX do
   alias SSL.PKIX.Certificate
   alias SSL.PKIX.VerifiedPeer
 
+  require Record
+
+  Record.defrecordp(
+    :otp_certificate,
+    :OTPCertificate,
+    Record.extract(:OTPCertificate, from_lib: "public_key/include/OTP-PUB-KEY.hrl")
+  )
+
+  Record.defrecordp(
+    :otp_tbs_certificate,
+    :OTPTBSCertificate,
+    Record.extract(:OTPTBSCertificate, from_lib: "public_key/include/OTP-PUB-KEY.hrl")
+  )
+
+  Record.defrecordp(
+    :certificate_extension,
+    :Extension,
+    Record.extract(:Extension, from_lib: "public_key/include/OTP-PUB-KEY.hrl")
+  )
+
   @default_max_certificates 128
   @default_max_der_bytes 1_048_576
   @default_max_total_der_bytes 8_388_608
   @default_max_pem_bytes 8_388_608
   @rsa_encryption_oid {1, 2, 840, 113_549, 1, 1, 1}
   @ec_public_key_oid {1, 2, 840, 10_045, 2, 1}
+  @subject_alt_name_oid {2, 5, 29, 17}
   @option_keys [
     :max_certificates,
     :max_der_bytes,
@@ -236,25 +257,97 @@ defmodule SSL.PKIX do
   defp certificate_verify_key(public_key_info), do: public_key_info
 
   defp verify_identity(certificate, identity) do
-    if safe_verify_hostname(certificate, identity) do
+    if san_matches_identity?(subject_alt_names(certificate), identity) do
       :ok
     else
       {:error, :hostname_mismatch}
     end
   end
 
-  defp safe_verify_hostname(certificate, identity) do
-    :public_key.pkix_verify_hostname(certificate, [identity])
-  catch
-    _kind, _reason -> false
+  defp subject_alt_names(certificate) do
+    certificate
+    |> otp_certificate(:tbsCertificate)
+    |> otp_tbs_certificate(:extensions)
+    |> find_subject_alt_name()
   end
 
-  defp validate_identity({:dns_id, hostname})
-       when is_binary(hostname) and byte_size(hostname) > 0,
-       do: :ok
+  defp find_subject_alt_name(:asn1_NOVALUE), do: []
 
-  defp validate_identity({:ip, address}) when is_binary(address) and byte_size(address) > 0,
-    do: :ok
+  defp find_subject_alt_name(extensions) when is_list(extensions) do
+    Enum.find_value(extensions, [], fn extension ->
+      if certificate_extension(extension, :extnID) == @subject_alt_name_oid do
+        certificate_extension(extension, :extnValue)
+      end
+    end)
+  end
+
+  defp find_subject_alt_name(_extensions), do: []
+
+  defp san_matches_identity?(names, {:dns_id, reference}) do
+    Enum.any?(names, fn
+      {:dNSName, name} -> dns_name_matches?(name, reference)
+      _name -> false
+    end)
+  end
+
+  defp san_matches_identity?(names, {:ip, reference}) do
+    case ip_reference_bytes(reference) do
+      {:ok, reference_bytes} ->
+        Enum.any?(names, fn
+          {:iPAddress, ^reference_bytes} -> true
+          _name -> false
+        end)
+
+      :error ->
+        false
+    end
+  end
+
+  defp dns_name_matches?(name, reference) when is_list(name),
+    do: dns_name_matches?(List.to_string(name), reference)
+
+  defp dns_name_matches?(name, reference) when is_binary(name) and is_binary(reference) do
+    presented_labels = name |> String.downcase() |> String.split(".")
+    reference_labels = reference |> String.downcase() |> String.split(".")
+
+    case {presented_labels, reference_labels} do
+      {["*" | presented_suffix], [_reference_label | reference_suffix]}
+      when presented_suffix != [] ->
+        presented_suffix == reference_suffix
+
+      {presented, reference_labels} ->
+        "*" not in presented and presented == reference_labels
+    end
+  end
+
+  defp dns_name_matches?(_name, _reference), do: false
+
+  defp ip_reference_bytes(reference) when is_binary(reference) do
+    case :inet.parse_address(String.to_charlist(reference)) do
+      {:ok, address} -> ip_reference_bytes(address)
+      {:error, _reason} -> :error
+    end
+  end
+
+  defp ip_reference_bytes({a, b, c, d})
+       when a in 0..255 and b in 0..255 and c in 0..255 and d in 0..255,
+       do: {:ok, <<a, b, c, d>>}
+
+  defp ip_reference_bytes({a, b, c, d, e, f, g, h})
+       when a in 0..65_535 and b in 0..65_535 and c in 0..65_535 and d in 0..65_535 and
+              e in 0..65_535 and f in 0..65_535 and g in 0..65_535 and h in 0..65_535,
+       do: {:ok, <<a::16, b::16, c::16, d::16, e::16, f::16, g::16, h::16>>}
+
+  defp ip_reference_bytes(_reference), do: :error
+
+  defp validate_identity({:dns_id, hostname})
+       when is_binary(hostname) and byte_size(hostname) > 0 do
+    if String.valid?(hostname), do: :ok, else: {:error, {:invalid_identity, {:dns_id, hostname}}}
+  end
+
+  defp validate_identity({:ip, address}) when is_binary(address) and byte_size(address) > 0 do
+    if String.valid?(address), do: :ok, else: {:error, {:invalid_identity, {:ip, address}}}
+  end
 
   defp validate_identity({:ip, {a, b, c, d}})
        when a in 0..255 and b in 0..255 and c in 0..255 and d in 0..255,
@@ -269,8 +362,12 @@ defmodule SSL.PKIX do
 
   defp nonempty_list([], :certificate_chain), do: {:error, :empty_certificate_chain}
   defp nonempty_list([], :trust_source), do: {:error, :empty_trust_anchors}
-  defp nonempty_list(value, _field) when is_list(value), do: :ok
+  defp nonempty_list([_value | rest], field), do: proper_list_tail(rest, field)
   defp nonempty_list(_value, field), do: {:error, {:invalid_input, field}}
+
+  defp proper_list_tail([], _field), do: :ok
+  defp proper_list_tail([_value | rest], field), do: proper_list_tail(rest, field)
+  defp proper_list_tail(_tail, field), do: {:error, {:invalid_input, field}}
 
   defp limits(options) when is_list(options) do
     if Keyword.keyword?(options) and

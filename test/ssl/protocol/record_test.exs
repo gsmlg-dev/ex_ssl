@@ -77,6 +77,26 @@ defmodule SSL.Protocol.RecordTest do
     assert state.sequence == 0
   end
 
+  test "rejects authenticated oversized and empty handshake or alert inner plaintext" do
+    maximum_content = :binary.copy(<<1>>, 16_384)
+
+    assert {:error, {:inner_plaintext_length_exceeded, 16_386, 16_385}} =
+             Record.decrypt(state(), authenticate_raw(maximum_content <> <<22, 0>>))
+
+    for type <- [21, 22] do
+      assert {:error, {:empty_content, decoded_type}} =
+               Record.decrypt(state(), authenticate_raw(<<type>>))
+
+      assert decoded_type in [:alert, :handshake]
+
+      assert {:error, {:empty_content, ^decoded_type}} =
+               Record.decrypt(state(), authenticate_raw(<<type, 0>>))
+    end
+
+    assert {:ok, :application_data, <<>>, %TrafficState{sequence: 1}} =
+             Record.decrypt(state(), authenticate_raw(<<23>>))
+  end
+
   test "validates the exact TLSCiphertext framing contract" do
     state = state()
 
@@ -120,7 +140,7 @@ defmodule SSL.Protocol.RecordTest do
   test "rejects sequence exhaustion without wrapping" do
     exhausted = %{state() | sequence: 0xFFFFFFFFFFFFFFFF}
 
-    assert {:error, :sequence_exhausted} = Record.encrypt(exhausted, :handshake, <<>>)
+    assert {:error, :sequence_exhausted} = Record.encrypt(exhausted, :handshake, <<1>>)
     assert {:error, :sequence_exhausted} = Record.decrypt(exhausted, @record)
     assert exhausted.sequence == 0xFFFFFFFFFFFFFFFF
   end
@@ -155,6 +175,13 @@ defmodule SSL.Protocol.RecordTest do
 
   defp replace_header(<<_header::binary-size(5), body::binary>>, type, version, length) do
     <<type, version::16, length::16, body::binary>>
+  end
+
+  defp authenticate_raw(inner_plaintext) do
+    length = byte_size(inner_plaintext) + 16
+    header = <<23, 3, 3, length::16>>
+    assert {:ok, ciphertext, tag} = AEAD.encrypt(state(), header, inner_plaintext)
+    <<header::binary, ciphertext::binary, tag::binary>>
   end
 
   defp feed_chunks(chunks) do

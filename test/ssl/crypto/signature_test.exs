@@ -49,9 +49,65 @@ defmodule SSL.Crypto.SignatureTest do
              Signature.verify_server(
                0x0403,
                public_key(@ec_public_pem),
+               :sha256,
                sequence(32),
                hex(@ec_signature)
              )
+  end
+
+  test "verifies ECDSA SHA-256 with a SHA-384 transcript digest" do
+    private_key = :public_key.generate_key({:namedCurve, {1, 2, 840, 10_045, 3, 1, 7}})
+    public_key = {{:ECPoint, elem(private_key, 4)}, elem(private_key, 3)}
+    transcript_digest = :crypto.hash(:sha384, "independent transcript")
+
+    signed_content =
+      :binary.copy(<<0x20>>, 64) <>
+        "TLS 1.3, server CertificateVerify" <> <<0>> <> transcript_digest
+
+    signature = :public_key.sign(signed_content, :sha256, private_key)
+
+    assert :ok =
+             Signature.verify_server(
+               0x0403,
+               public_key,
+               :sha384,
+               transcript_digest,
+               signature
+             )
+  end
+
+  test "verifies RSA-PSS SHA-256 with SHA-384 and RSA-PSS SHA-384 with SHA-256 transcripts" do
+    private_key = :public_key.generate_key({:rsa, 2048, 65_537})
+    public_key = {:RSAPublicKey, elem(private_key, 2), elem(private_key, 3)}
+
+    for {scheme, transcript_hash, signature_hash, salt_length} <- [
+          {0x0804, :sha384, :sha256, 32},
+          {0x0805, :sha256, :sha384, 48},
+          {0x0806, :sha384, :sha512, 64}
+        ] do
+      transcript_digest = :crypto.hash(transcript_hash, "independent transcript")
+
+      signed_content =
+        :binary.copy(<<0x20>>, 64) <>
+          "TLS 1.3, server CertificateVerify" <> <<0>> <> transcript_digest
+
+      options = [
+        {:rsa_padding, :rsa_pkcs1_pss_padding},
+        {:rsa_pss_saltlen, salt_length},
+        {:rsa_mgf1_md, signature_hash}
+      ]
+
+      signature = :public_key.sign(signed_content, signature_hash, private_key, options)
+
+      assert :ok =
+               Signature.verify_server(
+                 scheme,
+                 public_key,
+                 transcript_hash,
+                 transcript_digest,
+                 signature
+               )
+    end
   end
 
   test "verifies fixed OpenSSL RSA-PSS SHA-256, SHA-384, and SHA-512 signatures" do
@@ -62,6 +118,7 @@ defmodule SSL.Crypto.SignatureTest do
                Signature.verify_server(
                  scheme,
                  key,
+                 transcript_hash_algorithm(transcript_size),
                  sequence(transcript_size),
                  hex(Map.fetch!(@rsa_signatures, scheme))
                )
@@ -73,10 +130,16 @@ defmodule SSL.Crypto.SignatureTest do
     signature = hex(@ec_signature)
 
     assert {:error, :invalid_certificate_verify} =
-             Signature.verify_server(0x0403, key, :binary.copy(<<0>>, 32), signature)
+             Signature.verify_server(0x0403, key, :sha256, :binary.copy(<<0>>, 32), signature)
 
     assert {:error, :invalid_certificate_verify} =
-             Signature.verify_server(0x0403, key, sequence(32), flip_first_bit(signature))
+             Signature.verify_server(
+               0x0403,
+               key,
+               :sha256,
+               sequence(32),
+               flip_first_bit(signature)
+             )
   end
 
   test "rejects key type and curve mismatches" do
@@ -86,45 +149,55 @@ defmodule SSL.Crypto.SignatureTest do
     wrong_curve = {{:ECPoint, point}, {:namedCurve, {1, 3, 132, 0, 34}}}
 
     assert {:error, {:key_type_mismatch, :ecdsa}} =
-             Signature.verify_server(0x0403, rsa_key, sequence(32), hex(@ec_signature))
+             Signature.verify_server(0x0403, rsa_key, :sha256, sequence(32), hex(@ec_signature))
 
     assert {:error, {:key_type_mismatch, :rsa}} =
              Signature.verify_server(
                0x0804,
                ec_key,
+               :sha256,
                sequence(32),
                hex(Map.fetch!(@rsa_signatures, 0x0804))
              )
 
     assert {:error, {:unsupported_ec_curve, :secp384r1}} =
-             Signature.verify_server(0x0403, wrong_curve, sequence(32), hex(@ec_signature))
+             Signature.verify_server(
+               0x0403,
+               wrong_curve,
+               :sha256,
+               sequence(32),
+               hex(@ec_signature)
+             )
   end
 
   test "rejects unsupported schemes and malformed arbitrary terms" do
     ec_key = public_key(@ec_public_pem)
 
     assert {:error, {:unsupported_signature_scheme, 0x0807}} =
-             Signature.verify_server(0x0807, ec_key, sequence(32), <<1>>)
+             Signature.verify_server(0x0807, ec_key, :sha256, sequence(32), <<1>>)
 
     assert {:error, {:unsupported_signature_scheme, nil}} =
-             Signature.verify_server(nil, ec_key, sequence(32), <<1>>)
+             Signature.verify_server(nil, ec_key, :sha256, sequence(32), <<1>>)
 
     assert {:error, {:invalid_transcript_hash_length, 32}} =
-             Signature.verify_server(0x0403, ec_key, <<0>>, <<1>>)
+             Signature.verify_server(0x0403, ec_key, :sha256, <<0>>, <<1>>)
 
     assert {:error, {:invalid_input, :transcript_hash}} =
-             Signature.verify_server(0x0403, ec_key, nil, <<1>>)
+             Signature.verify_server(0x0403, ec_key, :sha256, nil, <<1>>)
 
     assert {:error, {:invalid_input, :signature}} =
-             Signature.verify_server(0x0403, ec_key, sequence(32), nil)
+             Signature.verify_server(0x0403, ec_key, :sha256, sequence(32), nil)
 
     assert {:error, :empty_signature} =
-             Signature.verify_server(0x0403, ec_key, sequence(32), <<>>)
+             Signature.verify_server(0x0403, ec_key, :sha256, sequence(32), <<>>)
 
     assert {:error, :invalid_public_key} =
-             Signature.verify_server(0x0403, nil, sequence(32), <<1>>)
+             Signature.verify_server(0x0403, nil, :sha256, sequence(32), <<1>>)
 
     assert {:error, :unsupported_hash} = Signature.server_signed_content(:sha1, <<0::160>>)
+
+    assert {:error, {:invalid_transcript_hash_length, 32}} =
+             Signature.server_signed_content(:sha256, <<0::384>>)
   end
 
   defp public_key(pem) do
@@ -133,6 +206,9 @@ defmodule SSL.Crypto.SignatureTest do
   end
 
   defp sequence(size), do: for(byte <- 0..(size - 1), into: <<>>, do: <<byte>>)
+  defp transcript_hash_algorithm(32), do: :sha256
+  defp transcript_hash_algorithm(48), do: :sha384
+  defp transcript_hash_algorithm(64), do: :sha512
   defp hex(value), do: Base.decode16!(value, case: :mixed)
   defp flip_first_bit(<<first, rest::binary>>), do: <<Bitwise.bxor(first, 1), rest::binary>>
 end

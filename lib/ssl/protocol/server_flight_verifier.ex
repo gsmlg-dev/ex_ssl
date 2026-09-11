@@ -13,6 +13,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
   alias SSL.PKIX
 
   alias SSL.Protocol.{
+    ClientOffer,
     HandshakeFramer,
     Record,
     ServerFlight,
@@ -110,11 +111,13 @@ defmodule SSL.Protocol.ServerFlightVerifier do
 
   @type fatal_alert ::
           :bad_record_mac
+          | :record_overflow
           | :unknown_ca
           | :bad_certificate
           | :certificate_unknown
           | :decrypt_error
           | :unexpected_message
+          | :unsupported_extension
           | :decode_error
           | :illegal_parameter
           | :internal_error
@@ -130,13 +133,15 @@ defmodule SSL.Protocol.ServerFlightVerifier do
 
   defp verify_flight(%Input{} = input, options) do
     with {:ok, config} <- validate_options(options),
-         :ok <- validate_input(input),
-         {:ok, suite, hash, peer_public_key} <- negotiate(input),
+         {:ok, offer, server_hello} <- validate_input(input),
+         {:ok, config} <- bind_offer(config, offer),
+         input = %{input | server_hello: server_hello},
+         {:ok, suite, hash, peer_public_key} <- negotiate(input, offer),
          {:ok, secrets} <- derive_handshake_secrets(input, suite, hash, peer_public_key),
          {:ok, messages, server_handshake_state} <-
            decrypt_records(input.records, secrets.server_handshake_state, config),
          {:ok, verified_peer, transcript} <-
-           verify_messages(messages, input, secrets, config),
+           verify_messages(messages, input, secrets, config, offer),
          {:ok, result} <-
            finish_client_flight(
              verified_peer,
@@ -152,45 +157,135 @@ defmodule SSL.Protocol.ServerFlightVerifier do
     do: alert(:decode_error, {:invalid_input, :verifier})
 
   defp validate_input(%Input{} = input) do
-    with :ok <- validate_handshake(input.client_hello, 1, :client_hello),
-         :ok <- validate_server_hello(input.server_hello),
-         :ok <- validate_key_pair(input.client_key_pair) do
-      :ok
+    with {:ok, offer} <- client_offer(input.client_hello),
+         {:ok, server_hello} <- reparse_server_hello(input.server_hello, offer),
+         :ok <- compare_server_hello(input.server_hello, server_hello),
+         :ok <- validate_server_hello_kind(server_hello),
+         :ok <- validate_key_pair(input.client_key_pair, offer, server_hello) do
+      {:ok, offer, server_hello}
     else
       {:error, {_alert, _reason}} = error -> error
     end
   end
 
-  defp validate_handshake(encoded, expected_type, name) when is_binary(encoded) do
-    case encoded do
-      <<^expected_type, length::24, body::binary>>
-      when length == byte_size(body) and length <= @maximum_handshake_length ->
-        :ok
-
-      <<_type, length::24, _body::binary>> when length > @maximum_handshake_length ->
-        alert(:decode_error, {:handshake_length_exceeded, name, length})
-
-      _encoded ->
-        alert(:decode_error, {:invalid_handshake_encoding, name})
+  defp client_offer(encoded) do
+    case ClientOffer.from_client_hello(encoded) do
+      {:ok, offer} -> {:ok, offer}
+      {:error, reason} -> alert(:decode_error, reason)
     end
   end
 
-  defp validate_handshake(_encoded, _expected_type, name),
-    do: alert(:decode_error, {:invalid_handshake_encoding, name})
+  defp reparse_server_hello(%ServerHello{encoded: encoded}, offer) do
+    expectations = %{
+      legacy_session_id: offer.legacy_session_id,
+      offered_ciphers: offer.cipher_suites,
+      offered_versions: offer.offered_versions,
+      offered_groups: offer.supported_groups,
+      offered_key_share_groups: Enum.map(offer.key_shares, & &1.group),
+      offered_extension_ids: offer.extension_ids,
+      offered_psk_key_exchange_modes: offer.psk_key_exchange_modes,
+      offered_psk_count: offer.psk_count
+    }
 
-  defp validate_server_hello(%ServerHello{kind: :hello_retry_request}),
-    do: alert(:unexpected_message, {:unsupported, :hello_retry_request})
+    case ServerHello.decode(encoded, expectations) do
+      {:ok, %ServerHello{} = server_hello, <<>>} ->
+        {:ok, server_hello}
 
-  defp validate_server_hello(%ServerHello{kind: :server_hello, encoded: encoded}),
-    do: validate_handshake(encoded, 2, :server_hello)
+      {:ok, %ServerHello{}, remainder} ->
+        alert(:decode_error, {:trailing_server_hello, byte_size(remainder)})
 
-  defp validate_server_hello(_server_hello),
+      {:more, bytes} ->
+        alert(:decode_error, {:incomplete_server_hello, bytes})
+
+      {:error, reason} ->
+        alert(:illegal_parameter, reason)
+    end
+  end
+
+  defp reparse_server_hello(_server_hello, _offer),
     do: alert(:decode_error, {:invalid_input, :server_hello})
 
-  defp validate_key_pair(%KeyPair{}), do: :ok
-  defp validate_key_pair(_key_pair), do: alert(:illegal_parameter, :invalid_key_pair)
+  defp validate_server_hello_kind(%ServerHello{kind: :server_hello}), do: :ok
 
-  defp negotiate(%Input{server_hello: server_hello, client_key_pair: client_key_pair}) do
+  defp validate_server_hello_kind(%ServerHello{kind: :hello_retry_request}),
+    do: alert(:unexpected_message, {:unsupported, :hello_retry_request})
+
+  defp compare_server_hello(supplied, parsed) do
+    fields = [
+      :cipher_suite,
+      :random,
+      :legacy_session_id_echo,
+      :legacy_version,
+      :compression_method,
+      :kind
+    ]
+
+    case Enum.find(fields, &(Map.get(supplied, &1) != Map.get(parsed, &1))) do
+      nil -> compare_server_hello_extensions(supplied.extensions, parsed.extensions)
+      field -> alert(:illegal_parameter, {:server_hello_semantics_mismatch, field})
+    end
+  end
+
+  defp compare_server_hello_extensions(supplied, parsed) do
+    cond do
+      not proper_extension_list?(supplied) ->
+        alert(:illegal_parameter, :malformed_server_hello_extensions)
+
+      server_extension(supplied, :supported_versions) !=
+          server_extension(parsed, :supported_versions) ->
+        alert(:illegal_parameter, {:server_hello_semantics_mismatch, :version})
+
+      server_extension(supplied, :key_share) != server_extension(parsed, :key_share) ->
+        alert(:illegal_parameter, {:server_hello_semantics_mismatch, :key_share})
+
+      supplied != parsed ->
+        alert(:illegal_parameter, {:server_hello_semantics_mismatch, :extensions})
+
+      true ->
+        :ok
+    end
+  end
+
+  defp server_extension(extensions, name) when is_list(extensions),
+    do:
+      Enum.find(extensions, fn
+        {^name, _value} -> true
+        _extension -> false
+      end)
+
+  defp server_extension(_extensions, _name), do: :malformed
+
+  defp proper_extension_list?([]), do: true
+  defp proper_extension_list?([{_name, _value} | rest]), do: proper_extension_list?(rest)
+  defp proper_extension_list?(_extensions), do: false
+
+  defp validate_key_pair(%KeyPair{} = key_pair, offer, server_hello) do
+    with {:ok, selected_group, _peer_public} <- server_key_share(server_hello.extensions),
+         :ok <- key_pair_result(KeyExchange.validate_key_pair(key_pair)),
+         :ok <- bind_key_share_group(selected_group, key_pair.group),
+         {:ok, offered_public} <- offered_key_share(offer, selected_group),
+         true <- :crypto.hash_equals(offered_public, key_pair.public_key) do
+      :ok
+    else
+      false -> alert(:illegal_parameter, :client_key_pair_public_mismatch)
+      {:error, {_alert, _reason}} = error -> error
+    end
+  end
+
+  defp validate_key_pair(_key_pair, _offer, _server_hello),
+    do: alert(:illegal_parameter, :invalid_key_pair)
+
+  defp offered_key_share(offer, selected_group) do
+    case Enum.find(offer.key_shares, &(&1.group == selected_group)) do
+      %{key_exchange: public_key} -> {:ok, public_key}
+      nil -> alert(:illegal_parameter, {:client_key_share_not_offered, selected_group})
+    end
+  end
+
+  defp key_pair_result(:ok), do: :ok
+  defp key_pair_result({:error, reason}), do: alert(:illegal_parameter, reason)
+
+  defp negotiate(%Input{server_hello: server_hello, client_key_pair: client_key_pair}, _offer) do
     with {:ok, suite, hash} <- cipher_suite(server_hello.cipher_suite),
          {:ok, group, peer_public_key} <- server_key_share(server_hello.extensions),
          :ok <- bind_key_share_group(group, client_key_pair.group) do
@@ -349,6 +444,22 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       {:error, reason} when reason in [:authentication_failed, :decryption_failed] ->
         alert(:bad_record_mac, reason)
 
+      {:error, {:record_length_exceeded, _length, _maximum} = reason} ->
+        alert(:record_overflow, reason)
+
+      {:error, {:inner_plaintext_length_exceeded, _length, _maximum} = reason} ->
+        alert(:record_overflow, reason)
+
+      {:error, {:content_length_exceeded, _length, _maximum} = reason} ->
+        alert(:record_overflow, reason)
+
+      {:error, {:empty_content, content_type} = reason}
+      when content_type in [:handshake, :alert] ->
+        alert(:unexpected_message, reason)
+
+      {:error, reason} when reason in [:empty_inner_plaintext, :missing_inner_content_type] ->
+        alert(:unexpected_message, reason)
+
       {:error, reason} ->
         alert(:decode_error, reason)
     end
@@ -367,15 +478,18 @@ defmodule SSL.Protocol.ServerFlightVerifier do
          [encrypted_extensions, certificate, certificate_verify, finished],
          input,
          secrets,
-         config
+         config,
+         offer
        ) do
     options = [{:hash, secrets.hash} | config.server_flight_options]
 
     with {:ok, %EncryptedExtensions{} = encrypted_extensions} <-
            decode_message(encrypted_extensions, EncryptedExtensions, options),
+         :ok <- validate_encrypted_extensions(encrypted_extensions, offer),
          transcript = Transcript.append(secrets.transcript, encrypted_extensions.encoded),
          {:ok, %Certificate{} = certificate} <-
            decode_message(certificate, Certificate, options),
+         :ok <- validate_certificate_extensions(certificate, offer),
          transcript = Transcript.append(transcript, certificate.encoded),
          {:ok, verified_peer} <- verify_peer(certificate, input),
          {:ok, %CertificateVerify{} = certificate_verify} <-
@@ -390,7 +504,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
     end
   end
 
-  defp verify_messages(messages, _input, _secrets, _config),
+  defp verify_messages(messages, _input, _secrets, _config, _offer),
     do: alert(:unexpected_message, {:invalid_server_flight_order, message_types(messages)})
 
   defp decode_message(encoded, expected_module, options) do
@@ -408,9 +522,84 @@ defmodule SSL.Protocol.ServerFlightVerifier do
         alert(:decode_error, {:incomplete_handshake_message, bytes})
 
       {:error, reason} ->
-        alert(:decode_error, reason)
+        decode_alert(reason)
     end
   end
+
+  defp validate_encrypted_extensions(%EncryptedExtensions{extensions: extensions}, offer) do
+    Enum.reduce_while(extensions, :ok, fn extension, :ok ->
+      case validate_encrypted_extension(extension, offer) do
+        :ok -> {:cont, :ok}
+        {:error, {_alert, _reason}} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp validate_encrypted_extension({:early_data}, offer) do
+    if 42 in offer.extension_ids do
+      alert(:illegal_parameter, {:early_data_not_permitted, :non_psk})
+    else
+      alert(:unsupported_extension, {:unsolicited_extension, 42})
+    end
+  end
+
+  defp validate_encrypted_extension({:alpn, protocol}, offer) do
+    cond do
+      16 not in offer.extension_ids ->
+        alert(:unsupported_extension, {:unsolicited_extension, 16})
+
+      protocol not in offer.alpn_protocols ->
+        alert(:illegal_parameter, {:alpn_not_offered, protocol})
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_encrypted_extension(_extension, _offer), do: :ok
+
+  defp validate_certificate_extensions(%Certificate{entries: entries}, offer) do
+    entries
+    |> Enum.with_index()
+    |> Enum.reduce_while(:ok, fn {entry, index}, :ok ->
+      case validate_certificate_entry_extensions(entry.extensions, offer, index) do
+        :ok -> {:cont, :ok}
+        {:error, {_alert, _reason}} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp validate_certificate_entry_extensions(extensions, offer, index) do
+    Enum.reduce_while(extensions, :ok, fn extension, :ok ->
+      case certificate_extension_id(extension) do
+        id when id in [5, 18] ->
+          if id in offer.extension_ids do
+            {:cont, :ok}
+          else
+            {:halt,
+             alert(:unsupported_extension, {:unsolicited_certificate_extension, id, index})}
+          end
+
+        _id ->
+          {:cont, :ok}
+      end
+    end)
+  end
+
+  defp certificate_extension_id({:status_request, _response}), do: 5
+  defp certificate_extension_id({:signed_certificate_timestamps, _timestamps}), do: 18
+  defp certificate_extension_id(_extension), do: nil
+
+  defp decode_alert({:extension_not_offered, id}),
+    do: alert(:unsupported_extension, {:unsolicited_extension, id})
+
+  defp decode_alert({:forbidden_extension, context, id}),
+    do: alert(:unsupported_extension, {:forbidden_extension, context, id})
+
+  defp decode_alert({:signature_scheme_not_allowed, scheme}),
+    do: alert(:illegal_parameter, {:signature_scheme_not_offered, scheme})
+
+  defp decode_alert(reason), do: alert(:decode_error, reason)
 
   defp verify_peer(%Certificate{entries: entries}, input) do
     chain = Enum.map(entries, & &1.der)
@@ -427,6 +616,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
     case Signature.verify_server(
            certificate_verify.signature_scheme,
            verified_peer.public_key,
+           transcript.hash,
            Transcript.digest(transcript),
            certificate_verify.signature
          ) do
@@ -532,6 +722,39 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       end
     else
       alert(:decode_error, {:invalid_options, :verifier})
+    end
+  end
+
+  defp bind_offer(config, offer) do
+    supplied_extensions = Keyword.fetch(config.server_flight_options, :offered_extension_ids)
+    supplied_signatures = Keyword.fetch(config.server_flight_options, :allowed_signature_schemes)
+
+    with :ok <-
+           reject_offer_conflict(supplied_extensions, offer.extension_ids, :offered_extension_ids),
+         {:ok, allowed_signatures} <-
+           signature_policy(supplied_signatures, offer.signature_schemes) do
+      options =
+        config.server_flight_options
+        |> Keyword.put(:offered_extension_ids, offer.extension_ids)
+        |> Keyword.put(:allowed_signature_schemes, allowed_signatures)
+
+      {:ok, %{config | server_flight_options: options}}
+    end
+  end
+
+  defp reject_offer_conflict(:error, _actual, _field), do: :ok
+  defp reject_offer_conflict({:ok, actual}, actual, _field), do: :ok
+
+  defp reject_offer_conflict({:ok, _claimed}, _actual, field),
+    do: alert(:illegal_parameter, {:offer_override_conflict, field})
+
+  defp signature_policy(:error, offered), do: {:ok, offered}
+
+  defp signature_policy({:ok, policy}, offered) do
+    if Enum.all?(policy, &(&1 in offered)) do
+      {:ok, policy}
+    else
+      alert(:illegal_parameter, {:offer_override_conflict, :allowed_signature_schemes})
     end
   end
 

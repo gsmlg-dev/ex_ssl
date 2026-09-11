@@ -13,6 +13,8 @@ defmodule SSL.PKIXTest do
   @leaf_der @leaf_pem |> :public_key.pem_decode() |> hd() |> elem(1)
   @root_der @root_pem |> :public_key.pem_decode() |> hd() |> elem(1)
   @wrong_root_der @wrong_root_pem |> :public_key.pem_decode() |> hd() |> elem(1)
+  @identity_fixture_dir Path.expand("../../fixtures/pkix_identity", __DIR__)
+  @identity_root_pem File.read!(Path.join(@identity_fixture_dir, "root.pem"))
 
   test "decodes an ordered leaf-first DER chain without discarding exact bytes" do
     assert {:ok, [%Certificate{der: @leaf_der}, %Certificate{der: @root_der}]} =
@@ -38,6 +40,52 @@ defmodule SSL.PKIXTest do
   test "validates an IP subject alternative name" do
     assert {:ok, %VerifiedPeer{leaf_der: @leaf_der}} =
              PKIX.verify([@leaf_der], [@root_der], {:ip, {127, 0, 0, 1}})
+  end
+
+  test "rejects a matching common name when the certificate has no DNS SAN" do
+    assert {:error, :hostname_mismatch} =
+             PKIX.verify(
+               [identity_der("cn_only.pem")],
+               @identity_root_pem,
+               {:dns_id, "example.test"}
+             )
+  end
+
+  test "CN never rescues a mismatching SAN and an unrelated CN does not block a SAN match" do
+    assert {:error, :hostname_mismatch} =
+             verify_identity("mismatch.pem", {:dns_id, "example.test"})
+
+    assert {:ok, %VerifiedPeer{}} =
+             verify_identity("san_match.pem", {:dns_id, "example.test"})
+  end
+
+  test "matches IPv4 and IPv6 only against exact IP SAN values" do
+    for identity <- [
+          {:ip, "127.0.0.1"},
+          {:ip, {127, 0, 0, 1}},
+          {:ip, "::1"},
+          {:ip, {0, 0, 0, 0, 0, 0, 0, 1}}
+        ] do
+      assert {:ok, %VerifiedPeer{}} = verify_identity("ip.pem", identity)
+    end
+
+    assert {:error, :hostname_mismatch} = verify_identity("ip.pem", {:ip, "127.0.0.2"})
+  end
+
+  test "does not treat an IP-looking DNS SAN as an IP identity" do
+    assert {:error, :hostname_mismatch} =
+             verify_identity("dns_ip.pem", {:ip, "192.0.2.1"})
+  end
+
+  test "supports only a complete leftmost DNS wildcard matching one label" do
+    assert {:ok, %VerifiedPeer{}} =
+             verify_identity("wildcard.pem", {:dns_id, "www.example.test"})
+
+    assert {:error, :hostname_mismatch} =
+             verify_identity("wildcard.pem", {:dns_id, "a.b.example.test"})
+
+    assert {:error, :hostname_mismatch} =
+             verify_identity("partial_wildcard.pem", {:dns_id, "foo.example.test"})
   end
 
   test "accepts a peer chain that includes the supplied trust anchor" do
@@ -78,7 +126,17 @@ defmodule SSL.PKIXTest do
 
     assert {:error, {:invalid_identity, nil}} = PKIX.verify([@leaf_der], [@root_der], nil)
 
+    assert {:error, {:invalid_identity, {:dns_id, <<255>>}}} =
+             PKIX.verify([@leaf_der], [@root_der], {:dns_id, <<255>>})
+
+    assert {:error, {:invalid_identity, {:ip, <<255>>}}} =
+             PKIX.verify([@leaf_der], [@root_der], {:ip, <<255>>})
+
     assert {:error, {:invalid_input, :options}} = PKIX.decode_chain([@leaf_der], nil)
+    assert {:error, {:invalid_input, :certificate_chain}} = PKIX.decode_chain([@leaf_der | :bad])
+
+    assert {:error, {:invalid_input, :options}} =
+             PKIX.decode_chain([@leaf_der], [{:max_der_bytes, 1} | :bad])
   end
 
   test "enforces certificate count, individual DER, total DER, and PEM bounds" do
@@ -126,4 +184,17 @@ defmodule SSL.PKIXTest do
     <<prefix::binary-size(^prefix_size), last>> = der
     <<prefix::binary, Bitwise.bxor(last, 1)>>
   end
+
+  defp identity_der(name) do
+    [entry] =
+      name
+      |> then(&Path.join(@identity_fixture_dir, &1))
+      |> File.read!()
+      |> :public_key.pem_decode()
+
+    elem(entry, 1)
+  end
+
+  defp verify_identity(name, identity),
+    do: PKIX.verify([identity_der(name)], @identity_root_pem, identity)
 end

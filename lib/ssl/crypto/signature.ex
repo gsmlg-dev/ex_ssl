@@ -33,13 +33,20 @@ defmodule SSL.Crypto.Signature do
     end
   end
 
-  @spec verify_server(term(), term(), term(), term()) :: :ok | {:error, error_reason()}
-  def verify_server(signature_scheme, public_key, transcript_hash, signature) do
-    with {:ok, key_type, hash, verify_options} <- signature_scheme(signature_scheme),
-         {:ok, signed_content} <- server_signed_content(hash, transcript_hash),
+  @spec verify_server(term(), term(), atom(), term(), term()) :: :ok | {:error, error_reason()}
+  def verify_server(
+        signature_scheme,
+        public_key,
+        transcript_hash_algorithm,
+        transcript_digest,
+        signature
+      ) do
+    with {:ok, key_type, signature_hash, verify_options} <- signature_scheme(signature_scheme),
+         {:ok, signed_content} <-
+           server_signed_content(transcript_hash_algorithm, transcript_digest),
          :ok <- validate_signature(signature),
          :ok <- validate_public_key(key_type, public_key) do
-      verify(signed_content, hash, signature, public_key, verify_options)
+      verify(signed_content, signature_hash, signature, public_key, verify_options)
     end
   end
 

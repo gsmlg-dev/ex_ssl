@@ -29,6 +29,7 @@ defmodule SSL.Crypto.KeyExchange do
           | {:key_generation_failed, group()}
           | {:invalid_private_key, group()}
           | {:invalid_peer_public_key, group()}
+          | {:key_pair_mismatch, group()}
           | :invalid_key_pair
 
   @spec supported?(term()) :: boolean()
@@ -66,6 +67,29 @@ defmodule SSL.Crypto.KeyExchange do
   end
 
   def shared_secret(_key_pair, _peer_public_key), do: {:error, :invalid_key_pair}
+
+  @spec validate_key_pair(term()) :: :ok | {:error, error_reason()}
+  def validate_key_pair(%KeyPair{group: group, public_key: public_key, private_key: private_key})
+      when group in [:x25519, :secp256r1] do
+    if supported?(group) do
+      with :ok <- validate_private_key(group, private_key),
+           :ok <- validate_peer_public_key(group, public_key),
+           {derived_public, ^private_key} <- :crypto.generate_key(:ecdh, group, private_key),
+           :ok <- require_matching_public_key(derived_public, public_key, group) do
+        :ok
+      else
+        {:error, _reason} = error -> error
+        {_derived_public, _private_key} -> {:error, {:invalid_private_key, group}}
+      end
+    else
+      {:error, {:unsupported_capability, group}}
+    end
+  catch
+    :error, _reason -> {:error, {:invalid_private_key, group}}
+  end
+
+  def validate_key_pair(%KeyPair{group: group}), do: {:error, {:unsupported_group, group}}
+  def validate_key_pair(_key_pair), do: {:error, :invalid_key_pair}
 
   defp generate_supported(group) do
     {public_key, private_key} = :crypto.generate_key(:ecdh, group)
@@ -132,5 +156,16 @@ defmodule SSL.Crypto.KeyExchange do
 
     :error, :badarg ->
       {:error, {:invalid_peer_public_key, group}}
+  end
+
+  defp secure_equal(left, right)
+       when is_binary(left) and is_binary(right) and byte_size(left) == byte_size(right) do
+    :crypto.hash_equals(left, right)
+  end
+
+  defp secure_equal(_left, _right), do: false
+
+  defp require_matching_public_key(derived, supplied, group) do
+    if secure_equal(derived, supplied), do: :ok, else: {:error, {:key_pair_mismatch, group}}
   end
 end

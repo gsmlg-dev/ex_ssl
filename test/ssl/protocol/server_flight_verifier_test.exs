@@ -2,7 +2,7 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
 
-  alias SSL.Crypto.{KeyExchange, KeySchedule}
+  alias SSL.Crypto.{AEAD, KeyExchange, KeySchedule}
   alias SSL.Crypto.KeyExchange.KeyPair
   alias SSL.Protocol.{HandshakeFramer, Record, ServerFlightVerifier, ServerHello, Transcript}
   alias SSL.Protocol.ServerFlightVerifier.{Input, Result}
@@ -18,8 +18,12 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
            end)
   @root_pem File.read!(Path.join(@fixture_dir, "root.pem"))
   @wrong_root_pem File.read!(Path.expand("../../fixtures/pkix/wrong_root.pem", __DIR__))
+  @leaf_key_path Path.join(@fixture_dir, "leaf-key.pem")
+  @leaf_path Path.join(@fixture_dir, "leaf.pem")
+  @rsa_leaf_path Path.join(@fixture_dir, "leaf-rsa.pem")
+  @rsa_leaf_key_path Path.join(@fixture_dir, "leaf-rsa-key.pem")
 
-  test "verifies the captured fragmented and coalesced OpenSSL server flight" do
+  test "verifies the constructed fragmented and coalesced server flight" do
     assert {:ok,
             %Result{
               verified_peer: %{leaf_der: leaf_der},
@@ -33,6 +37,7 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
 
     assert client_finished_record == @capture.client_finished_record
     assert Transcript.digest(transcript) == @capture.transcript_digest
+    assert transcript.hash == :sha384
     assert client_application.key == @capture.client_app_key
     assert client_application.iv == @capture.client_app_iv
     assert server_application.key == @capture.server_app_key
@@ -45,11 +50,51 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
     refute inspected =~ Base.encode16(@capture.client_private)
   end
 
+  test "verifies a full SHA-384 transcript with RSA-PSS-RSAE-SHA256" do
+    flight =
+      SSL.TestServerFlightBuilder.build(
+        signature_scheme: 0x0804,
+        leaf_pem: @rsa_leaf_path,
+        leaf_key_pem: @rsa_leaf_key_path
+      )
+
+    assert {:ok, %Result{transcript: %{hash: :sha384}}} =
+             ServerFlightVerifier.verify(input_from_flight(flight))
+  end
+
   test "maps tampered AEAD authentication to bad_record_mac" do
     [first | rest] = capture_records()
 
     assert {:error, {:fatal_alert, :bad_record_mac, :authentication_failed}} =
              ServerFlightVerifier.verify(input(records: [flip_last_bit(first) | rest]))
+  end
+
+  test "classifies authenticated inner overflow and empty handshake precisely" do
+    oversized = :binary.copy(<<1>>, 16_384) <> <<22, 0>>
+
+    assert {:error,
+            {:fatal_alert, :record_overflow, {:inner_plaintext_length_exceeded, 16_386, 16_385}}} =
+             ServerFlightVerifier.verify(input(records: [authenticate_raw(oversized)]))
+
+    assert {:error, {:fatal_alert, :unexpected_message, {:empty_content, :handshake}}} =
+             ServerFlightVerifier.verify(input(records: [authenticate_raw(<<22, 0>>)]))
+
+    assert {:error, {:fatal_alert, :bad_record_mac, :authentication_failed}} =
+             ServerFlightVerifier.verify(
+               input(records: [authenticate_raw(oversized) |> flip_last_bit()])
+             )
+  end
+
+  test "classifies an oversized outer record before authentication" do
+    oversized = <<23, 3, 3, 16_641::16, 0::size(16_641 * 8)>>
+
+    assert {:error, {:fatal_alert, :record_overflow, {:record_length_exceeded, 16_641, 16_640}}} =
+             ServerFlightVerifier.verify(input(records: [oversized]))
+
+    generic_limit = <<23, 3, 3, 16_640::16, 0::size(16_640 * 8)>>
+
+    assert {:error, {:fatal_alert, :bad_record_mac, :authentication_failed}} =
+             ServerFlightVerifier.verify(input(records: [generic_limit]))
   end
 
   test "maps untrusted chains and wrong identities to certificate alerts" do
@@ -58,6 +103,100 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
 
     assert {:error, {:fatal_alert, :certificate_unknown, :hostname_mismatch}} =
              ServerFlightVerifier.verify(input(identity: {:dns_id, "wrong.example.test"}))
+  end
+
+  test "rejects a correctly authenticated unoffered ALPN selection" do
+    flight =
+      constructed_flight(
+        encrypted_extensions: [{16, <<9::16, 8, "http/1.1">>}],
+        client_options: [alpn_protocols: ["h2"]]
+      )
+
+    assert {:error, {:fatal_alert, :illegal_parameter, {:alpn_not_offered, "http/1.1"}}} =
+             ServerFlightVerifier.verify(input_from_flight(flight))
+  end
+
+  test "validates ALPN as exact opaque values and permits an absent response" do
+    for protocol <- ["h2", "http/1.1"] do
+      flight = constructed_flight(encrypted_extensions: [{16, alpn_payload([protocol])}])
+      assert {:ok, %Result{}} = ServerFlightVerifier.verify(input_from_flight(flight))
+    end
+
+    absent = constructed_flight(encrypted_extensions: [])
+    assert {:ok, %Result{}} = ServerFlightVerifier.verify(input_from_flight(absent))
+
+    case_mismatch =
+      constructed_flight(
+        encrypted_extensions: [{16, alpn_payload(["H2"])}],
+        client_options: [alpn_protocols: ["h2"]]
+      )
+
+    assert {:error, {:fatal_alert, :illegal_parameter, {:alpn_not_offered, "H2"}}} =
+             ServerFlightVerifier.verify(input_from_flight(case_mismatch))
+  end
+
+  test "rejects unsolicited and malformed ALPN with precise reasons" do
+    unsolicited =
+      constructed_flight(
+        encrypted_extensions: [{16, alpn_payload(["h2"])}],
+        client_options: [alpn_protocols: []]
+      )
+
+    assert {:error, {:fatal_alert, :unsupported_extension, {:unsolicited_extension, 16}}} =
+             ServerFlightVerifier.verify(input_from_flight(unsolicited))
+
+    for payload <- [<<0::16>>, alpn_payload(["h2", "http/1.1"])] do
+      malformed = constructed_flight(encrypted_extensions: [{16, payload}])
+
+      assert {:error, {:fatal_alert, :decode_error, {:malformed_extension, 16, :alpn}}} =
+               ServerFlightVerifier.verify(input_from_flight(malformed))
+    end
+  end
+
+  test "rejects early_data in the certificate-authenticated non-PSK flow" do
+    unsolicited = constructed_flight(encrypted_extensions: [{42, <<>>}])
+
+    assert {:error, {:fatal_alert, :unsupported_extension, {:unsolicited_extension, 42}}} =
+             ServerFlightVerifier.verify(input_from_flight(unsolicited))
+
+    impossible =
+      constructed_flight(
+        encrypted_extensions: [{42, <<>>}],
+        client_options: [early_data: true]
+      )
+
+    assert {:error, {:fatal_alert, :illegal_parameter, {:early_data_not_permitted, :non_psk}}} =
+             ServerFlightVerifier.verify(input_from_flight(impossible))
+  end
+
+  test "rejects unsolicited CertificateEntry OCSP and SCT responses on every entry" do
+    status_request = {5, <<1, 4::24, "ocsp">>}
+    sct = {18, <<3::16, "sct">>}
+
+    for {id, extension} <- [{5, status_request}, {18, sct}] do
+      offered = constructed_flight(certificate_extensions: [extension])
+      assert {:ok, %Result{}} = ServerFlightVerifier.verify(input_from_flight(offered))
+
+      leaf_response =
+        constructed_flight(
+          certificate_extensions: [extension],
+          client_options: [{extension_option(id), false}]
+        )
+
+      assert {:error,
+              {:fatal_alert, :unsupported_extension, {:unsolicited_certificate_extension, ^id, 0}}} =
+               ServerFlightVerifier.verify(input_from_flight(leaf_response))
+
+      later_response =
+        constructed_flight(
+          additional_certificate_entries: [{@root_pem, [extension]}],
+          client_options: [{extension_option(id), false}]
+        )
+
+      assert {:error,
+              {:fatal_alert, :unsupported_extension, {:unsolicited_certificate_extension, ^id, 1}}} =
+               ServerFlightVerifier.verify(input_from_flight(later_response))
+    end
   end
 
   test "rejects invalid CertificateVerify and Finished with decrypt_error" do
@@ -86,9 +225,16 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
                max_records: 2
              )
 
-    assert {:error, {:fatal_alert, :decode_error, {:record_length_mismatch, 124, 123}}} =
+    first_record = hd(capture_records())
+    <<_header::binary-size(3), declared_length::16, body::binary>> = first_record
+    invalid_declared_length = declared_length + 1
+    actual_length = byte_size(body)
+
+    assert {:error,
+            {:fatal_alert, :decode_error,
+             {:record_length_mismatch, ^invalid_declared_length, ^actual_length}}} =
              ServerFlightVerifier.verify(
-               input(records: [set_record_length(hd(capture_records()), 124)])
+               input(records: [set_record_length(first_record, declared_length + 1)])
              )
 
     stream = IO.iodata_to_binary(captured_messages())
@@ -122,15 +268,97 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
   test "rejects HelloRetryRequest and key-share mismatches explicitly" do
     server_hello = server_hello()
 
-    assert {:error, {:fatal_alert, :unexpected_message, {:unsupported, :hello_retry_request}}} =
+    assert {:error, {:fatal_alert, :illegal_parameter, {:server_hello_semantics_mismatch, :kind}}} =
              ServerFlightVerifier.verify(
                input(server_hello: %{server_hello | kind: :hello_retry_request})
              )
 
-    wrong_pair = %{client_key_pair() | group: :secp256r1}
+    assert {:ok, wrong_pair} = KeyExchange.generate(:secp256r1)
 
     assert {:error, {:fatal_alert, :illegal_parameter, {:key_share_group_mismatch, _, _}}} =
              ServerFlightVerifier.verify(input(client_key_pair: wrong_pair))
+  end
+
+  test "rejects supplied ServerHello semantics that diverge from its exact bytes" do
+    original = server_hello()
+    {:key_share, key_share} = Enum.find(original.extensions, &match?({:key_share, _}, &1))
+
+    mutations = [
+      {:cipher_suite, %{original | cipher_suite: 0x1301}},
+      {:random, %{original | random: :binary.copy(<<0>>, 32)}},
+      {:legacy_session_id_echo, %{original | legacy_session_id_echo: <<1>>}},
+      {:legacy_version, %{original | legacy_version: 0x0304}},
+      {:compression_method, %{original | compression_method: 1}},
+      {:kind, %{original | kind: :hello_retry_request}},
+      {:version,
+       %{
+         original
+         | extensions:
+             List.keyreplace(
+               original.extensions,
+               :supported_versions,
+               0,
+               {:supported_versions, 0x0303}
+             )
+       }},
+      {:key_share,
+       %{
+         original
+         | extensions:
+             List.keyreplace(
+               original.extensions,
+               :key_share,
+               0,
+               {:key_share, %{key_share | key_exchange: flip_last_bit(key_share.key_exchange)}}
+             )
+       }}
+    ]
+
+    for {field, supplied} <- mutations do
+      assert {:error,
+              {:fatal_alert, :illegal_parameter, {:server_hello_semantics_mismatch, ^field}}} =
+               ServerFlightVerifier.verify(input(server_hello: supplied))
+    end
+  end
+
+  test "rejects encoded ServerHello selections outside the exact offer" do
+    original = server_hello()
+    encoded = replace_server_hello_cipher(original.encoded, 0x1301)
+
+    assert {:error, {:fatal_alert, :illegal_parameter, {:cipher_not_offered, 0x1301}}} =
+             ServerFlightVerifier.verify(
+               input(server_hello: %{original | cipher_suite: 0x1301, encoded: encoded})
+             )
+
+    encoded =
+      :binary.replace(
+        original.encoded,
+        <<0, 51, 0, 36, 0, 29>>,
+        <<0, 51, 0, 36, 0, 23>>
+      )
+
+    assert {:error,
+            {:fatal_alert, :illegal_parameter, {:selected_group_not_offered, :key_share, 0x0017}}} =
+             ServerFlightVerifier.verify(input(server_hello: %{original | encoded: encoded}))
+  end
+
+  test "rejects a client key pair not coherent with the offered public share" do
+    pair = client_key_pair()
+    mismatched = %{pair | public_key: flip_last_bit(pair.public_key)}
+
+    assert {:error, {:fatal_alert, :illegal_parameter, {:key_pair_mismatch, :x25519}}} =
+             ServerFlightVerifier.verify(input(client_key_pair: mismatched))
+  end
+
+  test "rejects verifier options that widen the exact client offer" do
+    assert {:error,
+            {:fatal_alert, :illegal_parameter, {:offer_override_conflict, :offered_extension_ids}}} =
+             ServerFlightVerifier.verify(input(), offered_extension_ids: [10, 13, 43, 51])
+
+    assert {:error,
+            {:fatal_alert, :illegal_parameter,
+             {:offer_override_conflict, :allowed_signature_schemes}}} =
+             ServerFlightVerifier.verify(input(), allowed_signature_schemes: [0x0804])
   end
 
   test "rejects malformed inputs and options with explicit fatal alerts" do
@@ -155,7 +383,8 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
     server_hello = server_hello()
     key_share = Enum.find(server_hello.extensions, &match?({:key_share, _}, &1))
 
-    assert {:error, {:fatal_alert, :illegal_parameter, :missing_key_share}} =
+    assert {:error,
+            {:fatal_alert, :illegal_parameter, {:server_hello_semantics_mismatch, :key_share}}} =
              ServerFlightVerifier.verify(
                input(
                  server_hello: %{
@@ -167,12 +396,14 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
 
     duplicate_key_share = %{server_hello | extensions: server_hello.extensions ++ [key_share]}
 
-    assert {:error, {:fatal_alert, :illegal_parameter, :duplicate_key_share}} =
+    assert {:error,
+            {:fatal_alert, :illegal_parameter, {:server_hello_semantics_mismatch, :extensions}}} =
              ServerFlightVerifier.verify(input(server_hello: duplicate_key_share))
 
     psk = %{server_hello | extensions: server_hello.extensions ++ [{:pre_shared_key, 0}]}
 
-    assert {:error, {:fatal_alert, :illegal_parameter, {:unsupported, :pre_shared_key}}} =
+    assert {:error,
+            {:fatal_alert, :illegal_parameter, {:server_hello_semantics_mismatch, :extensions}}} =
              ServerFlightVerifier.verify(input(server_hello: psk))
   end
 
@@ -219,17 +450,65 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
     )
   end
 
+  defp constructed_flight(options) do
+    SSL.TestServerFlightBuilder.build(
+      Keyword.merge(
+        [signature_scheme: 0x0403, leaf_pem: @leaf_path, leaf_key_pem: @leaf_key_path],
+        options
+      )
+    )
+  end
+
+  defp input_from_flight(flight, overrides \\ []) do
+    struct!(
+      Input,
+      Keyword.merge(
+        [
+          client_hello: flight.client_hello,
+          server_hello: server_hello(flight),
+          client_key_pair: %KeyPair{
+            group: :x25519,
+            public_key: flight.client_public,
+            private_key: flight.client_private
+          },
+          records: [flight.record_1, flight.record_2, flight.record_3],
+          trust_source: @root_pem,
+          identity: {:dns_id, "example.test"}
+        ],
+        overrides
+      )
+    )
+  end
+
   defp server_hello do
     expectations = %{
       legacy_session_id: <<>>,
-      offered_ciphers: [0x1301],
+      offered_ciphers: [0x1302],
       offered_groups: [0x001D],
       offered_key_share_groups: [0x001D],
-      offered_extension_ids: [10, 43, 51],
+      offered_extension_ids: [5, 10, 13, 16, 18, 43, 51],
       offered_psk_key_exchange_modes: []
     }
 
     assert {:ok, server_hello, <<>>} = ServerHello.decode(@capture.server_hello, expectations)
+    server_hello
+  end
+
+  defp server_hello(flight) do
+    assert {:ok, offer} = SSL.Protocol.ClientOffer.from_client_hello(flight.client_hello)
+
+    expectations = %{
+      legacy_session_id: offer.legacy_session_id,
+      offered_versions: offer.offered_versions,
+      offered_ciphers: offer.cipher_suites,
+      offered_groups: offer.supported_groups,
+      offered_key_share_groups: Enum.map(offer.key_shares, & &1.group),
+      offered_extension_ids: offer.extension_ids,
+      offered_psk_key_exchange_modes: offer.psk_key_exchange_modes,
+      offered_psk_count: offer.psk_count
+    }
+
+    assert {:ok, server_hello, <<>>} = ServerHello.decode(flight.server_hello, expectations)
     server_hello
   end
 
@@ -272,25 +551,25 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
       Enum.find(server_hello.extensions, &match?({:key_share, _}, &1))
 
     assert {:ok, shared_secret} = KeyExchange.shared_secret(client_key_pair(), peer_public)
-    assert {:ok, early_secret} = KeySchedule.early_secret(:sha256, nil)
+    assert {:ok, early_secret} = KeySchedule.early_secret(:sha384, nil)
 
     assert {:ok, handshake_secret} =
-             KeySchedule.handshake_secret(:sha256, early_secret, shared_secret)
+             KeySchedule.handshake_secret(:sha384, early_secret, shared_secret)
 
     transcript =
-      Transcript.new(:sha256)
+      Transcript.new(:sha384)
       |> Transcript.append(@capture.client_hello)
       |> Transcript.append(server_hello.encoded)
 
     assert {:ok, traffic_secret} =
              KeySchedule.server_handshake_traffic_secret(
-               :sha256,
+               :sha384,
                handshake_secret,
                Transcript.digest(transcript)
              )
 
     assert {:ok, state} =
-             KeySchedule.traffic_state(:tls_aes_128_gcm_sha256, traffic_secret)
+             KeySchedule.traffic_state(:tls_aes_256_gcm_sha384, traffic_secret)
 
     state
   end
@@ -303,9 +582,39 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
   defp set_record_length(<<type, version::16, _length::16, body::binary>>, length),
     do: <<type, version::16, length::16, body::binary>>
 
+  defp alpn_payload(protocols) do
+    entries = IO.iodata_to_binary(Enum.map(protocols, &<<byte_size(&1), &1::binary>>))
+    <<byte_size(entries)::16, entries::binary>>
+  end
+
+  defp extension_option(5), do: :status_request
+  defp extension_option(18), do: :signed_certificate_timestamps
+
+  defp replace_server_hello_cipher(
+         <<2, _length::24, legacy::16, random::binary-size(32), session_length, rest::binary>>,
+         cipher
+       ) do
+    <<session::binary-size(^session_length), _old_cipher::16, tail::binary>> = rest
+
+    body =
+      <<legacy::16, random::binary, session_length, session::binary, cipher::16, tail::binary>>
+
+    <<2, byte_size(body)::24, body::binary>>
+  end
+
   defp flip_last_bit(binary) do
     prefix_size = byte_size(binary) - 1
     <<prefix::binary-size(^prefix_size), last>> = binary
     <<prefix::binary, Bitwise.bxor(last, 1)>>
+  end
+
+  defp authenticate_raw(inner_plaintext) do
+    length = byte_size(inner_plaintext) + 16
+    header = <<23, 3, 3, length::16>>
+
+    assert {:ok, ciphertext, tag} =
+             AEAD.encrypt(server_handshake_state(), header, inner_plaintext)
+
+    <<header::binary, ciphertext::binary, tag::binary>>
   end
 end

@@ -7,7 +7,7 @@ defmodule SSL.Protocol.InnerPlaintext do
   """
 
   @maximum_content_length 16_384
-  @maximum_inner_plaintext_length 16_624
+  @maximum_inner_plaintext_length 16_385
 
   @type content_type :: :alert | :handshake | :application_data
 
@@ -15,6 +15,7 @@ defmodule SSL.Protocol.InnerPlaintext do
   def encode(content, content_type, padding_length \\ 0) do
     with :ok <- validate_content(content),
          {:ok, encoded_type} <- encode_type(content_type),
+         :ok <- validate_nonempty_content(content, content_type),
          :ok <- validate_padding_length(padding_length, byte_size(content)) do
       {:ok, <<content::binary, encoded_type, 0::size(padding_length * 8)>>}
     end
@@ -56,10 +57,15 @@ defmodule SSL.Protocol.InnerPlaintext do
   end
 
   defp decoded_content(plaintext, content_length, padding_length, content_type) do
-    if content_length <= @maximum_content_length do
-      {:ok, content_type, binary_part(plaintext, 0, content_length), padding_length}
-    else
-      {:error, {:content_length_exceeded, content_length, @maximum_content_length}}
+    cond do
+      content_length > @maximum_content_length ->
+        {:error, {:content_length_exceeded, content_length, @maximum_content_length}}
+
+      content_length == 0 and content_type in [:handshake, :alert] ->
+        {:error, {:empty_content, content_type}}
+
+      true ->
+        {:ok, content_type, binary_part(plaintext, 0, content_length), padding_length}
     end
   end
 
@@ -74,6 +80,11 @@ defmodule SSL.Protocol.InnerPlaintext do
   end
 
   defp validate_content(_content), do: {:error, {:invalid_content, :not_binary}}
+
+  defp validate_nonempty_content(<<>>, content_type) when content_type in [:handshake, :alert],
+    do: {:error, {:empty_content, content_type}}
+
+  defp validate_nonempty_content(_content, _content_type), do: :ok
 
   defp validate_padding_length(padding_length, content_length)
        when is_integer(padding_length) and padding_length >= 0 do

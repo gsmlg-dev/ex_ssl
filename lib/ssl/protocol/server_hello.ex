@@ -46,6 +46,7 @@ defmodule SSL.Protocol.ServerHello do
 
   @type expectations :: %{
           required(:legacy_session_id) => binary(),
+          optional(:offered_versions) => [0..0xFFFF],
           required(:offered_ciphers) => [0..0xFFFF],
           required(:offered_groups) => [0..0xFFFF],
           required(:offered_key_share_groups) => [0..0xFFFF],
@@ -226,8 +227,13 @@ defmodule SSL.Protocol.ServerHello do
        ),
        do: error
 
-  defp parse_extension(_kind, 43, <<0x0304::16>>, _expectations),
-    do: {:ok, {:supported_versions, 0x0304}}
+  defp parse_extension(_kind, 43, <<0x0304::16>>, expectations) do
+    if 0x0304 in Map.get(expectations, :offered_versions, [0x0304]) do
+      {:ok, {:supported_versions, 0x0304}}
+    else
+      {:error, {:selected_version_not_offered, 0x0304}}
+    end
+  end
 
   defp parse_extension(_kind, 43, payload, _expectations),
     do: {:error, {:invalid_supported_versions, payload}}
@@ -401,6 +407,7 @@ defmodule SSL.Protocol.ServerHello do
          :ok <- validate_list_expectation(expectations, :offered_groups),
          :ok <- validate_list_expectation(expectations, :offered_key_share_groups),
          :ok <- validate_list_expectation(expectations, :offered_extension_ids),
+         :ok <- validate_optional_list_expectation(expectations, :offered_versions),
          :ok <- validate_psk_mode_expectation(expectations),
          :ok <- validate_key_share_expectation(expectations),
          :ok <- validate_psk_expectation(expectations) do
@@ -428,6 +435,13 @@ defmodule SSL.Protocol.ServerHello do
 
       _other ->
         {:error, {:invalid_expectations, field}}
+    end
+  end
+
+  defp validate_optional_list_expectation(expectations, field) do
+    case Map.fetch(expectations, field) do
+      :error -> :ok
+      {:ok, _values} -> validate_list_expectation(expectations, field)
     end
   end
 
