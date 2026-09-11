@@ -97,12 +97,27 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
              ServerFlightVerifier.verify(input(records: [generic_limit]))
   end
 
+  test "classifies an unexpected outer record content type before authentication" do
+    <<_application_data, authenticated_body::binary>> = authenticate_raw(<<22, 0>>)
+    wrong_outer_type = <<22, authenticated_body::binary>>
+
+    assert {:error, {:fatal_alert, :unexpected_message, {:unexpected_outer_content_type, 22}}} =
+             ServerFlightVerifier.verify(input(records: [wrong_outer_type]))
+  end
+
   test "maps untrusted chains and wrong identities to certificate alerts" do
     assert {:error, {:fatal_alert, :unknown_ca, {:path_validation_failed, _reason}}} =
              ServerFlightVerifier.verify(input(trust_source: @wrong_root_pem))
 
     assert {:error, {:fatal_alert, :certificate_unknown, :hostname_mismatch}} =
              ServerFlightVerifier.verify(input(identity: {:dns_id, "wrong.example.test"}))
+  end
+
+  test "maps an invalid caller DNS identity to illegal_parameter" do
+    identity = {:dns_id, ".example.test"}
+
+    assert {:error, {:fatal_alert, :illegal_parameter, {:invalid_identity, ^identity}}} =
+             ServerFlightVerifier.verify(input(identity: identity))
   end
 
   test "rejects a correctly authenticated unoffered ALPN selection" do
@@ -151,6 +166,14 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
       assert {:error, {:fatal_alert, :decode_error, {:malformed_extension, 16, :alpn}}} =
                ServerFlightVerifier.verify(input_from_flight(malformed))
     end
+  end
+
+  test "classifies a forbidden EncryptedExtensions extension as illegal_parameter" do
+    flight = constructed_flight(encrypted_extensions: [{43, <<0x0304::16>>}])
+
+    assert {:error,
+            {:fatal_alert, :illegal_parameter, {:forbidden_extension, :encrypted_extensions, 43}}} =
+             ServerFlightVerifier.verify(input_from_flight(flight))
   end
 
   test "rejects early_data in the certificate-authenticated non-PSK flow" do
@@ -370,6 +393,14 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
 
     assert {:error, {:fatal_alert, :decode_error, {:invalid_options, :verifier}}} =
              ServerFlightVerifier.verify(input(), unknown: true)
+  end
+
+  test "rejects malformed allowed signature schemes before enumerating the policy" do
+    for policy <- [:all, [nil]] do
+      assert {:error,
+              {:fatal_alert, :decode_error, {:invalid_options, :allowed_signature_schemes}}} =
+               ServerFlightVerifier.verify(input(), allowed_signature_schemes: policy)
+    end
   end
 
   test "rejects an improper ServerHello extension list without raising" do

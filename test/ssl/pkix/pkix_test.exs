@@ -88,6 +88,15 @@ defmodule SSL.PKIXTest do
              verify_identity("partial_wildcard.pem", {:dns_id, "foo.example.test"})
   end
 
+  test "rejects DNS references with empty or wildcard labels before identity matching" do
+    for reference <- [".example.test", "www..example.test", "*.example.test"] do
+      identity = {:dns_id, reference}
+
+      assert {:error, {:invalid_identity, ^identity}} =
+               verify_identity("wildcard.pem", identity)
+    end
+  end
+
   test "accepts a peer chain that includes the supplied trust anchor" do
     assert {:ok, %VerifiedPeer{leaf_der: @leaf_der}} =
              PKIX.verify(

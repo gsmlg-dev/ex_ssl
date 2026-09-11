@@ -342,7 +342,11 @@ defmodule SSL.PKIX do
 
   defp validate_identity({:dns_id, hostname})
        when is_binary(hostname) and byte_size(hostname) > 0 do
-    if String.valid?(hostname), do: :ok, else: {:error, {:invalid_identity, {:dns_id, hostname}}}
+    if valid_dns_reference?(hostname) do
+      :ok
+    else
+      {:error, {:invalid_identity, {:dns_id, hostname}}}
+    end
   end
 
   defp validate_identity({:ip, address}) when is_binary(address) and byte_size(address) > 0 do
@@ -359,6 +363,13 @@ defmodule SSL.PKIX do
        do: :ok
 
   defp validate_identity(identity), do: {:error, {:invalid_identity, identity}}
+
+  defp valid_dns_reference?(hostname) do
+    String.valid?(hostname) and
+      hostname
+      |> String.split(".")
+      |> Enum.all?(&(byte_size(&1) > 0 and not String.contains?(&1, "*")))
+  end
 
   defp nonempty_list([], :certificate_chain), do: {:error, :empty_certificate_chain}
   defp nonempty_list([], :trust_source), do: {:error, :empty_trust_anchors}

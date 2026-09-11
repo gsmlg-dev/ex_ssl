@@ -453,6 +453,9 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       {:error, {:content_length_exceeded, _length, _maximum} = reason} ->
         alert(:record_overflow, reason)
 
+      {:error, {:unexpected_outer_content_type, _content_type} = reason} ->
+        alert(:unexpected_message, reason)
+
       {:error, {:empty_content, content_type} = reason}
       when content_type in [:handshake, :alert] ->
         alert(:unexpected_message, reason)
@@ -594,7 +597,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
     do: alert(:unsupported_extension, {:unsolicited_extension, id})
 
   defp decode_alert({:forbidden_extension, context, id}),
-    do: alert(:unsupported_extension, {:forbidden_extension, context, id})
+    do: alert(:illegal_parameter, {:forbidden_extension, context, id})
 
   defp decode_alert({:signature_scheme_not_allowed, scheme}),
     do: alert(:illegal_parameter, {:signature_scheme_not_offered, scheme})
@@ -606,6 +609,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
 
     case PKIX.verify(chain, input.trust_source, input.identity) do
       {:ok, verified_peer} -> {:ok, verified_peer}
+      {:error, {:invalid_identity, _identity} = reason} -> alert(:illegal_parameter, reason)
       {:error, :hostname_mismatch = reason} -> alert(:certificate_unknown, reason)
       {:error, {:path_validation_failed, _path_reason} = reason} -> alert(:unknown_ca, reason)
       {:error, reason} -> alert(:bad_certificate, reason)
@@ -750,13 +754,24 @@ defmodule SSL.Protocol.ServerFlightVerifier do
 
   defp signature_policy(:error, offered), do: {:ok, offered}
 
-  defp signature_policy({:ok, policy}, offered) do
-    if Enum.all?(policy, &(&1 in offered)) do
-      {:ok, policy}
-    else
-      alert(:illegal_parameter, {:offer_override_conflict, :allowed_signature_schemes})
+  defp signature_policy({:ok, policy}, offered) when is_list(policy) do
+    cond do
+      not Enum.all?(policy, &(is_integer(&1) and &1 in 0..0xFFFF)) ->
+        alert(:decode_error, {:invalid_options, :allowed_signature_schemes})
+
+      length(policy) != length(Enum.uniq(policy)) ->
+        alert(:decode_error, {:invalid_options, :allowed_signature_schemes})
+
+      Enum.all?(policy, &(&1 in offered)) ->
+        {:ok, policy}
+
+      true ->
+        alert(:illegal_parameter, {:offer_override_conflict, :allowed_signature_schemes})
     end
   end
+
+  defp signature_policy({:ok, _policy}, _offered),
+    do: alert(:decode_error, {:invalid_options, :allowed_signature_schemes})
 
   defp crypto_result({:ok, value}, _alert), do: {:ok, value}
   defp crypto_result({:error, reason}, alert), do: alert(alert, reason)
