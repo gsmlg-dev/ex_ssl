@@ -1,12 +1,13 @@
 name: E2E
 
 on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
-    inputs:
-      version:
-        description: Release version to test
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -16,9 +17,64 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  pending:
-    name: E2E test TODO
+  caddy-fingerprints:
+    name: Caddy JA3/JA4
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
-      # TODO: Download the requested release and run independent TLS interoperability tests.
-      - run: echo "E2E tests are not implemented for ex_ssl yet"
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1.24.1
+        with:
+          elixir-version: "1.18"
+          otp-version: "28"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            e2e/deps
+            e2e/_build
+          key: ${{ runner.os }}-mix-e2e-1.18-28-${{ hashFiles('e2e/mix.lock', 'mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-e2e-1.18-28-
+
+      - name: Build pinned Caddy test server
+        run: docker build --tag ex-ssl-caddy-e2e ./e2e
+
+      - name: Start Caddy test server
+        run: |
+          docker run --rm --detach \
+            --name ex-ssl-caddy-e2e \
+            --publish 127.0.0.1:8443:8443 \
+            ex-ssl-caddy-e2e
+          for attempt in $(seq 1 30); do
+            if ! docker inspect --format '{{.State.Running}}' ex-ssl-caddy-e2e 2>/dev/null | grep -q true; then
+              docker logs ex-ssl-caddy-e2e
+              exit 1
+            fi
+            if nc -z 127.0.0.1 8443; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs ex-ssl-caddy-e2e
+          exit 1
+
+      - name: Install e2e dependencies
+        working-directory: e2e
+        run: mix deps.get
+
+      - name: Compile e2e harness
+        working-directory: e2e
+        run: mix compile --warnings-as-errors
+
+      - name: Run authenticated fingerprint test
+        working-directory: e2e
+        run: mix test --trace
+
+      - name: Stop Caddy test server
+        if: always()
+        run: |
+          docker logs ex-ssl-caddy-e2e || true
+          docker stop ex-ssl-caddy-e2e || true
