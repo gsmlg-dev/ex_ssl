@@ -262,10 +262,10 @@ The foundation gate, the Phase 3D/4A deterministic wire/parsing milestone, and t
 
 See:
 
-- [ARCHITECTURE.md](ARCHITECTURE.md)
-- [DESIGN.md](DESIGN.md)
-- [PRD.md](PRD.md)
-- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [DESIGN.md](docs/DESIGN.md)
+- [PRD.md](docs/PRD.md)
+- [IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)
 - [AGENTS.md](AGENTS.md)
 
 ## Testing philosophy

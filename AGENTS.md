@@ -13,10 +13,10 @@ Implement `ex_ssl`, an independent Elixir/OTP TLS stack with:
 
 Read these files before changing architecture:
 
-1. `ARCHITECTURE.md`
-2. `DESIGN.md`
-3. `PRD.md`
-4. `IMPLEMENTATION_PLAN.md`
+1. `docs/ARCHITECTURE.md`
+2. `docs/DESIGN.md`
+3. `docs/PRD.md`
+4. `docs/IMPLEMENTATION_PLAN.md`
 5. `README.md`
 
 ## Source-of-truth hierarchy
@@ -349,7 +349,7 @@ Preferred wording during development:
 
 ## Work sequence
 
-Follow `IMPLEMENTATION_PLAN.md` unless a failing test or newly discovered protocol requirement forces a dependency change.
+Follow `docs/IMPLEMENTATION_PLAN.md` unless a failing test or newly discovered protocol requirement forces a dependency change.
 
 For the first implementation cycle, prioritize:
 
@@ -385,4 +385,3 @@ If an RFC requirement conflicts with the current architecture, do not patch arou
 If OTP public behavior is unclear, reproduce it in a focused executable test against the supported OTP baseline before emulating it.
 
 If a target profile requires advertising a protocol capability ex_ssl does not implement, do not advertise it by default. Record the requirement and schedule the missing protocol feature.
-
