@@ -2,6 +2,12 @@
 
 ## 1. Delivery strategy
 
+The current implementation cycle targets the restricted Manifold client subset
+documented in [COMPATIBILITY.md](COMPATIBILITY.md), following Phases 4–6 and 8,
+with the necessary Phase 10 post-handshake processing and Phase 12 limits.
+Application active modes and general API breadth remain later milestones.
+The library gate must pass before a separate Manifold consumer change starts.
+
 Implement `ex_ssl` in vertical protocol slices. Do not create dozens of empty modules first and do not attempt full OTP `:ssl` parity before the first real handshake.
 
 Every phase ends in an executable/testable capability.
@@ -688,4 +694,3 @@ For the first Codex execution cycle, stop after a coherent **foundation PR** con
 - all project documents committed.
 
 Do **not** attempt the entire TLS handshake in the foundation PR. The second cycle should target deterministic ClientHello generation plus ServerHello parsing; the third should target the first authenticated handshake.
-

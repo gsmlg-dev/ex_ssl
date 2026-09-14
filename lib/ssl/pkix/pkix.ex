@@ -31,6 +31,7 @@ defmodule SSL.PKIX do
   )
 
   @default_max_certificates 128
+  @default_max_trust_anchors 4_096
   @default_max_der_bytes 1_048_576
   @default_max_total_der_bytes 8_388_608
   @default_max_pem_bytes 8_388_608
@@ -40,17 +41,21 @@ defmodule SSL.PKIX do
   @maximum_dns_name_length 253
   @option_keys [
     :max_certificates,
+    :max_trust_anchors,
     :max_der_bytes,
     :max_total_der_bytes,
-    :max_pem_bytes
+    :max_pem_bytes,
+    :customize_hostname_check
   ]
 
   @type identity :: {:dns_id, binary()} | {:ip, binary() | :inet.ip_address()}
   @type option ::
           {:max_certificates, pos_integer()}
+          | {:max_trust_anchors, pos_integer()}
           | {:max_der_bytes, pos_integer()}
           | {:max_total_der_bytes, pos_integer()}
           | {:max_pem_bytes, pos_integer()}
+          | {:customize_hostname_check, keyword()}
   @type error_reason ::
           :empty_certificate_chain
           | :empty_trust_anchors
@@ -79,7 +84,7 @@ defmodule SSL.PKIX do
           {:ok, [Certificate.t()]} | {:error, error_reason()}
   def normalize_trust(source, options \\ []) do
     with {:ok, limits} <- limits(options) do
-      normalize_trust_source(source, limits)
+      normalize_trust_source(source, %{limits | max_certificates: limits.max_trust_anchors})
     end
   end
 
@@ -91,7 +96,12 @@ defmodule SSL.PKIX do
          {:ok, trust_anchors} <- normalize_trust(trust_source, options),
          {:ok, public_key} <- validate_path(chain, trust_anchors),
          [leaf | _] <- chain,
-         :ok <- verify_identity(leaf.decoded, identity) do
+         :ok <-
+           verify_identity(
+             leaf.decoded,
+             identity,
+             Keyword.get(options, :customize_hostname_check, [])
+           ) do
       {:ok,
        %VerifiedPeer{
          leaf_der: leaf.der,
@@ -115,13 +125,35 @@ defmodule SSL.PKIX do
 
   defp normalize_trust_source(source, limits) when is_list(source) do
     with :ok <- nonempty_list(source, :trust_source),
-         {:ok, certificates} <- decode_der_list(source, limits) do
+         {:ok, ders} <- trust_der_entries(source),
+         {:ok, certificates} <- decode_der_list(ders, limits) do
       {:ok, certificates}
     end
   end
 
   defp normalize_trust_source(_source, _limits),
     do: {:error, {:invalid_input, :trust_source}}
+
+  # OTP returns CA certificates as tagged tuples. The decoded term is deliberately
+  # ignored so all trust anchors follow the same bounded DER decoding path.
+  defp trust_der_entries(entries) do
+    entries
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, []}, fn
+      {{:cert, der, _decoded}, _index}, {:ok, ders} when is_binary(der) ->
+        {:cont, {:ok, [der | ders]}}
+
+      {der, _index}, {:ok, ders} when is_binary(der) ->
+        {:cont, {:ok, [der | ders]}}
+
+      {_entry, index}, _acc ->
+        {:halt, {:error, {:invalid_certificate, index}}}
+    end)
+    |> case do
+      {:ok, ders} -> {:ok, Enum.reverse(ders)}
+      {:error, _reason} = error -> error
+    end
+  end
 
   defp decode_pem(pem, limits) do
     case safe_pem_decode(pem) do
@@ -257,8 +289,8 @@ defmodule SSL.PKIX do
 
   defp certificate_verify_key(public_key_info), do: public_key_info
 
-  defp verify_identity(certificate, identity) do
-    if san_matches_identity?(subject_alt_names(certificate), identity) do
+  defp verify_identity(certificate, identity, hostname_options) do
+    if san_matches_identity?(subject_alt_names(certificate), identity, hostname_options) do
       :ok
     else
       {:error, :hostname_mismatch}
@@ -284,24 +316,72 @@ defmodule SSL.PKIX do
 
   defp find_subject_alt_name(_extensions), do: []
 
-  defp san_matches_identity?(names, {:dns_id, reference}) do
+  defp san_matches_identity?(names, {:dns_id, reference}, options) do
     Enum.any?(names, fn
-      {:dNSName, name} -> dns_name_matches?(name, reference)
-      _name -> false
+      {:dNSName, name} ->
+        customized_name_matches?({:dns_id, reference}, {:dNSName, name}, options)
+
+      _name ->
+        false
     end)
   end
 
-  defp san_matches_identity?(names, {:ip, reference}) do
+  defp san_matches_identity?(names, {:ip, reference} = identity, options) do
     case ip_reference_bytes(reference) do
       {:ok, reference_bytes} ->
         Enum.any?(names, fn
-          {:iPAddress, ^reference_bytes} -> true
-          _name -> false
+          {:iPAddress, bytes} ->
+            customized_name_matches?(
+              identity,
+              {:iPAddress, bytes},
+              options,
+              bytes == reference_bytes
+            )
+
+          _name ->
+            false
         end)
 
       :error ->
         false
     end
+  end
+
+  defp customized_name_matches?(
+         {:dns_id, reference} = reference_id,
+         {:dNSName, name} = presented,
+         options
+       ) do
+    case hostname_match_fun(options, reference_id, presented) do
+      true -> true
+      false -> false
+      :default -> dns_name_matches?(name, reference)
+    end
+  end
+
+  defp customized_name_matches?(reference, presented, options, default) do
+    case hostname_match_fun(options, reference, presented) do
+      true -> true
+      false -> false
+      :default -> default
+    end
+  end
+
+  defp hostname_match_fun(options, reference, presented) do
+    case Keyword.get(options, :match_fun) do
+      nil ->
+        :default
+
+      fun when is_function(fun, 2) ->
+        case fun.(reference, presented) do
+          true -> true
+          false -> false
+          :default -> :default
+          _other -> false
+        end
+    end
+  catch
+    _kind, _reason -> false
   end
 
   defp dns_name_matches?(name, reference) when is_list(name),
@@ -421,16 +501,26 @@ defmodule SSL.PKIX do
   defp proper_list_tail(_tail, field), do: {:error, {:invalid_input, field}}
 
   defp limits(options) when is_list(options) do
-    if Keyword.keyword?(options) and
-         Enum.all?(options, fn {key, value} -> key in @option_keys and valid_limit?(value) end) do
-      {:ok,
-       %{
-         max_certificates: Keyword.get(options, :max_certificates, @default_max_certificates),
-         max_der_bytes: Keyword.get(options, :max_der_bytes, @default_max_der_bytes),
-         max_total_der_bytes:
-           Keyword.get(options, :max_total_der_bytes, @default_max_total_der_bytes),
-         max_pem_bytes: Keyword.get(options, :max_pem_bytes, @default_max_pem_bytes)
-       }}
+    if Keyword.keyword?(options) do
+      limit_options = Keyword.drop(options, [:customize_hostname_check])
+
+      if Enum.all?(limit_options, fn {key, value} ->
+           key in @option_keys and valid_limit?(value)
+         end) and
+           valid_hostname_options?(Keyword.get(options, :customize_hostname_check, [])) do
+        {:ok,
+         %{
+           max_certificates: Keyword.get(options, :max_certificates, @default_max_certificates),
+           max_trust_anchors:
+             Keyword.get(options, :max_trust_anchors, @default_max_trust_anchors),
+           max_der_bytes: Keyword.get(options, :max_der_bytes, @default_max_der_bytes),
+           max_total_der_bytes:
+             Keyword.get(options, :max_total_der_bytes, @default_max_total_der_bytes),
+           max_pem_bytes: Keyword.get(options, :max_pem_bytes, @default_max_pem_bytes)
+         }}
+      else
+        {:error, {:invalid_input, :options}}
+      end
     else
       {:error, {:invalid_input, :options}}
     end
@@ -439,4 +529,8 @@ defmodule SSL.PKIX do
   defp limits(_options), do: {:error, {:invalid_input, :options}}
 
   defp valid_limit?(value), do: is_integer(value) and value > 0
+
+  defp valid_hostname_options?([]), do: true
+  defp valid_hostname_options?(match_fun: fun) when is_function(fun, 2), do: true
+  defp valid_hostname_options?(_options), do: false
 end

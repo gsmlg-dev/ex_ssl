@@ -1,0 +1,43 @@
+name: TLS interoperability
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tls13-client:
+    name: OTP and OpenSSL TLS 1.3 peers
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1.24.1
+        with:
+          elixir-version: "1.20"
+          otp-version: "29"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-interop-1.20-29-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-interop-1.20-29-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile
+        run: MIX_ENV=test mix compile --warnings-as-errors
+
+      - name: Run mandatory OTP and OpenSSL interoperability tests
+        run: mix test --include integration test/ssl/connection_lifecycle_test.exs test/ssl/otp_reference_test.exs test/ssl/connection_interop_test.exs

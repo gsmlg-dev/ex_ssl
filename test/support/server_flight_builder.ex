@@ -15,6 +15,7 @@ defmodule SSL.TestServerFlightBuilder do
     encrypted_extensions = Keyword.get(options, :encrypted_extensions, [])
     certificate_extensions = Keyword.get(options, :certificate_extensions, [])
     additional_certificate_entries = Keyword.get(options, :additional_certificate_entries, [])
+    certificate_request_extensions = Keyword.get(options, :certificate_request_extensions)
     client_options = Keyword.get(options, :client_options, [])
 
     {client_public, @client_private} = :crypto.generate_key(:ecdh, :x25519, @client_private)
@@ -40,6 +41,9 @@ defmodule SSL.TestServerFlightBuilder do
 
     encrypted_extensions_message = handshake(8, extensions_vector(encrypted_extensions))
 
+    certificate_request =
+      certificate_request(certificate_request_extensions)
+
     certificate_entries =
       [{leaf_pem, certificate_extensions} | additional_certificate_entries]
       |> Enum.map(fn {pem, extensions} ->
@@ -58,7 +62,10 @@ defmodule SSL.TestServerFlightBuilder do
     certificate_digest =
       :crypto.hash(
         hash,
-        client_hello <> server_hello <> encrypted_extensions_message <> certificate
+        client_hello <>
+          server_hello <>
+          encrypted_extensions_message <>
+          certificate_request <> certificate
       )
 
     signed_content =
@@ -77,7 +84,9 @@ defmodule SSL.TestServerFlightBuilder do
       :crypto.hash(
         hash,
         client_hello <>
-          server_hello <> encrypted_extensions_message <> certificate <> certificate_verify
+          server_hello <>
+          encrypted_extensions_message <>
+          certificate_request <> certificate <> certificate_verify
       )
 
     server_finished_key =
@@ -91,13 +100,18 @@ defmodule SSL.TestServerFlightBuilder do
         hash,
         suite,
         server_handshake_secret,
-        [encrypted_extensions_message, certificate <> certificate_verify, finished]
+        [
+          encrypted_extensions_message,
+          certificate_request <> certificate <> certificate_verify,
+          finished
+        ]
       )
 
     server_transcript =
       client_hello <>
         server_hello <>
-        encrypted_extensions_message <> certificate <> certificate_verify <> finished
+        encrypted_extensions_message <>
+        certificate_request <> certificate <> certificate_verify <> finished
 
     application_digest = :crypto.hash(hash, server_transcript)
     client_app_secret = derive_secret(hash, master_secret, "c ap traffic", application_digest)
@@ -106,11 +120,28 @@ defmodule SSL.TestServerFlightBuilder do
     client_finished_key =
       expand_label(hash, client_handshake_secret, "finished", <<>>, hash_length)
 
-    client_verify_data = :crypto.mac(:hmac, hash, client_finished_key, application_digest)
+    client_certificate = client_certificate(certificate_request)
+    client_transcript = server_transcript <> client_certificate
+    client_verify_digest = :crypto.hash(hash, client_transcript)
+    client_verify_data = :crypto.mac(:hmac, hash, client_finished_key, client_verify_digest)
     client_finished = handshake(20, client_verify_data)
 
-    [client_finished_record] =
-      encrypt_records(hash, suite, client_handshake_secret, [client_finished])
+    client_records =
+      encrypt_records(
+        hash,
+        suite,
+        client_handshake_secret,
+        if(client_certificate == <<>>,
+          do: [client_finished],
+          else: [client_certificate, client_finished]
+        )
+      )
+
+    {client_empty_certificate_record, client_finished_record} =
+      case client_records do
+        [finished_record] -> {nil, finished_record}
+        [certificate_record, finished_record] -> {certificate_record, finished_record}
+      end
 
     %{
       client_private: @client_private,
@@ -122,7 +153,8 @@ defmodule SSL.TestServerFlightBuilder do
       record_2: Enum.at(server_records, 1),
       record_3: Enum.at(server_records, 2),
       client_finished_record: client_finished_record,
-      transcript_digest: :crypto.hash(hash, server_transcript <> client_finished),
+      transcript_digest: :crypto.hash(hash, client_transcript <> client_finished),
+      client_empty_certificate_record: client_empty_certificate_record,
       client_app_key: expand_label(hash, client_app_secret, "key", <<>>, 32),
       client_app_iv: expand_label(hash, client_app_secret, "iv", <<>>, 12),
       server_app_key: expand_label(hash, server_app_secret, "key", <<>>, 32),
@@ -226,6 +258,14 @@ defmodule SSL.TestServerFlightBuilder do
   end
 
   defp handshake(type, body), do: <<type, byte_size(body)::24, body::binary>>
+
+  defp certificate_request(nil), do: <<>>
+
+  defp certificate_request(extensions) when is_list(extensions),
+    do: handshake(13, <<0, extensions_vector(extensions)::binary>>)
+
+  defp client_certificate(<<>>), do: <<>>
+  defp client_certificate(_request), do: handshake(11, <<0, 0::24>>)
   defp extensions_vector(extensions), do: encode_extensions(extensions) |> vector16()
 
   defp encode_extensions(extensions) do

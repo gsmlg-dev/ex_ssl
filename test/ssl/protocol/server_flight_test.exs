@@ -225,23 +225,128 @@ defmodule SSL.Protocol.ServerFlightTest do
     assert {:error, {:invalid_input, :verify_data}} = ServerFlight.encode_finished(nil)
   end
 
-  test "parses CertificateRequest enough to reject unsupported client authentication" do
+  test "parses CertificateRequest extensions that RFC 9846 permits but this client does not use" do
     signature_algorithms = extension(13, <<2::16, 0x0804::16>>)
+    server_name = extension(0, <<0, 0>>)
+    unknown = extension(0xFAFA, <<1, 2, 3>>)
 
     request =
-      handshake(13, <<0, byte_size(signature_algorithms)::16, signature_algorithms::binary>>)
+      handshake(
+        13,
+        <<0, byte_size(signature_algorithms <> server_name <> unknown)::16,
+          signature_algorithms::binary, server_name::binary, unknown::binary>>
+      )
 
-    assert {:error, {:unsupported_handshake, :client_authentication}} =
-             ServerFlight.decode(request, @decode_options)
+    assert {:ok,
+            %ServerFlight.CertificateRequest{
+              request_context: <<>>,
+              extensions: [
+                {:signature_algorithms, [0x0804]},
+                {:raw, 0, <<0, 0>>},
+                {:raw, 0xFAFA, <<1, 2, 3>>}
+              ],
+              encoded: ^request
+            }, <<>>} = ServerFlight.decode(request, @decode_options)
+
+    assert {:ok, <<11, 4::24, 0, 0::24>>} = ServerFlight.encode_empty_certificate(<<>>)
 
     assert {:error, {:malformed_certificate_request, :extensions_length}} =
              ServerFlight.decode(handshake(13, <<0, 2::16, 0>>), @decode_options)
+
+    assert {:error, {:unsupported_certificate_request_context, <<1>>}} =
+             ServerFlight.decode(handshake(13, <<1, 1, 0::16>>), @decode_options)
+
+    assert {:error, :missing_certificate_request_signature_algorithms} =
+             ServerFlight.decode(handshake(13, <<0, 0::16>>), @decode_options)
+
+    malformed = extension(13, <<1, 0x08>>)
+
+    assert {:error, {:malformed_extension, 13, :signature_algorithms}} =
+             ServerFlight.decode(
+               handshake(13, <<0, byte_size(malformed)::16, malformed::binary>>),
+               @decode_options
+             )
+
+    forbidden = extension(43, <<0x0304::16>>)
+
+    assert {:error, {:forbidden_extension, :certificate_request, 43}} =
+             ServerFlight.decode(
+               handshake(
+                 13,
+                 <<0, byte_size(signature_algorithms <> forbidden)::16,
+                   signature_algorithms::binary, forbidden::binary>>
+               ),
+               @decode_options
+             )
+  end
+
+  test "validates post-handshake NewSessionTicket and KeyUpdate" do
+    early_data = extension(42, <<16_384::32>>)
+
+    ticket =
+      handshake(
+        4,
+        <<60::32, 7::32, 1, 9, 2::16, 1, 2, byte_size(early_data)::16, early_data::binary>>
+      )
+
+    assert {:ok, %ServerFlight.NewSessionTicket{ticket: <<1, 2>>}, <<>>} =
+             ServerFlight.decode(ticket, @decode_options)
+
+    update = handshake(24, <<1>>)
+
+    assert {:ok, %ServerFlight.KeyUpdate{request_update: true}, <<>>} =
+             ServerFlight.decode(update, @decode_options)
+
+    assert {:ok, <<24, 1::24, 0>>} = ServerFlight.encode_key_update(false)
+
+    assert {:error, {:malformed_key_update, 2}} =
+             ServerFlight.decode(handshake(24, <<2>>), @decode_options)
+
+    invalid_early_data = extension(42, <<>>)
+
+    assert {:error, {:malformed_extension, 42, :early_data}} =
+             ServerFlight.decode(
+               handshake(
+                 4,
+                 <<60::32, 7::32, 0, 1::16, 1, byte_size(invalid_early_data)::16,
+                   invalid_early_data::binary>>
+               ),
+               @decode_options
+             )
+
+    assert {:error, {:invalid_new_session_ticket_lifetime, 604_801}} =
+             ServerFlight.decode(
+               handshake(4, <<604_801::32, 7::32, 0, 1::16, 1, 0::16>>),
+               @decode_options
+             )
+
+    unknown = extension(0xFAFA, <<1, 2, 3>>)
+
+    unknown_extension_ticket =
+      handshake(
+        4,
+        <<60::32, 7::32, 0, 1::16, 1, byte_size(unknown)::16, unknown::binary>>
+      )
+
+    assert {:ok, %ServerFlight.NewSessionTicket{extensions: [{:raw, 0xFAFA, <<1, 2, 3>>}]}, <<>>} =
+             ServerFlight.decode(unknown_extension_ticket, @decode_options)
+
+    forbidden = extension(43, <<0x0304::16>>)
+
+    assert {:error, {:forbidden_extension, :new_session_ticket, 43}} =
+             ServerFlight.decode(
+               handshake(
+                 4,
+                 <<60::32, 7::32, 0, 1::16, 1, byte_size(forbidden)::16, forbidden::binary>>
+               ),
+               @decode_options
+             )
   end
 
   test "validates decoder input and configurable limits" do
     assert {:error, {:invalid_input, :not_binary}} = ServerFlight.decode(nil, @decode_options)
 
-    assert {:error, {:unexpected_handshake_type, 4}} =
+    assert {:error, {:malformed_new_session_ticket, :header}} =
              ServerFlight.decode(handshake(4, <<>>), @decode_options)
 
     for key <- [

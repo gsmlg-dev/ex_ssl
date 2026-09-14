@@ -1,9 +1,10 @@
 # Caddy JA3/JA4 end-to-end test
 
-This isolated Mix project starts from a fresh ex_ssl ClientHello, completes an
-authenticated TLS 1.3 handshake without using OTP `:ssl`, sends an HTTP/1.1
-request, and checks the exact JA3 and JA4 values observed by Caddy's pinned
-listener plugins.
+This isolated Mix project uses the public `SSL.connect/send/recv/close` API to
+complete an authenticated TLS 1.3 handshake, send an HTTP/1.1 request, and check
+the exact JA3 and JA4 values observed by Caddy's pinned listener plugins. Its
+helper only supplies the WireProfile and parses the small test HTTP response;
+it contains no independent TLS implementation.
 
 The Caddy image build and live end-to-end test run only in
 `.github/workflows/e2e.yml`. Do not build or start the Caddy fixture locally.
