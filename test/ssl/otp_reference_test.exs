@@ -40,6 +40,27 @@ defmodule SSL.OTPReferenceTest do
     assert :ok = LocalTLSPeer.stop(peer)
   end
 
+  @tag capture_log: true
+  test "OTP timer edge accepts durations beyond 32 bits but rejects an unrepresentable deadline" do
+    {:ok, peer} =
+      LocalTLSPeer.start(fn socket ->
+        :ok = :ssl.send(socket, "a")
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    {:ok, socket} = :ssl.connect(~c"127.0.0.1", peer.port, LocalTLSPeer.client_options(), 5_000)
+    assert {:ok, "a"} = :ssl.recv(socket, 1, 4_294_967_296)
+
+    end_time =
+      :erlang.system_info(:end_time)
+      |> :erlang.convert_time_unit(:native, :millisecond)
+
+    unrepresentable_timeout = end_time - System.monotonic_time(:millisecond) + 1_000
+    assert catch_exit(:ssl.recv(socket, 1, unrepresentable_timeout))
+    assert :ok = LocalTLSPeer.stop(peer)
+  end
+
   test "OTP ssl serializes concurrent passive receives" do
     {:ok, peer} =
       LocalTLSPeer.start(fn socket ->

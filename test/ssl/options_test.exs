@@ -48,6 +48,14 @@ defmodule SSL.OptionsTest do
       assert {:error, :badarg} = SSL.Options.deadline(timeout)
     end
 
+    end_time =
+      :erlang.system_info(:end_time)
+      |> :erlang.convert_time_unit(:native, :millisecond)
+
+    unrepresentable_timeout = end_time - System.monotonic_time(:millisecond) + 1_000
+    assert {:error, :badarg} = SSL.Options.deadline(unrepresentable_timeout)
+    assert {:ok, _deadline} = SSL.Options.deadline(4_294_967_296)
+
     assert {:ok, :infinity} = SSL.Options.deadline(:infinity)
     assert {:ok, deadline} = SSL.Options.deadline(0)
     assert SSL.Options.remaining(deadline) == 0

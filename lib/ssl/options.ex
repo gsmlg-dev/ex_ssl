@@ -96,14 +96,23 @@ defmodule SSL.Options do
   @spec deadline(timeout()) :: {:ok, integer() | :infinity} | {:error, :badarg}
   def deadline(:infinity), do: {:ok, :infinity}
 
-  def deadline(timeout) when is_integer(timeout) and timeout >= 0,
-    do: {:ok, System.monotonic_time(:millisecond) + timeout}
+  def deadline(timeout) when is_integer(timeout) and timeout >= 0 do
+    now = System.monotonic_time(:millisecond)
+    deadline = now + timeout
+
+    if deadline <= timer_end_time(), do: {:ok, deadline}, else: {:error, :badarg}
+  end
 
   def deadline(_), do: {:error, :badarg}
 
   @spec remaining(integer() | :infinity) :: timeout()
   def remaining(:infinity), do: :infinity
   def remaining(deadline), do: max(0, deadline - System.monotonic_time(:millisecond))
+
+  defp timer_end_time do
+    :erlang.system_info(:end_time)
+    |> :erlang.convert_time_unit(:native, :millisecond)
+  end
 
   defp option_list(options) when is_list(options) do
     normalized =

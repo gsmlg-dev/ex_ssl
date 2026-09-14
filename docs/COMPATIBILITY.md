@@ -32,7 +32,7 @@ Finch's `Mint.HTTP.connect` call and `Mint.Core.Transport.SSL`.
 | `SSL.connect(tcp_socket, opts, timeout)` and `/2` | Required STARTTLS upgrade; ownership and plaintext boundary requirements below. `/2` defaults timeout to infinity. |
 | `SSL.send/2` | Accepts iodata. Splits application writes into at most 16,384-byte TLS records. At most one write is admitted; concurrent writes return `{:error, :busy}`. Maximum one call is 1 MiB (`:emsgsize` above the limit). No automatic retries. |
 | `SSL.recv/3` and `/2` | Passive binary/raw only. Zero length returns available application bytes. Positive length waits for exactly that many bytes (maximum 1 MiB). Surplus/partial bytes persist. `/2` uses infinity. |
-| Receive deadlines | Non-negative milliseconds or `:infinity`; invalid values return `:badarg`. Zero polls. Fragments do not extend the monotonic deadline. A timeout retains buffered plaintext; a dead receiver is cancelled. |
+| Receive deadlines | Non-negative milliseconds representable by the VM timer service, or `:infinity`; invalid values return `:badarg` before an operation is admitted. Durations beyond 32 bits are supported. Zero polls. Fragments do not extend the monotonic deadline. A timeout retains buffered plaintext; a dead receiver is cancelled. |
 | Concurrent receives | One pending receiver; a competing receive returns `{:error, :einval}`. This is an explicit restriction: OTP reference behavior for concurrent calls is not emulated. |
 | `SSL.close/1` | Sends close_notify when possible and closes. Idempotent for a previously closed handle; pending calls wake with `:closed`. |
 | Closed sockets | Authenticated peer close_notify preserves previously decrypted bytes for subsequent reads, then returns `{:error, :closed}`. Local close and owner shutdown also leave a `:closed` handle. Abrupt TCP loss or unexpected connection-process death returns `{:error, :econnreset}`, including later calls after process exit; undelivered bytes are discarded on transport failure. TLS authentication/protocol errors return a redacted `{:tls_alert, {category, description}}`. |
@@ -41,6 +41,12 @@ Finch's `Mint.HTTP.connect` call and `Mint.Core.Transport.SSL`.
 OTP's independent reference probe observed either `:einval` or `:closed` for a
 send immediately after `:ssl.close/1` on OTP 28, depending on sender shutdown.
 The implemented SSL subset deliberately returns the stable `:closed` result.
+
+The timer-edge OTP reference probe observes that an unrepresentable receive
+deadline can terminate OTP's connection. SSL rejects it with `:badarg` while
+preserving the live session. It checks the VM's documented
+[`end_time`](https://www.erlang.org/doc/apps/erts/erlang.html#system_info/1)
+instead of imposing an arbitrary 32-bit timeout cap.
 
 Supported options are `:binary` or `mode: :binary`, `active: false`,
 `packet: :raw` or `0`, `verify: :verify_peer`, `cacerts` (DER or actual OTP
@@ -108,9 +114,9 @@ is validated then discarded. Other post-handshake messages fail explicitly.
 | Public API | Local lifecycle suite covers buffering, partial timeouts, cancellation, owner death, concurrent close, limits and upgrade failure cleanup. |
 | Independent interoperability | Mandatory local OTP and OpenSSL peers with generated certificates; dedicated `.github/workflows/interop.yml` job. Exact validation results are recorded after completion below. |
 | Caddy fingerprints | Existing dedicated e2e workflow uses a thin public SSL API wrapper. Live Caddy execution stays in CI per `e2e/README.md`; local compile does not claim live fingerprint validation. |
-| IMAP integration | Pending library gate and separate consumer change. |
-| SMTP submission integration | Pending library gate and separate consumer change. |
-| EAS integration | Pending library gate and separate verified HTTP adapter. |
+| IMAP integration | Separate [Manifold PR #3](https://github.com/gsmlg-opt/manifold/pull/3): controlled direct-TLS/STARTTLS LOGIN, SELECT, literal FETCH and LOGOUT, plus failure/cleanup regressions pass. |
+| SMTP submission integration | Same consumer change: real local direct-TLS/STARTTLS AUTH and submission workflows pass; OTP remains default and DATA outcome classification is preserved. |
+| EAS integration | Same consumer change: explicit Req HTTP/1.1 adapter passes real verified OPTIONS/WBXML exchanges, server-observed profile, framing/deadline/security failures, and no mutation replay. No HTTP/EAS code is added to ex_ssl. |
 
 Deliberate exclusions: TLS 1.2 and downgrade fallback, server TLS, DTLS, QUIC,
 HTTP/2, client certificate authentication, post-handshake authentication,
@@ -120,7 +126,7 @@ exporters and general OTP parity. HTTP/EAS framing belongs in Manifold.
 ### Library gate executed on 2026-09-14
 
 - OTP 28.5.0.5 / Elixir 1.18.5 and OTP 29.0.6 / Elixir 1.20.4:
-  `mix test --include integration` — 280 tests and 15 properties passed,
+  `mix test --include integration` — 282 tests and 15 properties passed,
   with no skipped interoperability tests. Local OTP/OpenSSL peers generate
   certificates at test time; no production endpoint or account is required.
 - `mix format --check-formatted`, `mix compile --warnings-as-errors`, and
@@ -138,11 +144,15 @@ exporters and general OTP parity. HTTP/EAS framing belongs in Manifold.
   receives exactly one timeout even when later input exhausts the buffer.
   These address consumer issue [#3](https://github.com/gsmlg-dev/ex_ssl/issues/3)
   without reducing the receive bound or pacing the test peer.
+  The final local dedicated command passes 44 tests, including representable
+  timer limits, invalid-timeout connection preservation and a no-network connect
+  check. The full updated suite passes on both OTP toolchains above.
 - OTP 29 validation used the Docker image
   `hexpm/elixir:1.20.4-erlang-29.0.6-ubuntu-noble-20260905`, with OpenSSL,
   CA certificates and `libsctp1` installed, a read-only source mount and a
   separate `/tmp/ex_ssl_build` build directory.
 
-The library gate permits consumer implementation and controlled local testing.
-It does not establish readiness of any Manifold consumer until that consumer's
-separate workflow tests pass.
+Manifold's separate local gate passes 462 connector tests and 7 SMTP submission
+provider tests under its configured Elixir 1.18.4 / OTP 28.5.0.3 environment.
+Its own compatibility document records the exact dependency pin, enable/return
+configuration, final CI evidence and restricted controlled-testing scope.

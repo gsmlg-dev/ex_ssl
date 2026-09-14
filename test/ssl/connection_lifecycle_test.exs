@@ -144,10 +144,19 @@ defmodule SSL.ConnectionLifecycleTest do
       end)
 
     socket = connect(peer)
+
+    end_time =
+      :erlang.system_info(:end_time)
+      |> :erlang.convert_time_unit(:native, :millisecond)
+
+    unrepresentable_timeout = end_time - System.monotonic_time(:millisecond) + 1_000
+
     assert {:error, :badarg} = SSL.send(socket, [:invalid])
     assert {:error, :emsgsize} = SSL.send(socket, :binary.copy("x", 1_048_577))
     assert {:error, :badarg} = SSL.recv(socket, -1, 0)
     assert {:error, :badarg} = SSL.recv(socket, 0, -1)
+    assert {:error, :badarg} = SSL.recv(socket, 0, unrepresentable_timeout)
+    assert Process.alive?(socket.pid)
     assert {:error, :emsgsize} = SSL.recv(socket, 1_048_577, 0)
     assert :ok = SSL.send(socket, "valid")
     assert {:ok, "response"} = SSL.recv(socket, 0, 1_000)
@@ -188,6 +197,25 @@ defmodule SSL.ConnectionLifecycleTest do
     assert {:error, :timeout} = SSL.connect(~c"127.0.0.1", port, Peer.client_options(), 50)
     Task.await(task)
     assert DynamicSupervisor.count_children(SSL.ConnectionSupervisor).active == before
+    :gen_tcp.close(listener)
+  end
+
+  test "unrepresentable connect timeout fails before opening a TCP connection" do
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, {_, port}} = :inet.sockname(listener)
+    existing = connection_children()
+
+    end_time =
+      :erlang.system_info(:end_time)
+      |> :erlang.convert_time_unit(:native, :millisecond)
+
+    unrepresentable_timeout = end_time - System.monotonic_time(:millisecond) + 1_000
+
+    assert {:error, :badarg} =
+             SSL.connect(~c"127.0.0.1", port, Peer.client_options(), unrepresentable_timeout)
+
+    assert {:error, :timeout} = :gen_tcp.accept(listener, 25)
+    assert connection_children() == existing
     :gen_tcp.close(listener)
   end
 
