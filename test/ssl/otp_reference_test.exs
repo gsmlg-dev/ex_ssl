@@ -66,7 +66,7 @@ defmodule SSL.OTPReferenceTest do
     assert :ok = LocalTLSPeer.stop(peer)
   end
 
-  test "OTP ssl reports closed sockets consistently to send, recv, and close" do
+  test "OTP ssl closed-socket operations include its send shutdown race" do
     {:ok, peer} =
       LocalTLSPeer.start(fn socket ->
         assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
@@ -76,7 +76,9 @@ defmodule SSL.OTPReferenceTest do
     {:ok, socket} = :ssl.connect(~c"127.0.0.1", peer.port, LocalTLSPeer.client_options(), 5_000)
 
     assert :ok = :ssl.close(socket)
-    assert {:error, :closed} = :ssl.send(socket, "after-close")
+    # OTP's sender can still be shutting down when close/1 returns. OTP 28 CI
+    # independently observes :einval here; after sender exit it returns :closed.
+    assert :ssl.send(socket, "after-close") in [{:error, :closed}, {:error, :einval}]
     assert {:error, :closed} = :ssl.recv(socket, 0, 0)
     assert :ok = :ssl.close(socket)
     assert :ok = LocalTLSPeer.stop(peer)

@@ -38,6 +38,10 @@ Finch's `Mint.HTTP.connect` call and `Mint.Core.Transport.SSL`.
 | Closed sockets | Authenticated peer close_notify preserves previously decrypted bytes for subsequent reads, then returns `{:error, :closed}`. Local close and owner shutdown also leave a `:closed` handle. Abrupt TCP loss or unexpected connection-process death returns `{:error, :econnreset}`, including later calls after process exit; undelivered bytes are discarded on transport failure. TLS authentication/protocol errors return a redacted `{:tls_alert, {category, description}}`. |
 | Other OTP API | Not exported. No success-returning compatibility stubs. |
 
+OTP's independent reference probe observed either `:einval` or `:closed` for a
+send immediately after `:ssl.close/1` on OTP 28, depending on sender shutdown.
+The implemented SSL subset deliberately returns the stable `:closed` result.
+
 Supported options are `:binary` or `mode: :binary`, `active: false`,
 `packet: :raw` or `0`, `verify: :verify_peer`, `cacerts` (DER or actual OTP
 `cacerts_get` entries), `cacertfile`, DNS `server_name_indication`,
