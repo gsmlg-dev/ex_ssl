@@ -3,7 +3,7 @@ defmodule SSL.Protocol.HandshakeMachine do
 
   alias SSL.ClientHello.{Extension, Serializer}
   alias SSL.ClientHello.Materializer.Materialized
-  alias SSL.Crypto.{KeyExchange, KeySchedule}
+  alias SSL.Crypto.{KeyExchange, KeySchedule, TrafficState}
   alias SSL.Crypto.KeyExchange.KeyPair
 
   alias SSL.Protocol.{
@@ -157,9 +157,16 @@ defmodule SSL.Protocol.HandshakeMachine do
 
   @spec encrypt(t(), :application_data | :alert, iodata()) ::
           {:ok, binary(), t()} | {:error, term()}
-  def encrypt(%__MODULE__{phase: :connected, write_state: write} = state, type, data)
-      when type in [:application_data, :alert],
-      do: encrypt_record(state, write, type, data)
+  def encrypt(%__MODULE__{phase: :connected, write_state: write} = state, :application_data, data) do
+    with {:ok, updates, write} <-
+           maybe_update_write(write, TrafficState.key_update_required?(write)),
+         {:ok, record, next} <- encrypt_record(state, write, :application_data, data) do
+      {:ok, IO.iodata_to_binary([updates, record]), next}
+    else
+      {:error, {:fatal_alert, _, _}} = error -> error
+      {:error, reason} -> fatal(:internal_error, reason)
+    end
+  end
 
   def encrypt(%__MODULE__{phase: :closed, write_state: write} = state, :alert, data)
       when not is_nil(write),
@@ -318,23 +325,26 @@ defmodule SSL.Protocol.HandshakeMachine do
   end
 
   defp process_post_handshake(state, messages) do
-    Enum.reduce_while(messages, {:ok, state, []}, fn message, {:ok, current, out} ->
-      case ServerFlight.decode(message, hash: hash_for(current.write_state)) do
-        {:ok, %ServerFlight.NewSessionTicket{}, <<>>} ->
-          {:cont, {:ok, current, out}}
+    Enum.reduce_while(messages, {:ok, state, []}, fn
+      # RFC 9846 §4.7.1: no resumption support means no ticket semantic decoding.
+      # HandshakeFramer has already checked completeness and the global size bound.
+      <<4, _length::24, _body::binary>>, result ->
+        {:cont, result}
 
-        {:ok, %ServerFlight.KeyUpdate{request_update: request?}, <<>>} ->
-          case apply_key_update(current, request?) do
-            {:ok, next, records} -> {:cont, {:ok, next, out ++ records}}
-            {:error, _} = error -> {:halt, error}
-          end
+      message, {:ok, current, out} ->
+        case ServerFlight.decode(message, hash: hash_for(current.write_state)) do
+          {:ok, %ServerFlight.KeyUpdate{request_update: request?}, <<>>} ->
+            case apply_key_update(current, request?) do
+              {:ok, next, records} -> {:cont, {:ok, next, out ++ records}}
+              {:error, _} = error -> {:halt, error}
+            end
 
-        {:ok, decoded, <<>>} ->
-          {:halt, fatal(:unexpected_message, {:unsupported_post_handshake, decoded.__struct__})}
+          {:ok, decoded, <<>>} ->
+            {:halt, fatal(:unexpected_message, {:unsupported_post_handshake, decoded.__struct__})}
 
-        {:error, reason} ->
-          {:halt, fatal(:unexpected_message, reason)}
-      end
+          {:error, reason} ->
+            {:halt, fatal(:unexpected_message, reason)}
+        end
     end)
   end
 
@@ -352,18 +362,25 @@ defmodule SSL.Protocol.HandshakeMachine do
   # A reciprocal update is encrypted with the old write key before switching epochs.
   defp apply_key_update(state, request?) do
     with {:ok, read} <- update_traffic_state(state.read_state),
-         {:ok, records, write} <- maybe_respond_key_update(state.write_state, request?) do
+         {:ok, records, write} <- maybe_update_write(state.write_state, request?) do
       {:ok, %{state | read_state: read, write_state: write}, records}
     end
   end
 
-  defp maybe_respond_key_update(write, false), do: {:ok, [], write}
+  defp maybe_update_write(write, false), do: {:ok, [], write}
 
-  defp maybe_respond_key_update(write, true) do
-    with {:ok, encoded} <- ServerFlight.encode_key_update(false),
-         {:ok, record, advanced_old} <- Record.encrypt(write, :handshake, encoded),
-         {:ok, updated} <- update_traffic_state(advanced_old) do
+  defp maybe_update_write(write, true) do
+    with true <- TrafficState.may_update_write?(write),
+         {:ok, encoded} <- ServerFlight.encode_key_update(false),
+         # Compute the candidate before encryption so derivation failure cannot
+         # consume the last old-key operation. Install it only after protecting
+         # KeyUpdate with the old key; the returned wire order is unchanged.
+         {:ok, updated} <- update_traffic_state(write),
+         {:ok, record, _advanced_old} <- Record.encrypt(write, :handshake, encoded) do
       {:ok, [record], updated}
+    else
+      false -> fatal(:internal_error, :generation_exhausted)
+      {:error, reason} -> fatal(:internal_error, reason)
     end
   end
 

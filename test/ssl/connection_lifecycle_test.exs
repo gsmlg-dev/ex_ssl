@@ -3,6 +3,105 @@ defmodule SSL.ConnectionLifecycleTest do
   alias ExSSL.TestSupport.LocalTLSPeer, as: Peer
   @moduletag :integration
 
+  test "a peer-requested update at the final sending generation closes without another epoch" do
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        receive do
+          :request_update -> :ok
+        end
+
+        assert :ok = :ssl.update_keys(socket, :read_write)
+        assert {:error, {:tls_alert, {:internal_error, _}}} = :ssl.recv(socket, 0, 5_000)
+      end)
+
+    socket = connect(peer)
+
+    :sys.replace_state(socket.pid, fn {:connected, state} ->
+      write = %{state.machine.write_state | generation: 0xFFFFFFFFFFFF}
+      {:connected, %{state | machine: %{state.machine | write_state: write}}}
+    end)
+
+    monitor = Process.monitor(socket.pid)
+    receiver = Task.async(fn -> SSL.recv(socket, 0, 5_000) end)
+    wait_for_pending_receiver(socket.pid)
+    send(peer.task.pid, :request_update)
+    assert {:error, {:tls_alert, {:internal_error, _}}} = Task.await(receiver)
+    assert_receive {:DOWN, ^monitor, :process, _, :normal}
+    refute MapSet.member?(connection_children(), socket.pid)
+    assert {:error, :econnreset} = SSL.send(socket, "never replay")
+    Peer.stop(peer)
+  end
+
+  test "an exhausted application writer terminates and wakes pending operations" do
+    {:ok, peer} = Peer.start(fn socket -> assert {:error, _} = :ssl.recv(socket, 0, 5_000) end)
+    socket = connect(peer)
+
+    :sys.replace_state(socket.pid, fn {:connected, state} ->
+      write = %{state.machine.write_state | sequence: 23_726_566}
+      {:connected, %{state | machine: %{state.machine | write_state: write}}}
+    end)
+
+    monitor = Process.monitor(socket.pid)
+    receiver = Task.async(fn -> SSL.recv(socket, 0, 5_000) end)
+    wait_for_pending_receiver(socket.pid)
+    assert {:error, {:tls_alert, {:internal_error, _}}} = SSL.send(socket, "never sent")
+    assert {:error, {:tls_alert, {:internal_error, _}}} = Task.await(receiver)
+    assert_receive {:DOWN, ^monitor, :process, _, :normal}
+    refute MapSet.member?(connection_children(), socket.pid)
+    assert {:error, :econnreset} = SSL.recv(socket, 0, 0)
+    Peer.stop(peer)
+  end
+
+  for {name, ticket} <- [
+        {"normal", <<4, 15::24, 60::32, 7::32, 1, 9, 1::16, 1, 0::16>>},
+        {"unknown extension",
+         <<4, 20::24, 60::32, 7::32, 1, 9, 1::16, 1, 5::16, 0xFEFF::16, 1::16, 9>>},
+        {"invalid resumption contents", <<4, 0::24>>}
+      ] do
+    test "public connection exchanges application data after a ticket with #{name}" do
+      {:ok, peer} =
+        Peer.start(fn socket ->
+          :ok = :ssl.send(socket, "ready")
+
+          receive do
+            :send_ticket_slot -> :ok
+          end
+
+          # The proxy replaces this single encrypted record with an NST using
+          # the same sequence. All subsequent traffic remains the OTP peer's.
+          :ok = :ssl.send(socket, "ticket slot")
+          :ok = :ssl.send(socket, "after ticket")
+          assert {:ok, "client response"} = :ssl.recv(socket, 15, 5_000)
+          :ok = :ssl.send(socket, "done")
+          assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        end)
+
+      {proxy_port, proxy, listener} = replacing_proxy(peer.port)
+
+      on_exit(fn ->
+        :gen_tcp.close(listener)
+        Process.exit(proxy.pid, :kill)
+      end)
+
+      assert {:ok, socket} = SSL.connect(~c"127.0.0.1", proxy_port, Peer.client_options(), 5_000)
+      assert {:ok, "ready"} = SSL.recv(socket, 5, 5_000)
+      {:connected, state} = :sys.get_state(socket.pid)
+
+      {:ok, replacement, _} =
+        SSL.Protocol.Record.encrypt(state.machine.read_state, :handshake, unquote(ticket))
+
+      send(proxy.pid, {:replace, replacement, self()})
+      assert_receive :replacement_armed
+      send(peer.task.pid, :send_ticket_slot)
+      assert {:ok, "after ticket"} = SSL.recv(socket, 12, 5_000)
+      assert :ok = SSL.send(socket, "client response")
+      assert {:ok, "done"} = SSL.recv(socket, 4, 5_000)
+      assert :ok = SSL.close(socket)
+      Peer.stop(peer)
+      assert :ok = Task.await(proxy, 5_000)
+    end
+  end
+
   test "partial receive timeout preserves plaintext and a later receive succeeds" do
     parent = self()
 
@@ -517,6 +616,65 @@ defmodule SSL.ConnectionLifecycleTest do
     {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false, packet: :raw])
     {:ok, server} = :gen_tcp.accept(listener, 1_000)
     {tcp, server, listener}
+  end
+
+  # Fault injection over real TCP after an authenticated OTP handshake. This
+  # proxy changes one server record and never implements a TLS handshake.
+  defp replacing_proxy(upstream_port) do
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, {_, port}} = :inet.sockname(listener)
+
+    proxy =
+      Task.async(fn ->
+        {:ok, client} = :gen_tcp.accept(listener, 5_000)
+
+        {:ok, server} =
+          :gen_tcp.connect(~c"127.0.0.1", upstream_port, [:binary, active: false], 5_000)
+
+        :ok = :inet.setopts(client, active: :once)
+        :ok = :inet.setopts(server, active: :once)
+
+        try do
+          replacing_proxy_loop(client, server, SSL.Protocol.RecordFramer.new(), nil)
+        after
+          :gen_tcp.close(client)
+          :gen_tcp.close(server)
+        end
+      end)
+
+    {port, proxy, listener}
+  end
+
+  defp replacing_proxy_loop(client, server, framer, replacement) do
+    receive do
+      {:replace, record, caller} ->
+        assert SSL.Protocol.RecordFramer.buffered_size(framer) == 0
+        send(caller, :replacement_armed)
+        replacing_proxy_loop(client, server, framer, record)
+
+      {:tcp, ^client, bytes} ->
+        :ok = :gen_tcp.send(server, bytes)
+        :ok = :inet.setopts(client, active: :once)
+        replacing_proxy_loop(client, server, framer, replacement)
+
+      {:tcp, ^server, bytes} ->
+        {:ok, records, framer} = SSL.Protocol.RecordFramer.feed(framer, bytes)
+
+        {records, replacement} =
+          case {records, replacement} do
+            {[_original | rest], record} when is_binary(record) -> {[record | rest], nil}
+            _ -> {records, replacement}
+          end
+
+        :ok = :gen_tcp.send(client, records)
+        :ok = :inet.setopts(server, active: :once)
+        replacing_proxy_loop(client, server, framer, replacement)
+
+      {:tcp_closed, _socket} ->
+        :ok
+    after
+      5_000 -> flunk("record replacement proxy timed out")
+    end
   end
 
   defp connection_children do

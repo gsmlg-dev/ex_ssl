@@ -85,7 +85,10 @@ defmodule SSL.Protocol.ServerFlight do
 
   @encrypted_extension_ids [0, 1, 10, 16, 19, 20, 28, 42]
   @certificate_extension_ids [5, 18]
-  @certificate_request_extension_ids [13, 47, 48, 50]
+  # RFC 9846 permits these extensions in CertificateRequest.  We only need the
+  # signature algorithms to decide how to respond; the other permitted values
+  # are retained for exact-message diagnostics without assigning semantics.
+  @certificate_request_extension_ids [0, 5, 13, 47, 48, 50]
   @recognized_extension_ids Enum.uniq(
                               @encrypted_extension_ids ++
                                 @certificate_extension_ids ++
@@ -529,11 +532,19 @@ defmodule SSL.Protocol.ServerFlight do
   defp decode_extension(:certificate_request, 13, payload, _config),
     do: decode_signature_algorithms(payload)
 
-  defp decode_extension(:certificate_request, extension_id, payload, _config) do
-    with :ok <- require_known_extension(extension_id, :certificate_request) do
-      {:ok, {:raw, extension_id, payload}}
-    end
-  end
+  defp decode_extension(:certificate_request, extension_id, payload, _config)
+       when extension_id in @certificate_request_extension_ids,
+       do: {:ok, {:raw, extension_id, payload}}
+
+  defp decode_extension(:certificate_request, extension_id, _payload, _config)
+       when extension_id in @recognized_extension_ids,
+       do: {:error, {:forbidden_extension, :certificate_request, extension_id}}
+
+  # RFC 9846 requires clients to ignore unrecognized CertificateRequest
+  # extensions. Preserve their framing for diagnostics while leaving their
+  # semantics unused by this no-client-authentication implementation.
+  defp decode_extension(:certificate_request, extension_id, payload, _config),
+    do: {:ok, {:raw, extension_id, payload}}
 
   defp decode_extension(:new_session_ticket, 42, <<maximum::32>>, _config),
     do: {:ok, {:early_data, maximum}}
@@ -541,8 +552,14 @@ defmodule SSL.Protocol.ServerFlight do
   defp decode_extension(:new_session_ticket, 42, _payload, _config),
     do: {:error, {:malformed_extension, 42, :early_data}}
 
-  defp decode_extension(:new_session_ticket, extension_id, _payload, _config),
-    do: {:error, {:unsupported_extension, :new_session_ticket, extension_id}}
+  defp decode_extension(:new_session_ticket, extension_id, _payload, _config)
+       when extension_id in @recognized_extension_ids,
+       do: {:error, {:forbidden_extension, :new_session_ticket, extension_id}}
+
+  # RFC 9846 requires clients to ignore unrecognized NewSessionTicket
+  # extensions. Keep known, forbidden extensions distinct from that case.
+  defp decode_extension(:new_session_ticket, extension_id, payload, _config),
+    do: {:ok, {:raw, extension_id, payload}}
 
   defp require_known_extension(extension_id, :encrypted_extensions)
        when extension_id in @encrypted_extension_ids,
@@ -550,10 +567,6 @@ defmodule SSL.Protocol.ServerFlight do
 
   defp require_known_extension(extension_id, :certificate_entry)
        when extension_id in @certificate_extension_ids,
-       do: :ok
-
-  defp require_known_extension(extension_id, :certificate_request)
-       when extension_id in @certificate_request_extension_ids,
        do: :ok
 
   defp require_known_extension(extension_id, context)

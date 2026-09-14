@@ -5,7 +5,7 @@ defmodule SSL.Protocol.HandshakeMachineTest do
   alias SSL.ClientHello.Materializer.Materialized
   alias SSL.Crypto.{KeyExchange, KeySchedule}
   alias SSL.Crypto.KeyExchange.KeyPair
-  alias SSL.Protocol.{ClientOffer, HandshakeMachine, Record, ServerFlight}
+  alias SSL.Protocol.{ClientOffer, HandshakeMachine, Record, RecordFramer, ServerFlight}
 
   @fixture_dir Path.expand("../../fixtures/server_flight", __DIR__)
   @capture Path.join(@fixture_dir, "capture.txt")
@@ -79,7 +79,7 @@ defmodule SSL.Protocol.HandshakeMachineTest do
              HandshakeMachine.feed(machine, record)
   end
 
-  test "validates and discards NewSessionTicket and rejects other post-handshake messages" do
+  test "discards NewSessionTicket and rejects other post-handshake messages" do
     machine = connected_fixture_machine()
     ticket = <<4, 15::24, 60::32, 7::32, 1, 9, 1::16, 1, 0::16>>
     {:ok, record, _} = Record.encrypt(machine.read_state, :handshake, ticket)
@@ -88,6 +88,159 @@ defmodule SSL.Protocol.HandshakeMachineTest do
     {:ok, record, _} = Record.encrypt(machine.read_state, :handshake, <<8, 2::24, 0::16>>)
 
     assert {:error, {:fatal_alert, :unexpected_message, _}} =
+             HandshakeMachine.feed(machine, record)
+  end
+
+  for {suite, hash, limit} <- [
+        {:tls_aes_128_gcm_sha256, :sha256, 23_726_566},
+        {:tls_aes_256_gcm_sha384, :sha384, 23_726_566},
+        {:tls_chacha20_poly1305_sha256, :sha256, 0xFFFFFFFFFFFFFFFF}
+      ] do
+    test "rotates #{suite} before the next application record would exhaust its key" do
+      suite = unquote(suite)
+      hash = unquote(hash)
+      limit = unquote(limit)
+      {:ok, write} = KeySchedule.traffic_state(suite, :crypto.hash(hash, "write epoch"))
+      write = %{write | sequence: limit - 2, generation: 7}
+      machine = %{connected_fixture_machine() | write_state: write}
+      original_read = machine.read_state
+
+      assert {:ok, last_application, machine} =
+               HandshakeMachine.encrypt(machine, :application_data, "last old application")
+
+      assert machine.write_state.sequence == limit - 1
+      assert machine.write_state.generation == 7
+
+      assert {:ok, :application_data, "last old application", peer_read} =
+               Record.decrypt(write, last_application)
+
+      assert {:ok, wire, machine} =
+               HandshakeMachine.encrypt(machine, :application_data, ["first", " new application"])
+
+      assert {:ok, [update, application], framer} = RecordFramer.feed(<<>>, wire)
+      assert RecordFramer.buffered_size(framer) == 0
+
+      assert {:ok, :handshake, <<24, 1::24, 0>>, old_epoch_end} =
+               Record.decrypt(peer_read, update)
+
+      assert old_epoch_end.sequence == limit
+
+      {:ok, secret} = KeySchedule.traffic_update(hash, write.secret)
+      {:ok, next_peer_read} = KeySchedule.traffic_state(suite, secret)
+      assert {:error, :authentication_failed} = Record.decrypt(next_peer_read, update)
+
+      assert {:ok, :application_data, "first new application", next_peer_read} =
+               Record.decrypt(next_peer_read, application)
+
+      assert machine.write_state.secret == secret
+      assert machine.write_state.sequence == 1
+      assert machine.write_state.generation == 8
+      assert machine.read_state == original_read
+
+      assert {:ok, wire, machine} = HandshakeMachine.encrypt(machine, :application_data, "later")
+      assert {:ok, :application_data, "later", _} = Record.decrypt(next_peer_read, wire)
+      assert machine.write_state.sequence == 2
+      assert machine.write_state.generation == 8
+    end
+  end
+
+  test "write updates reach the last allowed generation but never advance past it" do
+    machine = connected_fixture_machine()
+    maximum = 0xFFFFFFFFFFFF
+    write = %{machine.write_state | sequence: 23_726_565, generation: maximum - 1}
+
+    assert {:ok, _, last_epoch} =
+             HandshakeMachine.encrypt(%{machine | write_state: write}, :application_data, "last")
+
+    assert last_epoch.write_state.generation == maximum
+
+    exhausted = %{last_epoch.write_state | sequence: 23_726_565}
+
+    assert {:error, {:fatal_alert, :internal_error, :generation_exhausted}} =
+             HandshakeMachine.encrypt(
+               %{last_epoch | write_state: exhausted},
+               :application_data,
+               "no"
+             )
+
+    {:ok, update, _} = Record.encrypt(machine.read_state, :handshake, <<24, 1::24, 1>>)
+
+    assert {:error, {:fatal_alert, :internal_error, :generation_exhausted}} =
+             HandshakeMachine.feed(last_epoch, update)
+  end
+
+  test "required write update fails closed when the old key or traffic secret cannot be used" do
+    machine = connected_fixture_machine()
+
+    for write <- [
+          %{machine.write_state | sequence: 23_726_566},
+          %{machine.write_state | sequence: 23_726_565, key: <<>>},
+          %{machine.write_state | sequence: 23_726_565, secret: <<>>}
+        ] do
+      assert {:error, {:fatal_alert, :internal_error, _}} =
+               HandshakeMachine.encrypt(%{machine | write_state: write}, :application_data, "no")
+    end
+  end
+
+  test "peer requested update uses the last old-key operation and independent receiving epochs" do
+    machine = connected_fixture_machine()
+    write = %{machine.write_state | sequence: 23_726_565}
+    read = %{machine.read_state | generation: 0xFFFFFFFFFFFF}
+    {:ok, update, _} = Record.encrypt(machine.read_state, :handshake, <<24, 1::24, 1>>)
+
+    assert {:ok, next, [response], []} =
+             HandshakeMachine.feed(%{machine | write_state: write, read_state: read}, update)
+
+    assert {:ok, :handshake, <<24, 1::24, 0>>, _} = Record.decrypt(write, response)
+    assert next.read_state.generation == 0x1000000000000
+    assert next.write_state.generation == 1
+    assert next.write_state.sequence == 0
+    assert {:ok, application, next} = HandshakeMachine.encrypt(next, :application_data, "after")
+
+    assert {:ok, :application_data, "after", _} =
+             Record.decrypt(%{next.write_state | sequence: 0}, application)
+  end
+
+  test "fully framed tickets are ignored regardless of resumption-specific contents" do
+    tickets = [
+      <<4, 15::24, 60::32, 7::32, 1, 9, 1::16, 1, 0::16>>,
+      <<4, 20::24, 60::32, 7::32, 1, 9, 1::16, 1, 5::16, 0xFEFF::16, 1::16, 9>>,
+      <<4, 0::24>>,
+      <<4, 15::24, 604_801::32, 7::32, 1, 9, 1::16, 1, 0::16>>,
+      <<4, 20::24, 60::32, 7::32, 1, 9, 1::16, 1, 5::16, 42::16, 1::16, 9>>
+    ]
+
+    assert {:error, _} = ServerFlight.decode(Enum.at(tickets, 2))
+    assert {:error, _} = ServerFlight.decode(Enum.at(tickets, 3))
+    assert {:error, _} = ServerFlight.decode(Enum.at(tickets, 4))
+
+    for ticket <- tickets do
+      machine = connected_fixture_machine()
+      # Fragment the handshake header as well as its resumption-specific body.
+      <<first::binary-size(2), rest::binary>> = ticket
+      {:ok, record, server_write} = Record.encrypt(machine.read_state, :handshake, first)
+      assert {:ok, machine, [], []} = HandshakeMachine.feed(machine, record)
+      {:ok, record, server_write} = Record.encrypt(server_write, :handshake, rest)
+      assert {:ok, machine, [], []} = HandshakeMachine.feed(machine, record)
+      {:ok, record, _} = Record.encrypt(server_write, :application_data, "after ticket")
+
+      assert {:ok, machine, [], [{:application_data, "after ticket"}]} =
+               HandshakeMachine.feed(machine, record)
+
+      peer_read = machine.write_state
+
+      assert {:ok, record, _} =
+               HandshakeMachine.encrypt(machine, :application_data, "still usable")
+
+      assert {:ok, :application_data, "still usable", _} = Record.decrypt(peer_read, record)
+    end
+  end
+
+  test "ignoring ticket semantics retains handshake framing limits" do
+    machine = connected_fixture_machine()
+    {:ok, record, _} = Record.encrypt(machine.read_state, :handshake, <<4, 1_048_577::24>>)
+
+    assert {:error, {:fatal_alert, :decode_error, {:handshake_length_exceeded, _, _}}} =
              HandshakeMachine.feed(machine, record)
   end
 

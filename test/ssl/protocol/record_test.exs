@@ -167,12 +167,44 @@ defmodule SSL.Protocol.RecordTest do
              Record.encrypt(state, :handshake, <<>>, unknown: true)
   end
 
-  test "rejects sequence exhaustion without wrapping" do
+  test "enforces write key usage limits but only sequence exhaustion on reads" do
     exhausted = %{state() | sequence: 0xFFFFFFFFFFFFFFFF}
 
-    assert {:error, :sequence_exhausted} = Record.encrypt(exhausted, :handshake, <<1>>)
+    assert {:error, :key_usage_exhausted} = Record.encrypt(exhausted, :handshake, <<1>>)
     assert {:error, :sequence_exhausted} = Record.decrypt(exhausted, @record)
     assert exhausted.sequence == 0xFFFFFFFFFFFFFFFF
+  end
+
+  test "permits the final old-key record and then rejects another AES-GCM encryption" do
+    limit = TrafficState.encryption_limit(:tls_aes_128_gcm_sha256)
+    final = %{state() | sequence: limit - 1}
+
+    assert {:ok, _record, %TrafficState{sequence: ^limit}} =
+             Record.encrypt(final, :handshake, <<24, 0, 0, 1, 0>>)
+
+    assert {:error, :key_usage_exhausted} =
+             Record.encrypt(%{final | sequence: limit}, :handshake, <<1>>)
+  end
+
+  test "decrypting does not enforce the AES-GCM usage count or sending generation limit" do
+    state = %{
+      state()
+      | sequence: TrafficState.encryption_limit(:tls_aes_128_gcm_sha256) + 1,
+        generation: TrafficState.maximum_write_generation() + 1
+    }
+
+    record = independently_encrypt_for_receive(state, "peer data")
+
+    assert {:ok, :application_data, "peer data", %TrafficState{sequence: sequence}} =
+             Record.decrypt(state, record)
+
+    assert sequence == state.sequence + 1
+  end
+
+  test "rejects a sending epoch beyond the RFC generation maximum" do
+    invalid = %{state() | generation: TrafficState.maximum_write_generation() + 1}
+
+    assert {:error, :generation_exhausted} = Record.encrypt(invalid, :handshake, <<1>>)
   end
 
   test "decrypts records after arbitrary TCP fragmentation through RecordFramer" do
@@ -211,6 +243,17 @@ defmodule SSL.Protocol.RecordTest do
     length = byte_size(inner_plaintext) + 16
     header = <<23, 3, 3, length::16>>
     assert {:ok, ciphertext, tag} = AEAD.encrypt(state(), header, inner_plaintext)
+    <<header::binary, ciphertext::binary, tag::binary>>
+  end
+
+  defp independently_encrypt_for_receive(state, content) do
+    plaintext = <<content::binary, 23>>
+    header = <<23, 3, 3, byte_size(plaintext) + 16::16>>
+    {:ok, nonce} = TrafficState.nonce(state)
+
+    {ciphertext, tag} =
+      :crypto.crypto_one_time_aead(:aes_128_gcm, state.key, nonce, plaintext, header, 16, true)
+
     <<header::binary, ciphertext::binary, tag::binary>>
   end
 

@@ -1,6 +1,8 @@
 defmodule SSL.Crypto.TrafficStateTest do
   use ExUnit.Case, async: true
 
+  import Bitwise
+
   alias SSL.Crypto.TrafficState
 
   test "nonce XORs the static IV with the left-padded uint64 sequence number" do
@@ -78,6 +80,45 @@ defmodule SSL.Crypto.TrafficStateTest do
              TrafficState.advance(%{state | sequence: -1})
 
     assert {:error, :invalid_traffic_state} = TrafficState.advance(nil)
+  end
+
+  test "tracks cipher-specific encryption limits and reserves the final record for KeyUpdate" do
+    aes = %TrafficState{
+      secret: <<1>>,
+      key: <<2>>,
+      iv: <<0::96>>,
+      cipher_suite: :tls_aes_128_gcm_sha256
+    }
+
+    assert TrafficState.encryption_limit(:tls_aes_128_gcm_sha256) == 23_726_566
+    assert TrafficState.encryption_limit(:tls_aes_256_gcm_sha384) == 23_726_566
+    assert TrafficState.encryption_limit(:tls_chacha20_poly1305_sha256) == 0xFFFFFFFFFFFFFFFF
+
+    aes_limit = TrafficState.encryption_limit(:tls_aes_128_gcm_sha256)
+    assert aes_limit * aes_limit <= 1 <<< 49
+    assert (aes_limit + 1) * (aes_limit + 1) > 1 <<< 49
+
+    final = %{aes | sequence: aes_limit - 1}
+    exhausted = %{aes | sequence: aes_limit}
+
+    assert TrafficState.may_encrypt?(final)
+    assert TrafficState.key_update_required?(final)
+    refute TrafficState.may_encrypt?(exhausted)
+    assert TrafficState.key_update_required?(exhausted)
+  end
+
+  test "allows write epochs through the RFC generation maximum without allowing another update" do
+    state = %TrafficState{
+      secret: <<1>>,
+      key: <<2>>,
+      iv: <<0::96>>,
+      generation: TrafficState.maximum_write_generation(),
+      cipher_suite: :tls_aes_128_gcm_sha256
+    }
+
+    assert TrafficState.valid_write_generation?(state)
+    refute TrafficState.may_update_write?(state)
+    refute TrafficState.valid_write_generation?(%{state | generation: state.generation + 1})
   end
 
   test "inspection redacts traffic secrets and derived key material" do

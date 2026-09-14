@@ -22,7 +22,8 @@ defmodule SSL.Protocol.Record do
   def encrypt(state, content_type, content, options \\ [])
 
   def encrypt(%TrafficState{} = state, content_type, content, options) do
-    with {:ok, padding_length} <- padding_length(options),
+    with :ok <- encryption_permitted(state),
+         {:ok, padding_length} <- padding_length(options),
          {:ok, inner_plaintext} <- InnerPlaintext.encode(content, content_type, padding_length),
          {:ok, next_state} <- TrafficState.advance(state),
          header <- ciphertext_header(byte_size(inner_plaintext) + @tag_length),
@@ -82,6 +83,19 @@ defmodule SSL.Protocol.Record do
 
   defp ciphertext_header(ciphertext_length) do
     <<@application_data, @legacy_record_version::16, ciphertext_length::16>>
+  end
+
+  defp encryption_permitted(state) do
+    cond do
+      not TrafficState.valid_write_generation?(state) ->
+        {:error, :generation_exhausted}
+
+      not TrafficState.may_encrypt?(state) ->
+        {:error, :key_usage_exhausted}
+
+      true ->
+        :ok
+    end
   end
 
   defp padding_length(options) when is_list(options) do

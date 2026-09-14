@@ -103,8 +103,22 @@ the supported cryptographic algorithms where available from OTP crypto.
 HRR uses the transcript message_hash rewrite. Optional handshake
 CertificateRequest receives an empty client Certificate; client authentication
 is not supported. Peer KeyUpdate rotates independent traffic epochs and sends
-any required response before subsequent application traffic. NewSessionTicket
-is validated then discarded. Other post-handshake messages fail explicitly.
+any required response before subsequent application traffic. Application writes
+automatically send an old-key KeyUpdate before switching to a fresh write epoch
+when the supported AEAD usage bound approaches. Both AES-GCM suites permit
+23,726,566 encryptions per epoch (floor of RFC 9846's 2^24.5 record bound);
+ChaCha20-Poly1305 uses the existing uint64 sequence guard. The last permitted
+encryption is reserved for KeyUpdate. Sending generations cannot exceed 2^48−1;
+an update that cannot legally advance or protect its record terminates the
+connection without retrying application data. These sending limits are not
+imposed on receiving epochs.
+
+Session resumption remains unsupported. In accordance with RFC 9846,
+fully framed NewSessionTicket messages are silently ignored without semantic
+ticket/extension validation; global handshake framing and buffer limits remain
+enforced. Unknown CertificateRequest extensions are preserved and ignored,
+while required signature_algorithms and forbidden-context checks remain.
+Other post-handshake messages fail explicitly.
 
 ## Evidence and staged readiness
 
@@ -156,3 +170,14 @@ Manifold's separate local gate passes 462 connector tests and 7 SMTP submission
 provider tests under its configured Elixir 1.18.4 / OTP 28.5.0.3 environment.
 Its own compatibility document records the exact dependency pin, enable/return
 configuration, final CI evidence and restricted controlled-testing scope.
+
+### RFC 9846 review regression gate
+
+The AEAD/KeyUpdate and post-handshake fixes pass on both toolchains above:
+`mix format --check-formatted`, `mix compile --warnings-as-errors`, and
+`MIX_ENV=test mix compile --warnings-as-errors`; `mix test` runs 258 tests and
+15 properties with 43 integration tests excluded by default;
+`mix test --include integration` passes all 301 tests and 15 properties with no
+exclusions. The dedicated interoperability/lifecycle command passes 49 tests.
+The unchanged e2e harness also formats and compiles on OTP 29; live Caddy
+fingerprint execution remains in its dedicated CI job.
