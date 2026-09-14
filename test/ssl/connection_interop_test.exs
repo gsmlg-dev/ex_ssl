@@ -378,5 +378,8 @@ defmodule SSL.ConnectionInteropTest do
     after
       assert :ok = LocalTLSPeer.stop_openssl(peer)
     end
+
+    assert {:error, :econnrefused} =
+             :gen_tcp.connect(~c"127.0.0.1", peer.port, [:binary, active: false], 500)
   end
 end

@@ -228,14 +228,35 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
         ]
       ])
 
-    await_openssl(port, 40)
-    {:ok, %{port: port, port_handle: port_handle}}
+    peer = %{port: port, port_handle: port_handle}
+
+    try do
+      await_openssl(port, 40)
+      {:ok, peer}
+    rescue
+      exception ->
+        stop_openssl(peer)
+        reraise exception, __STACKTRACE__
+    end
   end
 
   @spec stop_openssl(%{port_handle: port()}) :: :ok
   def stop_openssl(%{port_handle: port_handle}) do
-    Port.close(port_handle)
-    :ok
+    # s_server -quiet ignores stdin EOF, so closing its BEAM port is insufficient.
+    # Signal the exact owned child and wait for process exit before returning.
+    case Port.info(port_handle, :os_pid) do
+      nil ->
+        :ok
+
+      {:os_pid, pid} ->
+        System.cmd("kill", ["-TERM", Integer.to_string(pid)], stderr_to_stdout: true)
+
+        receive do
+          {^port_handle, {:exit_status, _status}} -> :ok
+        after
+          2_000 -> raise "openssl test peer did not terminate"
+        end
+    end
   end
 
   defp available_port do
@@ -312,7 +333,8 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
 
     case :persistent_term.get(key, nil) do
       nil ->
-        tmpdir = Path.join(System.tmp_dir!(), "ex-ssl-test-#{System.unique_integer([:positive])}")
+        suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+        tmpdir = Path.join(System.tmp_dir!(), "ex-ssl-test-#{suffix}")
         File.mkdir_p!(tmpdir)
         cafile = Path.join(tmpdir, "ca.pem")
         cakeyfile = Path.join(tmpdir, "ca-key.pem")

@@ -128,7 +128,11 @@ exporters and general OTP parity. HTTP/EAS framing belongs in Manifold.
   `MIX_ENV=prod mix compile --warnings-as-errors` also passed locally.
 - `cd e2e && mix format --check-formatted && mix compile --warnings-as-errors`
   passed on OTP 29. Live Caddy execution was not run locally, as required by
-  the existing e2e workflow policy. CI has not yet been executed for this branch.
+  the existing e2e workflow policy. The live
+  [Caddy fingerprint job](https://github.com/gsmlg-dev/ex_ssl/actions/runs/34838897365)
+  passed in CI (one test), and the dedicated
+  [OTP/OpenSSL job](https://github.com/gsmlg-dev/ex_ssl/actions/runs/34838897359)
+  passed all 40 reference/interoperability/lifecycle tests on revision `c02a90c`.
 - OTP 29 validation used the Docker image
   `hexpm/elixir:1.20.4-erlang-29.0.6-ubuntu-noble-20260905`, with OpenSSL,
   CA certificates and `libsctp1` installed, a read-only source mount and a
