@@ -311,6 +311,7 @@ defmodule SSL.Connection do
             do: {:error, :closed, state},
             else: process_records(rest, state)
         else
+          {:error, reason, failed_state} -> {:error, reason, failed_state}
           {:error, reason} -> {:error, reason, state}
         end
 
@@ -323,7 +324,7 @@ defmodule SSL.Connection do
 
   defp apply_events([:connected | rest], state) do
     if Options.remaining(state.deadline) == 0 do
-      {:error, :timeout}
+      {:error, :timeout, state}
     else
       :gen_statem.reply(state.connect_from, {:ok, state.socket})
       cancel_timer(state.handshake_timer)
@@ -332,19 +333,9 @@ defmodule SSL.Connection do
   end
 
   defp apply_events([{:application_data, bytes} | rest], state) do
-    if state.size + byte_size(bytes) <= @max_plaintext do
-      state =
-        if bytes == <<>>,
-          do: state,
-          else: %{
-            state
-            | buffer: :queue.in(bytes, state.buffer),
-              size: state.size + byte_size(bytes)
-          }
-
-      apply_events(rest, deliver(state))
-    else
-      {:error, :enobufs}
+    case buffer_application_data(deliver(state), bytes) do
+      {:ok, state} -> apply_events(rest, state)
+      {:error, reason, state} -> {:error, reason, state}
     end
   end
 
@@ -383,6 +374,34 @@ defmodule SSL.Connection do
       true ->
         state
     end
+  end
+
+  defp buffer_application_data(state, bytes)
+       when state.size + byte_size(bytes) <= @max_plaintext do
+    {:ok, deliver(enqueue_application_data(state, bytes))}
+  end
+
+  defp buffer_application_data(%{recv: %{length: length}} = state, bytes)
+       when length > state.size do
+    needed = length - state.size
+    <<requested::binary-size(^needed), surplus::binary>> = bytes
+
+    state
+    |> enqueue_application_data(requested)
+    |> deliver()
+    |> buffer_application_data(surplus)
+  end
+
+  defp buffer_application_data(state, _bytes), do: {:error, :enobufs, state}
+
+  defp enqueue_application_data(state, <<>>), do: state
+
+  defp enqueue_application_data(state, bytes) do
+    %{
+      state
+      | buffer: :queue.in(bytes, state.buffer),
+        size: state.size + byte_size(bytes)
+    }
   end
 
   defp deliver_bytes(state, length) do

@@ -44,6 +44,26 @@ defmodule SSL.ConnectionLifecycleTest do
     Peer.stop(peer)
   end
 
+  test "maximum-length receive drains a crossing TLS record and preserves its surplus" do
+    prefix = :binary.copy("a", 7)
+    remainder = :binary.copy("b", 1_048_576 - byte_size(prefix))
+    expected = prefix <> remainder
+    surplus = "surplus-after-limit"
+
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        :ok = :ssl.send(socket, prefix)
+        :ok = :ssl.send(socket, remainder <> surplus)
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+      end)
+
+    socket = connect(peer)
+    assert {:ok, ^expected} = SSL.recv(socket, 1_048_576, 5_000)
+    assert {:ok, ^surplus} = SSL.recv(socket, byte_size(surplus), 5_000)
+    assert :ok = SSL.close(socket)
+    Peer.stop(peer)
+  end
+
   test "dead receiver is cancelled and does not consume subsequent data" do
     {:ok, peer} =
       Peer.start(fn socket ->
@@ -320,6 +340,62 @@ defmodule SSL.ConnectionLifecycleTest do
     Peer.stop(peer)
   end
 
+  test "near-limit overflow preserves state after expiring a pending receive" do
+    parent = self()
+
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        receive do
+          :send_crossing_record -> :ok
+        end
+
+        :ok = :ssl.send(socket, "xy")
+        send(parent, :crossing_record_sent)
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    socket = connect(peer)
+    near_limit = :binary.copy("p", 1_048_575)
+
+    :sys.replace_state(socket.pid, fn {:connected, state} ->
+      {:connected,
+       %{state | buffer: :queue.in(near_limit, state.buffer), size: byte_size(near_limit)}}
+    end)
+
+    receiver =
+      spawn(fn ->
+        send(parent, {:near_limit_recv, SSL.recv(socket, 1_048_576, 50)})
+
+        receive do
+          message -> send(parent, {:stale_receiver_message, message})
+        after
+          100 -> send(parent, :receiver_quiet)
+        end
+      end)
+
+    receiver_monitor = Process.monitor(receiver)
+    wait_for_pending_receiver(socket.pid)
+    connection_monitor = Process.monitor(socket.pid)
+
+    try do
+      :ok = :sys.suspend(socket.pid)
+      send(peer.task.pid, :send_crossing_record)
+      assert_receive :crossing_record_sent, 1_000
+      Process.sleep(75)
+    after
+      if Process.alive?(socket.pid), do: :sys.resume(socket.pid)
+    end
+
+    assert_receive {:near_limit_recv, {:error, :timeout}}, 1_000
+    assert_receive {:DOWN, ^connection_monitor, :process, _, :normal}
+    assert_receive :receiver_quiet, 1_000
+    refute_receive {:stale_receiver_message, _message}
+    assert_receive {:DOWN, ^receiver_monitor, :process, ^receiver, :normal}
+    assert {:error, :econnreset} = SSL.recv(socket, 0, 0)
+    assert :ok = Peer.stop(peer)
+  end
+
   test "oversized wire record sends a protocol alert and terminates the temporary child" do
     {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
     {:ok, {_, port}} = :inet.sockname(listener)
@@ -441,6 +517,20 @@ defmodule SSL.ConnectionLifecycleTest do
       {:error, :timeout} ->
         Process.sleep(1)
         wait_for_receiver(socket, attempts - 1)
+    end
+  end
+
+  defp wait_for_pending_receiver(pid, attempts \\ 100)
+  defp wait_for_pending_receiver(_pid, 0), do: flunk("receiver did not become pending")
+
+  defp wait_for_pending_receiver(pid, attempts) do
+    case :sys.get_state(pid) do
+      {:connected, %{recv: nil}} ->
+        Process.sleep(1)
+        wait_for_pending_receiver(pid, attempts - 1)
+
+      {:connected, %{recv: %{} = _receiver}} ->
+        :ok
     end
   end
 

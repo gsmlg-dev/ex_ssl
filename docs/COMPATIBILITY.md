@@ -120,7 +120,7 @@ exporters and general OTP parity. HTTP/EAS framing belongs in Manifold.
 ### Library gate executed on 2026-09-14
 
 - OTP 28.5.0.5 / Elixir 1.18.5 and OTP 29.0.6 / Elixir 1.20.4:
-  `mix test --include integration` — 278 tests and 15 properties passed,
+  `mix test --include integration` — 280 tests and 15 properties passed,
   with no skipped interoperability tests. Local OTP/OpenSSL peers generate
   certificates at test time; no production endpoint or account is required.
 - `mix format --check-formatted`, `mix compile --warnings-as-errors`, and
@@ -129,10 +129,15 @@ exporters and general OTP parity. HTTP/EAS framing belongs in Manifold.
 - `cd e2e && mix format --check-formatted && mix compile --warnings-as-errors`
   passed on OTP 29. Live Caddy execution was not run locally, as required by
   the existing e2e workflow policy. The live
-  [Caddy fingerprint job](https://github.com/gsmlg-dev/ex_ssl/actions/runs/34838897365)
+  [Caddy fingerprint job](https://github.com/gsmlg-dev/ex_ssl/actions/runs/34839788033)
   passed in CI (one test), and the dedicated
-  [OTP/OpenSSL job](https://github.com/gsmlg-dev/ex_ssl/actions/runs/34838897359)
-  passed all 40 reference/interoperability/lifecycle tests on revision `c02a90c`.
+  [OTP/OpenSSL job](https://github.com/gsmlg-dev/ex_ssl/actions/runs/34839787990)
+  passed all 40 reference/interoperability/lifecycle tests on revision `7c2e72b`.
+  The follow-up maximum-length receive regression adds two lifecycle tests:
+  a crossing record preserves surplus bytes, and an expired near-limit receive
+  receives exactly one timeout even when later input exhausts the buffer.
+  These address consumer issue [#3](https://github.com/gsmlg-dev/ex_ssl/issues/3)
+  without reducing the receive bound or pacing the test peer.
 - OTP 29 validation used the Docker image
   `hexpm/elixir:1.20.4-erlang-29.0.6-ubuntu-noble-20260905`, with OpenSSL,
   CA certificates and `libsctp1` installed, a read-only source mount and a
