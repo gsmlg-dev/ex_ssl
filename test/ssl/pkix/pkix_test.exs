@@ -27,6 +27,24 @@ defmodule SSL.PKIXTest do
     assert {:ok, [%Certificate{der: @root_der}]} = PKIX.normalize_trust(@root_pem)
   end
 
+  test "normalizes the tagged entries returned by public_key.cacerts_get/0" do
+    cacerts = :public_key.cacerts_get()
+    assert cacerts != []
+    assert {:ok, certificates} = PKIX.normalize_trust(cacerts)
+    assert length(certificates) == length(cacerts)
+    assert Enum.all?(certificates, &match?(%Certificate{}, &1))
+  end
+
+  test "trust-anchor limits are independent from peer-chain limits" do
+    anchors = List.duplicate({:cert, @root_der, :ignored_decoded_term}, 129)
+
+    assert {:ok, certificates} = PKIX.normalize_trust(anchors)
+    assert length(certificates) == 129
+
+    assert {:error, {:certificate_count_limit_exceeded, 129, 128}} =
+             PKIX.decode_chain(List.duplicate(@root_der, 129))
+  end
+
   test "validates a path and DNS service identity and exposes the verified leaf" do
     assert {:ok,
             %VerifiedPeer{
@@ -36,6 +54,35 @@ defmodule SSL.PKIXTest do
             }} = PKIX.verify([@leaf_der], @root_pem, {:dns_id, "example.test"})
 
     assert leaf == :public_key.pkix_decode_cert(@leaf_der, :otp)
+  end
+
+  test "honors a bounded custom hostname match function" do
+    allow_alias = fn
+      {:dns_id, "alias.example.test"}, {:dNSName, presented} ->
+        to_string(presented) == "example.test"
+
+      _reference, _presented ->
+        :default
+    end
+
+    assert {:ok, %VerifiedPeer{}} =
+             PKIX.verify([@leaf_der], @root_pem, {:dns_id, "alias.example.test"},
+               customize_hostname_check: [match_fun: allow_alias]
+             )
+
+    reject_all = fn _reference, _presented -> false end
+
+    assert {:error, :hostname_mismatch} =
+             PKIX.verify([@leaf_der], @root_pem, {:dns_id, "example.test"},
+               customize_hostname_check: [match_fun: reject_all]
+             )
+
+    https_match = :public_key.pkix_verify_hostname_match_fun(:https)
+
+    assert {:ok, %VerifiedPeer{}} =
+             PKIX.verify([@leaf_der], @root_pem, {:dns_id, "example.test"},
+               customize_hostname_check: [match_fun: https_match]
+             )
   end
 
   test "validates an IP subject alternative name" do

@@ -4,8 +4,8 @@ defmodule SSL.Protocol.ServerFlight do
 
   Decoding accepts one complete handshake message and preserves its exact
   encoded bytes. Stream fragmentation remains the responsibility of
-  `SSL.Protocol.HandshakeFramer`. Post-handshake NewSessionTicket and KeyUpdate
-  messages are intentionally deferred.
+  `SSL.Protocol.HandshakeFramer`. Bounded NewSessionTicket and KeyUpdate codecs
+  let the connection runtime apply post-handshake epoch transitions explicitly.
   """
 
   defmodule EncryptedExtensions do
@@ -51,6 +51,31 @@ defmodule SSL.Protocol.ServerFlight do
     defstruct [:verify_data, :encoded]
   end
 
+  defmodule CertificateRequest do
+    @moduledoc false
+    @enforce_keys [:request_context, :extensions, :encoded]
+    defstruct @enforce_keys
+  end
+
+  defmodule NewSessionTicket do
+    @moduledoc false
+    @enforce_keys [
+      :ticket_lifetime,
+      :ticket_age_add,
+      :ticket_nonce,
+      :ticket,
+      :extensions,
+      :encoded
+    ]
+    defstruct @enforce_keys
+  end
+
+  defmodule KeyUpdate do
+    @moduledoc false
+    @enforce_keys [:request_update, :encoded]
+    defstruct @enforce_keys
+  end
+
   @default_max_handshake_length 1_048_576
   @default_max_certificate_count 16
   @default_max_total_certificate_bytes 1_048_576
@@ -85,6 +110,9 @@ defmodule SSL.Protocol.ServerFlight do
           | Certificate.t()
           | CertificateVerify.t()
           | Finished.t()
+          | CertificateRequest.t()
+          | NewSessionTicket.t()
+          | KeyUpdate.t()
 
   @spec decode(term(), keyword()) ::
           {:ok, decoded(), binary()} | {:more, pos_integer()} | {:error, term()}
@@ -103,6 +131,16 @@ defmodule SSL.Protocol.ServerFlight do
       {:ok, <<20, byte_size(verify_data)::24, verify_data::binary>>}
     end
   end
+
+  @spec encode_empty_certificate(binary()) :: {:ok, binary()} | {:error, term()}
+  def encode_empty_certificate(context) when is_binary(context) and byte_size(context) <= 255,
+    do: {:ok, <<11, byte_size(context) + 4::24, byte_size(context), context::binary, 0::24>>}
+
+  def encode_empty_certificate(_context), do: {:error, {:invalid_input, :request_context}}
+
+  @spec encode_key_update(boolean()) :: {:ok, binary()}
+  def encode_key_update(request_update) when is_boolean(request_update),
+    do: {:ok, <<24, 1::24, if(request_update, do: 1, else: 0)>>}
 
   defp decode_message(input, _config) when byte_size(input) < 4,
     do: {:more, 4 - byte_size(input)}
@@ -145,11 +183,17 @@ defmodule SSL.Protocol.ServerFlight do
     end
   end
 
-  defp decode_body(13, body, _encoded, _remainder, config) do
-    with {:ok, extension_bytes} <- parse_certificate_request(body),
-         {:ok, _extensions} <-
-           parse_extensions(extension_bytes, :certificate_request, config) do
-      {:error, {:unsupported_handshake, :client_authentication}}
+  defp decode_body(13, body, encoded, remainder, config) do
+    with {:ok, context, extension_bytes} <- parse_certificate_request(body),
+         :ok <- require_empty_certificate_request_context(context),
+         {:ok, extensions} <- parse_extensions(extension_bytes, :certificate_request, config),
+         :ok <- require_certificate_request_signature_algorithms(extensions) do
+      {:ok,
+       %CertificateRequest{
+         request_context: context,
+         extensions: extensions,
+         encoded: encoded
+       }, remainder}
     end
   end
 
@@ -171,6 +215,31 @@ defmodule SSL.Protocol.ServerFlight do
       {:ok, %Finished{verify_data: verify_data, encoded: encoded}, remainder}
     end
   end
+
+  defp decode_body(4, body, encoded, remainder, config) do
+    with {:ok, lifetime, age_add, nonce, ticket, extension_bytes} <-
+           parse_new_session_ticket(body),
+         {:ok, extensions} <- parse_extensions(extension_bytes, :new_session_ticket, config) do
+      {:ok,
+       %NewSessionTicket{
+         ticket_lifetime: lifetime,
+         ticket_age_add: age_add,
+         ticket_nonce: nonce,
+         ticket: ticket,
+         extensions: extensions,
+         encoded: encoded
+       }, remainder}
+    end
+  end
+
+  defp decode_body(24, <<request>>, encoded, remainder, _config) when request in [0, 1],
+    do: {:ok, %KeyUpdate{request_update: request == 1, encoded: encoded}, remainder}
+
+  defp decode_body(24, <<request>>, _encoded, _remainder, _config),
+    do: {:error, {:malformed_key_update, request}}
+
+  defp decode_body(24, _body, _encoded, _remainder, _config),
+    do: {:error, {:malformed_key_update, :length}}
 
   defp decode_body(type, _body, _encoded, _remainder, _config),
     do: {:error, {:unexpected_handshake_type, type}}
@@ -344,11 +413,11 @@ defmodule SSL.Protocol.ServerFlight do
     if byte_size(rest) < context_length + 2 do
       {:error, {:malformed_certificate_request, :request_context}}
     else
-      <<_context::binary-size(^context_length), extension_length::16, extension_bytes::binary>> =
+      <<context::binary-size(^context_length), extension_length::16, extension_bytes::binary>> =
         rest
 
       if byte_size(extension_bytes) == extension_length do
-        {:ok, extension_bytes}
+        {:ok, context, extension_bytes}
       else
         {:error, {:malformed_certificate_request, :extensions_length}}
       end
@@ -357,6 +426,42 @@ defmodule SSL.Protocol.ServerFlight do
 
   defp parse_certificate_request(_body),
     do: {:error, {:malformed_certificate_request, :request_context}}
+
+  defp require_empty_certificate_request_context(<<>>), do: :ok
+
+  defp require_empty_certificate_request_context(context),
+    do: {:error, {:unsupported_certificate_request_context, context}}
+
+  defp require_certificate_request_signature_algorithms(extensions) do
+    if Enum.any?(extensions, &match?({:signature_algorithms, [_ | _]}, &1)),
+      do: :ok,
+      else: {:error, :missing_certificate_request_signature_algorithms}
+  end
+
+  defp parse_new_session_ticket(<<lifetime::32, age_add::32, nonce_length, rest::binary>>)
+       when byte_size(rest) >= nonce_length + 4 do
+    <<nonce::binary-size(^nonce_length), ticket_length::16, tail::binary>> = rest
+
+    cond do
+      lifetime > 604_800 ->
+        {:error, {:invalid_new_session_ticket_lifetime, lifetime}}
+
+      ticket_length > 0 and byte_size(tail) >= ticket_length + 2 ->
+        <<ticket::binary-size(^ticket_length), extensions_length::16, extensions::binary>> = tail
+
+        if byte_size(extensions) == extensions_length do
+          {:ok, lifetime, age_add, nonce, ticket, extensions}
+        else
+          {:error, {:malformed_new_session_ticket, :extensions_length}}
+        end
+
+      true ->
+        {:error, {:malformed_new_session_ticket, :ticket}}
+    end
+  end
+
+  defp parse_new_session_ticket(_body),
+    do: {:error, {:malformed_new_session_ticket, :header}}
 
   defp decode_vector16(<<length::16, bytes::binary>>, _error) when byte_size(bytes) == length,
     do: {:ok, bytes}
@@ -421,11 +526,23 @@ defmodule SSL.Protocol.ServerFlight do
     end
   end
 
+  defp decode_extension(:certificate_request, 13, payload, _config),
+    do: decode_signature_algorithms(payload)
+
   defp decode_extension(:certificate_request, extension_id, payload, _config) do
     with :ok <- require_known_extension(extension_id, :certificate_request) do
       {:ok, {:raw, extension_id, payload}}
     end
   end
+
+  defp decode_extension(:new_session_ticket, 42, <<maximum::32>>, _config),
+    do: {:ok, {:early_data, maximum}}
+
+  defp decode_extension(:new_session_ticket, 42, _payload, _config),
+    do: {:error, {:malformed_extension, 42, :early_data}}
+
+  defp decode_extension(:new_session_ticket, extension_id, _payload, _config),
+    do: {:error, {:unsupported_extension, :new_session_ticket, extension_id}}
 
   defp require_known_extension(extension_id, :encrypted_extensions)
        when extension_id in @encrypted_extension_ids,
@@ -481,6 +598,22 @@ defmodule SSL.Protocol.ServerFlight do
 
   defp decode_supported_groups(_payload),
     do: {:error, {:malformed_extension, 10, :supported_groups}}
+
+  defp decode_signature_algorithms(<<length::16, values::binary>>)
+       when length > 0 and rem(length, 2) == 0 and byte_size(values) == length do
+    algorithms = for <<algorithm::16 <- values>>, do: algorithm
+
+    cond do
+      length(algorithms) != length(Enum.uniq(algorithms)) ->
+        {:error, {:duplicate_signature_algorithm, :certificate_request}}
+
+      true ->
+        {:ok, {:signature_algorithms, algorithms}}
+    end
+  end
+
+  defp decode_signature_algorithms(_payload),
+    do: {:error, {:malformed_extension, 13, :signature_algorithms}}
 
   defp decode_alpn(<<list_length::16, protocol_length, protocol::binary>>)
        when list_length == protocol_length + 1 and protocol_length > 0 and

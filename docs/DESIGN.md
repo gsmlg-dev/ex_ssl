@@ -79,12 +79,16 @@ Suggested internal representation:
 
 ```elixir
 defmodule SSL.Socket do
-  @opaque t :: %__MODULE__{pid: pid(), ref: reference()}
-  defstruct [:pid, :ref]
+  @opaque t :: %__MODULE__{pid: pid(), ref: reference(), status: reference()}
+  defstruct [:pid, :ref, :status]
 end
 ```
 
 `ref` protects against stale/cross-connection calls and gives the connection a stable public identity.
+
+`status` is an atomic terminal-status cell (open/orderly/failed), written by the
+connection process and omitted from inspection. It preserves closure information
+after the process exits; it stores no TLS secrets or application data.
 
 All active messages contain the same public socket term handed to the caller.
 
@@ -630,6 +634,12 @@ Outbound KeyUpdate:
 
 Maintain a close state distinct from process termination.
 
+In the passive client milestone, authenticated close_notify drains already
+decrypted bytes before returning `:closed`. An abrupt TCP EOF or unexpected
+connection-process exit returns `:econnreset`, also on later calls through the
+same handle. Undelivered plaintext is discarded on transport failure so an HTTP
+consumer cannot mistake a truncated close-delimited response for a complete one.
+
 Support:
 
 - inbound/outbound `close_notify`;
@@ -821,4 +831,3 @@ The first implementation MUST NOT:
 - add a Rust NIF before a measured requirement exists;
 - implement HTTP/2 or HTTP/3 inside this library;
 - advertise TLS 1.2 support before TLS 1.2 is implemented.
-

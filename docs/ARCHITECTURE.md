@@ -173,10 +173,16 @@ A passive fingerprint sniffer, if implemented later, belongs under a separate su
 The public socket is opaque from the caller's perspective. Initial implementation may use:
 
 ```elixir
-%SSL.Socket{pid: pid, ref: ref}
+%SSL.Socket{pid: pid, ref: ref, status: terminal_status}
 ```
 
 The caller MUST NOT depend on this representation.
+
+The passive client milestone uses one atomic terminal-status cell written by the
+connection process. It contains only open/orderly/failed state, never keys or
+payloads, and survives process exit while the caller retains the handle.
+This lets later calls distinguish authenticated closure (`:closed`) from abrupt
+transport/process loss (`:econnreset`) without tombstone processes or a global table.
 
 A stable socket identity is required across:
 
@@ -844,4 +850,3 @@ The first architecture milestone is complete when:
 8. at least one golden custom profile proves exact controllable ordering/GREASE placement;
 9. JA3 and JA4 are derived from that same ClientHello;
 10. no native TLS implementation (`:ssl`) is used to perform the `ex_ssl` handshake itself.
-

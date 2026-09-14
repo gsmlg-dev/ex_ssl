@@ -23,6 +23,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
 
   alias SSL.Protocol.ServerFlight.{
     Certificate,
+    CertificateRequest,
     CertificateVerify,
     EncryptedExtensions
   }
@@ -95,6 +96,21 @@ defmodule SSL.Protocol.ServerFlightVerifier do
           }
   end
 
+  defmodule Incremental do
+    @moduledoc false
+    @derive {Inspect, except: [:secrets, :server_handshake_state, :verified_peer]}
+    @enforce_keys [
+      :input,
+      :offer,
+      :secrets,
+      :config,
+      :phase,
+      :transcript,
+      :server_handshake_state
+    ]
+    defstruct @enforce_keys ++ [verified_peer: nil, certificate_request_context: nil]
+  end
+
   @default_max_records 64
   @maximum_handshake_length 1_048_576
   @server_flight_option_keys [
@@ -107,13 +123,14 @@ defmodule SSL.Protocol.ServerFlightVerifier do
     :offered_extension_ids,
     :allowed_signature_schemes
   ]
-  @option_keys [:max_records | @server_flight_option_keys]
+  @option_keys [:max_records, :customize_hostname_check | @server_flight_option_keys]
 
   @type fatal_alert ::
           :bad_record_mac
           | :record_overflow
           | :unknown_ca
           | :bad_certificate
+          | :certificate_expired
           | :certificate_unknown
           | :decrypt_error
           | :unexpected_message
@@ -130,6 +147,144 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       {:error, {alert, reason}} -> {:error, {:fatal_alert, alert, reason}}
     end
   end
+
+  @doc false
+  @spec start_incremental(Input.t(), keyword()) ::
+          {:ok, Incremental.t()} | {:error, {:fatal_alert, fatal_alert(), term()}}
+  def start_incremental(input, options \\ [])
+
+  def start_incremental(%Input{} = input, options) do
+    case do_start_incremental(input, options, nil) do
+      {:ok, incremental} -> {:ok, incremental}
+      {:error, {alert, reason}} -> {:error, {:fatal_alert, alert, reason}}
+    end
+  end
+
+  def start_incremental(_input, _options),
+    do: {:error, {:fatal_alert, :decode_error, {:invalid_input, :verifier}}}
+
+  @doc false
+  def start_incremental(%Input{} = input, options, %Transcript{} = transcript) do
+    case do_start_incremental(input, options, transcript) do
+      {:ok, incremental} -> {:ok, incremental}
+      {:error, {alert, reason}} -> {:error, {:fatal_alert, alert, reason}}
+    end
+  end
+
+  @doc false
+  @spec process_message(Incremental.t(), binary()) ::
+          {:ok, Incremental.t()}
+          | {:connected, Result.t(), [binary()]}
+          | {:error, {:fatal_alert, fatal_alert(), term()}}
+  def process_message(%Incremental{} = state, encoded) when is_binary(encoded) do
+    case do_process_message(state, encoded) do
+      {:error, {alert, reason}} -> {:error, {:fatal_alert, alert, reason}}
+      result -> result
+    end
+  end
+
+  def process_message(_state, _encoded),
+    do: {:error, {:fatal_alert, :decode_error, {:invalid_input, :incremental_message}}}
+
+  defp do_start_incremental(input, options, transcript_prefix) do
+    with {:ok, config} <- validate_options(options),
+         {:ok, offer, server_hello} <- validate_input(input),
+         {:ok, config} <- bind_offer(config, offer),
+         input = %{input | server_hello: server_hello},
+         {:ok, suite, hash, peer_public_key} <- negotiate(input, offer),
+         {:ok, secrets} <-
+           derive_handshake_secrets(input, suite, hash, peer_public_key, transcript_prefix) do
+      {:ok,
+       %Incremental{
+         input: input,
+         offer: offer,
+         secrets: secrets,
+         config: config,
+         phase: :encrypted_extensions,
+         transcript: secrets.transcript,
+         server_handshake_state: secrets.server_handshake_state
+       }}
+    end
+  end
+
+  defp do_process_message(%Incremental{phase: :encrypted_extensions} = state, encoded) do
+    options = [{:hash, state.secrets.hash} | state.config.server_flight_options]
+
+    with {:ok, %EncryptedExtensions{} = message} <-
+           decode_message(encoded, EncryptedExtensions, options),
+         :ok <- validate_encrypted_extensions(message, state.offer) do
+      {:ok,
+       %{
+         state
+         | phase: :certificate_or_request,
+           transcript: Transcript.append(state.transcript, encoded)
+       }}
+    end
+  end
+
+  defp do_process_message(
+         %Incremental{phase: :certificate_or_request} = state,
+         <<13, _::binary>> = encoded
+       ) do
+    options = [{:hash, state.secrets.hash} | state.config.server_flight_options]
+
+    with {:ok, %CertificateRequest{} = request} <-
+           decode_message(encoded, CertificateRequest, options) do
+      {:ok,
+       %{
+         state
+         | phase: :certificate,
+           certificate_request_context: request.request_context,
+           transcript: Transcript.append(state.transcript, encoded)
+       }}
+    end
+  end
+
+  defp do_process_message(%Incremental{phase: phase} = state, encoded)
+       when phase in [:certificate_or_request, :certificate] do
+    options = [{:hash, state.secrets.hash} | state.config.server_flight_options]
+
+    with {:ok, %Certificate{} = certificate} <- decode_message(encoded, Certificate, options),
+         :ok <- validate_certificate_extensions(certificate, state.offer),
+         {:ok, verified_peer} <- verify_peer(certificate, state.input, state.config) do
+      {:ok,
+       %{
+         state
+         | phase: :certificate_verify,
+           verified_peer: verified_peer,
+           transcript: Transcript.append(state.transcript, encoded)
+       }}
+    end
+  end
+
+  defp do_process_message(%Incremental{phase: :certificate_verify} = state, encoded) do
+    options = [{:hash, state.secrets.hash} | state.config.server_flight_options]
+
+    with {:ok, %CertificateVerify{} = certificate_verify} <-
+           decode_message(encoded, CertificateVerify, options),
+         :ok <-
+           verify_certificate_signature(certificate_verify, state.verified_peer, state.transcript) do
+      {:ok, %{state | phase: :finished, transcript: Transcript.append(state.transcript, encoded)}}
+    end
+  end
+
+  defp do_process_message(%Incremental{phase: :finished} = state, encoded) do
+    options = [{:hash, state.secrets.hash} | state.config.server_flight_options]
+
+    with {:ok, %ServerFinished{} = finished} <- decode_message(encoded, ServerFinished, options),
+         :ok <- verify_server_finished(finished, state.transcript, state.secrets),
+         server_transcript = Transcript.append(state.transcript, encoded),
+         {:ok, result, outbound} <- finish_incremental(state, server_transcript) do
+      {:connected, result, outbound}
+    end
+  end
+
+  defp do_process_message(%Incremental{} = state, encoded),
+    do:
+      alert(
+        :unexpected_message,
+        {:invalid_server_flight_order, state.phase, message_types([encoded])}
+      )
 
   defp verify_flight(%Input{} = input, options) do
     with {:ok, config} <- validate_options(options),
@@ -336,7 +491,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
   defp bind_key_share_group(group, client_group),
     do: alert(:illegal_parameter, {:key_share_group_mismatch, group, client_group})
 
-  defp derive_handshake_secrets(input, suite, hash, peer_public_key) do
+  defp derive_handshake_secrets(input, suite, hash, peer_public_key, transcript_prefix \\ nil) do
     with {:ok, shared_secret} <-
            crypto_result(
              KeyExchange.shared_secret(input.client_key_pair, peer_public_key),
@@ -346,8 +501,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
          {:ok, handshake_secret} <-
            crypto_result(KeySchedule.handshake_secret(hash, early_secret, shared_secret)),
          transcript =
-           Transcript.new(hash)
-           |> Transcript.append(input.client_hello)
+           (transcript_prefix || Transcript.new(hash) |> Transcript.append(input.client_hello))
            |> Transcript.append(input.server_hello.encoded),
          transcript_hash = Transcript.digest(transcript),
          {:ok, client_secret} <-
@@ -497,7 +651,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
            decode_message(certificate, Certificate, options),
          :ok <- validate_certificate_extensions(certificate, offer),
          transcript = Transcript.append(transcript, certificate.encoded),
-         {:ok, verified_peer} <- verify_peer(certificate, input),
+         {:ok, verified_peer} <- verify_peer(certificate, input, config),
          {:ok, %CertificateVerify{} = certificate_verify} <-
            decode_message(certificate_verify, CertificateVerify, options),
          :ok <- verify_certificate_signature(certificate_verify, verified_peer, transcript),
@@ -610,15 +764,100 @@ defmodule SSL.Protocol.ServerFlightVerifier do
 
   defp decode_alert(reason), do: alert(:decode_error, reason)
 
-  defp verify_peer(%Certificate{entries: entries}, input) do
+  defp verify_peer(%Certificate{entries: entries}, input, config) do
     chain = Enum.map(entries, & &1.der)
 
-    case PKIX.verify(chain, input.trust_source, input.identity) do
-      {:ok, verified_peer} -> {:ok, verified_peer}
-      {:error, {:invalid_identity, _identity} = reason} -> alert(:illegal_parameter, reason)
-      {:error, :hostname_mismatch = reason} -> alert(:certificate_unknown, reason)
-      {:error, {:path_validation_failed, _path_reason} = reason} -> alert(:unknown_ca, reason)
-      {:error, reason} -> alert(:bad_certificate, reason)
+    case PKIX.verify(chain, input.trust_source, input.identity,
+           customize_hostname_check: config.hostname_check
+         ) do
+      {:ok, verified_peer} ->
+        {:ok, verified_peer}
+
+      {:error, {:invalid_identity, _identity} = reason} ->
+        alert(:illegal_parameter, reason)
+
+      {:error, :hostname_mismatch = reason} ->
+        alert(:certificate_unknown, reason)
+
+      {:error, {:path_validation_failed, {:bad_cert, :cert_expired}} = reason} ->
+        alert(:certificate_expired, reason)
+
+      {:error, {:path_validation_failed, _path_reason} = reason} ->
+        alert(:unknown_ca, reason)
+
+      {:error, reason} ->
+        alert(:bad_certificate, reason)
+    end
+  end
+
+  defp finish_incremental(state, server_transcript) do
+    transcript_hash = Transcript.digest(server_transcript)
+
+    with {:ok, client_application_secret} <-
+           crypto_result(
+             KeySchedule.client_application_traffic_secret(
+               state.secrets.hash,
+               state.secrets.master_secret,
+               transcript_hash
+             )
+           ),
+         {:ok, server_application_secret} <-
+           crypto_result(
+             KeySchedule.server_application_traffic_secret(
+               state.secrets.hash,
+               state.secrets.master_secret,
+               transcript_hash
+             )
+           ),
+         {:ok, client_application_state} <-
+           crypto_result(
+             KeySchedule.traffic_state(state.secrets.suite, client_application_secret)
+           ),
+         {:ok, server_application_state} <-
+           crypto_result(
+             KeySchedule.traffic_state(state.secrets.suite, server_application_secret)
+           ),
+         {:ok, transcript, handshake_state, certificate_records} <-
+           maybe_empty_client_certificate(
+             state.certificate_request_context,
+             server_transcript,
+             state.secrets.client_handshake_state
+           ),
+         {:ok, client_verify_data} <-
+           crypto_result(
+             CryptoFinished.client_verify_data(
+               state.secrets.hash,
+               state.secrets.client_handshake_secret,
+               Transcript.digest(transcript)
+             )
+           ),
+         {:ok, client_finished} <-
+           crypto_result(
+             ServerFlight.encode_finished(client_verify_data, hash: state.secrets.hash)
+           ),
+         {:ok, client_finished_record, client_handshake_state} <-
+           encrypt_client_finished(handshake_state, client_finished) do
+      result = %Result{
+        verified_peer: state.verified_peer,
+        server_handshake_state: state.server_handshake_state,
+        client_handshake_state: client_handshake_state,
+        client_finished_record: client_finished_record,
+        client_application_state: client_application_state,
+        server_application_state: server_application_state,
+        transcript: Transcript.append(transcript, client_finished)
+      }
+
+      {:ok, result, certificate_records ++ [client_finished_record]}
+    end
+  end
+
+  defp maybe_empty_client_certificate(nil, transcript, state),
+    do: {:ok, transcript, state, []}
+
+  defp maybe_empty_client_certificate(context, transcript, state) do
+    with {:ok, certificate} <- crypto_result(ServerFlight.encode_empty_certificate(context)),
+         {:ok, record, next_state} <- encrypt_client_finished(state, certificate) do
+      {:ok, Transcript.append(transcript, certificate), next_state, [record]}
     end
   end
 
@@ -719,12 +958,15 @@ defmodule SSL.Protocol.ServerFlightVerifier do
     if length(keys) == length(Enum.uniq(keys)) and Enum.all?(keys, &(&1 in @option_keys)) do
       case Keyword.get(options, :max_records, @default_max_records) do
         maximum when is_integer(maximum) and maximum > 0 ->
-          server_flight_options = Keyword.drop(options, [:max_records])
+          server_flight_options =
+            Keyword.drop(options, [:max_records, :customize_hostname_check])
 
-          with :ok <- validate_signature_policy_option(server_flight_options) do
+          with :ok <- validate_signature_policy_option(server_flight_options),
+               :ok <- validate_hostname_check_option(options) do
             {:ok,
              %{
                max_records: maximum,
+               hostname_check: Keyword.get(options, :customize_hostname_check, []),
                max_handshake_length:
                  Keyword.get(options, :max_handshake_length, @maximum_handshake_length),
                server_flight_options: server_flight_options
@@ -750,6 +992,14 @@ defmodule SSL.Protocol.ServerFlightVerifier do
         else
           alert(:decode_error, {:invalid_options, :allowed_signature_schemes})
         end
+    end
+  end
+
+  defp validate_hostname_check_option(options) do
+    case Keyword.get(options, :customize_hostname_check, []) do
+      [] -> :ok
+      [match_fun: fun] when is_function(fun, 2) -> :ok
+      _other -> alert(:decode_error, {:invalid_options, :customize_hostname_check})
     end
   end
 

@@ -17,7 +17,7 @@ defmodule SSL.MixProject do
 
   def application do
     [
-      extra_applications: [:crypto, :public_key],
+      extra_applications: [:crypto, :public_key] ++ if(Mix.env() == :test, do: [:ssl], else: []),
       mod: {SSL.Application, []}
     ]
   end

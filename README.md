@@ -7,7 +7,7 @@
 
 The OTP application is `:ex_ssl`. The public compatibility module is `SSL` (`Elixir.SSL`), which does not conflict with Erlang's built-in `:ssl` module.
 
-> **Status:** foundation, deterministic ClientHello/ServerHello parsing, and the pure authenticated server-flight milestone are complete. The repository contains bounded record and handshake protection, a byte-bound normal ServerHello negotiation path, Certificate/CertificateVerify/Finished verification, and SAN-only service identity checks. It does not yet implement TLS connection APIs, a complete HRR transition, or live interoperability. Do not treat `ex_ssl` as a production replacement for OTP `:ssl` until the compatibility and security milestones documented here are complete.
+> **Status:** experimental TLS 1.3 client runtime under validation for an opt-in Manifold backend. The public API supports authenticated connections, passive binary/raw application traffic, and TCP-to-TLS upgrades. See the [compatibility matrix](docs/COMPATIBILITY.md) for the exact scope, test evidence, restrictions, and consumer gates. OTP `:ssl` remains the default recommendation.
 
 ## Installation
 
@@ -65,7 +65,7 @@ SSL.connect(host, port,
   verify: :verify_peer,
   server_name_indication: host,
   ex_ssl: [
-    profile: :my_wire_profile
+    profile: :default
   ]
 )
 ```
@@ -81,13 +81,19 @@ feature subset.
 
 The initial compatibility baseline is the Erlang/OTP 29 `:ssl` client API.
 
-Planned/targeted client functions include:
+Implemented client functions are `connect/2,3,4`, `send/2`, `recv/2,3`, and
+`close/1`. Calls return success only after CertificateVerify and Finished
+verification and transmission of client Finished. The connection runs as a
+temporary supervised `:gen_statem`; a failed session is never restarted.
+
+Defaults are deliberately restricted to binary, passive, raw, verified TLS 1.3.
+They differ from OTP's defaults. Supported options and receive/upgrade ownership
+rules are documented in the [compatibility matrix](docs/COMPATIBILITY.md).
+
+The wider roadmap (not implemented API) includes:
 
 ```text
-connect/2,3,4
-send/2
-recv/2,3
-close/1,2
+close/2
 shutdown/2
 setopts/2
 getopts/2
