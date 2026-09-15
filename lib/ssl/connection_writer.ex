@@ -12,8 +12,13 @@ defmodule SSL.ConnectionWriter do
 
   defp loop(connection, connection_monitor) do
     receive do
-      {:send, token, tcp, bytes} when is_reference(token) and is_binary(bytes) ->
-        result = :gen_tcp.send(tcp, bytes)
+      {:send, token, tcp, bytes, shutdown?}
+      when is_reference(token) and (is_binary(bytes) or is_list(bytes)) and
+             is_boolean(shutdown?) ->
+        result =
+          with :ok <- :gen_tcp.send(tcp, bytes),
+               do: if(shutdown?, do: :gen_tcp.shutdown(tcp, :write), else: :ok)
+
         send(connection, {:writer_result, self(), token, result})
         loop(connection, connection_monitor)
 

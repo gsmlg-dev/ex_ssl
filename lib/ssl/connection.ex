@@ -6,7 +6,10 @@ defmodule SSL.Connection do
   alias SSL.Protocol.{HandshakeMachine, RecordFramer}
 
   @max_plaintext 1_048_576
+  @max_pending_input 1_048_576
+  @max_pending_output 1_048_576
   @rearm_reserve 65_536
+  @shutdown_timeout 250
   @alert_codes %{
     unexpected_message: 10,
     bad_record_mac: 20,
@@ -47,8 +50,12 @@ defmodule SSL.Connection do
       :send_timeout,
       :send_timeout_close,
       :negotiated_protocol,
-      :deferred_tcp,
+      :output,
+      :closing,
       records: nil,
+      input: :queue.new(),
+      input_size: 0,
+      input_terminal: false,
       buffer: :queue.new(),
       size: 0,
       armed: false,
@@ -69,6 +76,7 @@ defmodule SSL.Connection do
   @impl true
   def init({owner, ref, status, options, deadline}) do
     Process.flag(:sensitive, true)
+    {writer, writer_monitor} = ConnectionWriter.start(self())
 
     state = %State{
       socket: %Socket{pid: self(), ref: ref, status: status},
@@ -79,6 +87,8 @@ defmodule SSL.Connection do
       active: options.active,
       send_timeout: options.send_timeout,
       send_timeout_close: options.send_timeout_close,
+      writer: writer,
+      writer_monitor: writer_monitor,
       active_terminal: options.active == :once,
       records: RecordFramer.new(),
       handshake_timer: timer(deadline, :handshake_timeout)
@@ -121,8 +131,15 @@ defmodule SSL.Connection do
                customize_hostname_check: state.options.hostname_check,
                depth: state.options.depth
              ),
-           :ok <- :gen_tcp.send(tcp, outbound) do
-        continue(:handshaking, %{state | machine: machine, options: nil})
+           {:ok, state} <-
+             start_output(
+               %{state | machine: machine, options: nil},
+               outbound,
+               :handshake,
+               :handshake_start,
+               state.deadline
+             ) do
+        {:next_state, :handshaking, state}
       else
         {:error, reason} -> fail(state, public_error(reason))
       end
@@ -130,10 +147,21 @@ defmodule SSL.Connection do
   end
 
   def handle_event({:call, from}, {_ref, :close}, _phase, state) do
-    Socket.mark_terminal(state.socket, true)
-    notify_pending(state, {:error, :closed})
-    state = if(state.write, do: state, else: close_notify(state))
-    {:stop_and_reply, :normal, [{:reply, from, :ok}], state}
+    if match?(%{kind: :local}, state.closing) do
+      closing = %{state.closing | waiters: [from | state.closing.waiters]}
+      {:keep_state, %{state | closing: closing}}
+    else
+      Socket.mark_terminal(state.socket, true)
+      notify_pending(state, {:error, :closed})
+
+      case begin_shutdown(state, :local, [from]) do
+        {:ok, state} ->
+          {:next_state, :closing, state}
+
+        {:abort, state} ->
+          {:stop_and_reply, :normal, [{:reply, from, :ok}], close_transport(state)}
+      end
+    end
   end
 
   def handle_event(
@@ -267,8 +295,8 @@ defmodule SSL.Connection do
                  send_timeout: write.send_timeout,
                  send_timeout_close: true
                ) do
-          send(self(), :write_next)
-          {:keep_state, %{state | write: %{write | from: from, cursor: cursor, size: size}}}
+          state = %{state | write: %{write | from: from, cursor: cursor, size: size}}
+          drain_or_continue(:connected, state)
         else
           {:error, reason} -> fail(%{state | write: %{write | from: from}}, reason)
         end
@@ -277,39 +305,41 @@ defmodule SSL.Connection do
 
   def handle_event({:call, from}, {_ref, _}, _phase, _state), do: reply(from, {:error, :closed})
 
-  def handle_event(
-        :info,
-        {:tcp, tcp, bytes},
-        _phase,
-        %{tcp: tcp, deferred_tcp: nil, write: %{waiting: waiting}} = state
-      )
-      when not is_nil(waiting),
-      do: {:keep_state, %{state | armed: false, deferred_tcp: bytes}}
-
   def handle_event(:info, {:tcp, tcp, bytes}, phase, %{tcp: tcp} = state) do
-    process_tcp(phase, bytes, %{state | armed: false})
+    case enqueue_input(%{state | armed: false}, {:data, bytes}) do
+      {:ok, state} -> drain_or_continue(phase, state)
+      {:error, reason, failed_state} -> fail(failed_state, reason)
+    end
   end
 
-  def handle_event(:info, {:deferred_tcp, bytes}, phase, %{deferred_tcp: nil} = state) do
-    process_tcp(phase, bytes, state)
+  def handle_event(:info, {:tcp_closed, tcp}, phase, %{tcp: tcp} = state) do
+    state = enqueue_terminal(%{state | armed: false}, :closed)
+    drain_or_continue(phase, state)
   end
 
-  def handle_event(:info, {:tcp_closed, tcp}, _phase, %{tcp: tcp} = state) do
-    fail(state, :econnreset)
+  def handle_event(:info, {:tcp_error, tcp, reason}, phase, %{tcp: tcp} = state) do
+    state = enqueue_terminal(%{state | armed: false}, {:error, reason})
+    drain_or_continue(phase, state)
   end
 
-  def handle_event(:info, {:tcp_error, tcp, reason}, _phase, %{tcp: tcp} = state),
-    do: fail(state, reason)
+  def handle_event(:internal, :drain_input, phase, state) do
+    drain_input(phase, state)
+  end
 
   def handle_event(:info, :handshake_timeout, phase, state) when phase != :connected,
     do: fail(state, :timeout)
 
   def handle_event(:info, {:recv_timeout, token}, :connected, %{recv: %{token: token}} = state) do
     state = finish_recv(state, {:error, :timeout})
-    continue(:connected, state)
+    drain_or_continue(:connected, state)
   end
 
-  def handle_event(:info, :write_next, :connected, %{write: %{cursor: cursor} = write} = state)
+  def handle_event(
+        :internal,
+        :write_next,
+        :connected,
+        %{output: nil, write: %{cursor: cursor} = write} = state
+      )
       when not is_nil(cursor) do
     cond do
       not Process.alive?(write.owner) ->
@@ -325,16 +355,16 @@ defmodule SSL.Connection do
 
           {:ok, chunk, cursor} ->
             with {:ok, record, machine} <-
-                   HandshakeMachine.encrypt(state.machine, :application_data, chunk) do
-              token = make_ref()
-              send(state.writer, {:send, token, state.tcp, record})
-
-              {:keep_state,
-               %{
-                 state
-                 | machine: machine,
-                   write: %{write | cursor: cursor, waiting: token}
-               }}
+                   HandshakeMachine.encrypt(state.machine, :application_data, chunk),
+                 {:ok, state} <-
+                   start_output(
+                     %{state | machine: machine, write: %{write | cursor: cursor}},
+                     record,
+                     :application,
+                     :application,
+                     write.deadline
+                   ) do
+              {:keep_state, %{state | write: %{state.write | waiting: state.output.token}}}
             else
               {:error, reason} -> fail(state, public_error(reason))
             end
@@ -342,31 +372,33 @@ defmodule SSL.Connection do
     end
   end
 
+  def handle_event(:internal, :write_next, _phase, _state), do: :keep_state_and_data
+
   def handle_event(
         :info,
         {:writer_result, writer, token, :ok},
-        :connected,
-        %{writer: writer, write: %{waiting: token} = write} = state
+        phase,
+        %{writer: writer, output: %{token: token} = output} = state
       ) do
-    state = %{state | write: %{write | waiting: nil}}
-
-    if state.deferred_tcp do
-      send(self(), {:deferred_tcp, state.deferred_tcp})
-      send(self(), :write_next)
-      {:keep_state, %{state | deferred_tcp: nil}}
-    else
-      send(self(), :write_next)
-      {:keep_state, state}
-    end
+    cancel_timer(output.timer)
+    complete_output(phase, output, %{state | output: nil})
   end
 
   def handle_event(
         :info,
         {:writer_result, writer, token, {:error, reason}},
-        _phase,
-        %{writer: writer, write: %{waiting: token}} = state
+        phase,
+        %{writer: writer, output: %{token: token} = output} = state
       ),
-      do: fail(state, reason)
+      do: output_failed(phase, output, %{state | output: nil}, reason)
+
+  def handle_event(
+        :info,
+        {:output_timeout, token},
+        phase,
+        %{output: %{token: token} = output} = state
+      ),
+      do: output_failed(phase, output, %{state | output: nil}, :timeout)
 
   def handle_event(:info, {:write_timeout, token}, _phase, %{write: %{token: token}} = state),
     do: fail(state, :timeout)
@@ -374,12 +406,20 @@ defmodule SSL.Connection do
   def handle_event(
         :info,
         {:DOWN, monitor, :process, _pid, _reason},
-        _phase,
+        phase,
         %{owner_monitor: monitor} = state
       ) do
     Socket.mark_terminal(state.socket, true)
-    state = if(state.write, do: state, else: close_notify(state))
-    fail(state, :closed)
+    notify_pending(state, {:error, :closed})
+
+    if phase == :connected do
+      case begin_shutdown(state, :owner, []) do
+        {:ok, state} -> {:next_state, :closing, state}
+        {:abort, state} -> {:stop, :normal, close_transport(state)}
+      end
+    else
+      {:stop, :normal, close_transport(state)}
+    end
   end
 
   def handle_event(
@@ -397,7 +437,7 @@ defmodule SSL.Connection do
         %{recv: %{monitor: monitor}} = state
       ) do
     cancel_timer(state.recv.timer)
-    continue(phase, %{state | recv: nil})
+    drain_or_continue(phase, %{state | recv: nil})
   end
 
   def handle_event(
@@ -416,14 +456,89 @@ defmodule SSL.Connection do
 
   def handle_event(:info, _message, _phase, _state), do: :keep_state_and_data
 
-  defp process_tcp(phase, bytes, state) do
+  defp consume_tcp(phase, bytes, state) do
     with {:ok, records, framer} <- RecordFramer.feed(state.records, bytes),
-         {:ok, state} <- process_records(records, %{state | records: framer}) do
-      phase = if state.connect_from == nil, do: :connected, else: phase
-      continue(phase, deliver(state))
+         {:ok, phase, state} <- process_records(phase, records, %{state | records: framer}) do
+      {:ok, phase, deliver(state)}
     else
-      {:error, reason, failed_state} -> fail(failed_state, public_error(reason))
-      {:error, reason} -> fail(state, public_error(reason))
+      {:paused, _, _} = paused -> paused
+      {:error, reason, failed_state} -> {:error, public_error(reason), failed_state}
+      {:error, reason} -> {:error, public_error(reason), state}
+    end
+  end
+
+  defp enqueue_input(%{input_terminal: true} = state, _event),
+    do: {:error, :econnreset, state}
+
+  defp enqueue_input(state, {:data, bytes})
+       when state.input_size + byte_size(bytes) <= @max_pending_input do
+    {:ok,
+     %{
+       state
+       | input: :queue.in({:data, bytes}, state.input),
+         input_size: state.input_size + byte_size(bytes)
+     }}
+  end
+
+  defp enqueue_input(state, {:data, _bytes}), do: {:error, :enobufs, state}
+
+  defp enqueue_terminal(%{input_terminal: true} = state, _terminal), do: state
+
+  defp enqueue_terminal(state, terminal) do
+    %{
+      state
+      | input: :queue.in({:terminal, terminal}, state.input),
+        input_terminal: true
+    }
+  end
+
+  defp drain_or_continue(phase, state, actions \\ []) do
+    cond do
+      state.output != nil ->
+        {:next_state, phase, state, actions}
+
+      not :queue.is_empty(state.input) ->
+        {:next_state, phase, state, [{:next_event, :internal, :drain_input} | actions]}
+
+      phase == :connected and ready_for_write?(state) ->
+        {:next_state, phase, state, [{:next_event, :internal, :write_next} | actions]}
+
+      true ->
+        continue(phase, state, actions)
+    end
+  end
+
+  defp ready_for_write?(%{write: %{cursor: cursor, waiting: nil}}) when not is_nil(cursor),
+    do: true
+
+  defp ready_for_write?(_state), do: false
+
+  defp drain_input(phase, %{output: output} = state) when not is_nil(output),
+    do: {:next_state, phase, state}
+
+  defp drain_input(phase, state) do
+    case :queue.out(state.input) do
+      {:empty, _input} ->
+        drain_or_continue(phase, state)
+
+      {{:value, {:data, bytes}}, input} ->
+        state = %{state | input: input, input_size: state.input_size - byte_size(bytes)}
+
+        case consume_tcp(phase, bytes, state) do
+          {:ok, phase, state} -> drain_or_continue(phase, state)
+          {:paused, phase, state} -> {:next_state, phase, state}
+          {:error, reason, failed_state} -> fail(failed_state, reason)
+        end
+
+      {{:value, {:terminal, terminal}}, input} ->
+        state = %{state | input: input, input_terminal: false}
+
+        if state.closed do
+          drain_or_continue(phase, state)
+        else
+          reason = if terminal == :closed, do: :econnreset, else: elem(terminal, 1)
+          fail(state, reason)
+        end
     end
   end
 
@@ -451,21 +566,34 @@ defmodule SSL.Connection do
     Map.merge(status, %{data: :redacted, reason: :redacted, log: [], queue: [], postponed: []})
   end
 
-  defp process_records([], state), do: {:ok, state}
+  defp process_records(phase, [], state), do: {:ok, phase, state}
 
-  defp process_records([record | rest], state) do
+  defp process_records(phase, [record | rest], state) do
     case HandshakeMachine.feed(state.machine, record) do
       {:ok, machine, outbound, events} ->
         state = %{state | machine: machine}
 
-        with :ok <- send_records(state.tcp, outbound),
-             {:ok, state} <- apply_events(events, state) do
-          if state.closed and rest != [],
-            do: {:error, :closed, state},
-            else: process_records(rest, state)
+        if outbound == [] do
+          with {:ok, phase, state} <- apply_events(phase, events, state) do
+            if state.closed and rest != [],
+              do: {:error, :closed, state},
+              else: process_records(phase, rest, state)
+          end
         else
-          {:error, reason, failed_state} -> {:error, reason, failed_state}
-          {:error, reason} -> {:error, reason, state}
+          deadline = if phase == :handshaking, do: state.deadline, else: :infinity
+
+          with {:ok, state} <-
+                 start_output(
+                   state,
+                   outbound,
+                   output_kind(phase, machine),
+                   {:protocol, events, rest},
+                   deadline
+                 ) do
+            {:paused, phase, state}
+          else
+            {:error, reason} -> {:error, reason, state}
+          end
         end
 
       {:error, reason} ->
@@ -473,39 +601,44 @@ defmodule SSL.Connection do
     end
   end
 
-  defp apply_events([], state), do: {:ok, state}
+  defp apply_events(phase, [], state), do: {:ok, phase, state}
 
-  defp apply_events([{:connected, negotiated_protocol} | rest], state) do
+  defp apply_events(_phase, [{:connected, negotiated_protocol} | rest], state) do
     if Options.remaining(state.deadline) == 0 do
       {:error, :timeout, state}
     else
-      {writer, writer_monitor} = ConnectionWriter.start(self())
       :gen_statem.reply(state.connect_from, {:ok, state.socket})
       cancel_timer(state.handshake_timer)
 
-      apply_events(rest, %{
+      apply_events(:connected, rest, %{
         state
         | connect_from: nil,
           handshake_timer: nil,
-          negotiated_protocol: negotiated_protocol,
-          writer: writer,
-          writer_monitor: writer_monitor
+          negotiated_protocol: negotiated_protocol
       })
     end
   end
 
-  defp apply_events([{:application_data, bytes} | rest], state) do
+  defp apply_events(phase, [{:application_data, bytes} | rest], state) do
     case buffer_application_data(deliver(state), bytes) do
-      {:ok, state} -> apply_events(rest, state)
+      {:ok, state} -> apply_events(phase, rest, state)
       {:error, reason, state} -> {:error, reason, state}
     end
   end
 
-  defp apply_events([:closed | rest], state) do
+  defp apply_events(phase, [:closed | rest], state) do
     Socket.mark_terminal(state.socket, true)
-    state = close_notify(state)
-    if state.tcp, do: :gen_tcp.close(state.tcp)
-    apply_events(rest, %{state | closed: true, tcp: nil, machine: nil, armed: false})
+
+    if rest == [] do
+      state = %{state | closed: true, armed: false}
+
+      case begin_shutdown(state, :peer, []) do
+        {:ok, state} -> {:paused, phase, state}
+        {:abort, state} -> {:ok, phase, close_transport(state)}
+      end
+    else
+      {:error, :closed, state}
+    end
   end
 
   defp deliver(state, immediate \\ false) do
@@ -626,8 +759,9 @@ defmodule SSL.Connection do
 
   defp continue(phase, state, actions) do
     can_read = state.size < @max_plaintext - @rearm_reserve or state.recv != nil
+    input_idle = state.output == nil and :queue.is_empty(state.input)
 
-    if state.tcp && not state.armed && not state.closed && can_read do
+    if state.tcp && not state.armed && not state.closed && can_read && input_idle do
       case :inet.setopts(state.tcp, active: :once) do
         :ok -> {:next_state, phase, %{state | armed: true}, actions}
         {:error, reason} -> fail(state, reason)
@@ -645,31 +779,54 @@ defmodule SSL.Connection do
 
     notify_pending(state, {:error, {:tls_alert, {category, ~c"Peer terminated TLS"}}})
     state = notify_active_terminal(state, {:tls_alert, {category, ~c"Peer terminated TLS"}})
-    {:stop, :normal, state}
+    {:stop, :normal, close_transport(state)}
   end
 
   defp fail(state, reason) do
-    notify_pending(state, {:error, reason})
-    state = notify_active_terminal(state, reason)
-    {:stop, :normal, fatal_alert(state, reason)}
+    if match?({:tls_alert, {_alert, _description}}, reason) and state.output == nil do
+      case begin_fatal_alert(state, reason) do
+        {:ok, state} -> {:next_state, :closing, state}
+        {:abort, state} -> fail_now(state, reason)
+      end
+    else
+      fail_now(state, reason)
+    end
   end
 
-  defp fatal_alert(%{machine: nil} = state, _reason), do: state
+  defp begin_fatal_alert(%{machine: nil} = state, _reason), do: {:abort, state}
 
-  defp fatal_alert(state, {:tls_alert, {alert, _description}}) do
+  defp begin_fatal_alert(state, {:tls_alert, {alert, _description}} = reason) do
     code = @alert_codes[alert] || 80
 
     case HandshakeMachine.encrypt(state.machine, :alert, <<2, code>>) do
       {:ok, record, machine} ->
-        if state.tcp, do: :gen_tcp.send(state.tcp, record)
-        %{state | machine: machine}
+        {:ok, deadline} = Options.deadline(@shutdown_timeout)
+
+        case start_output(
+               %{
+                 state
+                 | machine: machine,
+                   closing: %{kind: :fatal, waiters: [], reason: reason}
+               },
+               record,
+               :fatal_alert,
+               {:shutdown, :fatal},
+               deadline
+             ) do
+          {:ok, state} -> {:ok, state}
+          {:error, _reason} -> {:abort, state}
+        end
 
       _ ->
-        state
+        {:abort, state}
     end
   end
 
-  defp fatal_alert(state, _reason), do: state
+  defp fail_now(state, reason) do
+    notify_pending(state, {:error, reason})
+    state = notify_active_terminal(state, reason)
+    {:stop, :normal, close_transport(state)}
+  end
 
   defp notify_pending(state, result) do
     if state.connect_from, do: :gen_statem.reply(state.connect_from, result)
@@ -711,20 +868,131 @@ defmodule SSL.Connection do
     :gen_statem.reply(state.write.from, result)
     cancel_timer(state.write.timer)
     Process.demonitor(state.write.monitor, [:flush])
-    continue(:connected, %{state | write: nil})
+    drain_or_continue(:connected, %{state | write: nil})
   end
 
-  defp close_notify(%{machine: nil} = state), do: state
+  defp start_output(
+         %{output: nil, writer: writer, tcp: tcp} = state,
+         bytes,
+         kind,
+         continuation,
+         deadline
+       )
+       when is_pid(writer) and not is_nil(tcp) do
+    size = :erlang.iolist_size(bytes)
 
-  defp close_notify(state) do
+    cond do
+      size == 0 ->
+        {:error, :empty_output}
+
+      size > @max_pending_output ->
+        {:error, :enobufs}
+
+      Options.remaining(deadline) == 0 ->
+        {:error, :timeout}
+
+      true ->
+        token = make_ref()
+        shutdown? = kind in [:close_notify, :fatal_alert]
+        send(writer, {:send, token, tcp, bytes, shutdown?})
+
+        {:ok,
+         %{
+           state
+           | output: %{
+               token: token,
+               kind: kind,
+               continuation: continuation,
+               size: size,
+               timer: timer(deadline, {:output_timeout, token})
+             }
+         }}
+    end
+  end
+
+  defp start_output(_state, _bytes, _kind, _continuation, _deadline), do: {:error, :busy}
+
+  defp complete_output(phase, %{continuation: :handshake_start}, state),
+    do: drain_or_continue(phase, state)
+
+  defp complete_output(phase, %{continuation: :application}, %{write: write} = state) do
+    state = %{state | write: %{write | waiting: nil}}
+    drain_or_continue(phase, state)
+  end
+
+  defp complete_output(phase, %{continuation: {:protocol, events, rest}}, state) do
+    with {:ok, phase, state} <- apply_events(phase, events, state),
+         {:ok, phase, state} <- process_records(phase, rest, state) do
+      drain_or_continue(phase, deliver(state))
+    else
+      {:paused, phase, state} -> {:next_state, phase, state}
+      {:error, reason, failed_state} -> fail(failed_state, public_error(reason))
+    end
+  end
+
+  defp complete_output(phase, %{continuation: {:shutdown, kind}}, state),
+    do: finish_shutdown(phase, kind, state)
+
+  defp output_failed(phase, output, state, reason) do
+    cancel_timer(output.timer)
+
+    case output.continuation do
+      {:shutdown, kind} -> finish_shutdown(phase, kind, state)
+      _ -> fail_now(state, reason)
+    end
+  end
+
+  defp output_kind(:handshaking, %{phase: :connected}), do: :client_finished
+  defp output_kind(:handshaking, _machine), do: :handshake
+  defp output_kind(:connected, _machine), do: :control
+
+  defp begin_shutdown(%{machine: nil} = state, _kind, _waiters), do: {:abort, state}
+
+  defp begin_shutdown(%{output: output} = state, _kind, _waiters) when not is_nil(output),
+    do: {:abort, state}
+
+  defp begin_shutdown(state, kind, waiters) do
     case HandshakeMachine.encrypt(state.machine, :alert, <<1, 0>>) do
       {:ok, record, machine} ->
-        if state.tcp, do: :gen_tcp.send(state.tcp, record)
-        %{state | machine: machine}
+        {:ok, deadline} = Options.deadline(@shutdown_timeout)
 
-      _ ->
-        state
+        case start_output(
+               %{state | machine: machine, closing: %{kind: kind, waiters: waiters}},
+               record,
+               :close_notify,
+               {:shutdown, kind},
+               deadline
+             ) do
+          {:ok, state} -> {:ok, state}
+          {:error, _reason} -> {:abort, state}
+        end
+
+      {:error, _reason} ->
+        {:abort, state}
     end
+  end
+
+  defp finish_shutdown(_phase, :local, state) do
+    state.closing.waiters
+    |> Enum.each(&:gen_statem.reply(&1, :ok))
+
+    {:stop, :normal, close_transport(%{state | closing: nil})}
+  end
+
+  defp finish_shutdown(_phase, :owner, state),
+    do: {:stop, :normal, close_transport(%{state | closing: nil})}
+
+  defp finish_shutdown(_phase, :fatal, state),
+    do: fail_now(%{state | closing: nil}, state.closing.reason)
+
+  defp finish_shutdown(_phase, :peer, state) do
+    state = close_transport(%{state | closing: nil})
+    drain_or_continue(:connected, deliver(state))
+  end
+
+  defp close_transport(state) do
+    if state.tcp, do: :gen_tcp.close(state.tcp)
+    %{state | tcp: nil, machine: nil, armed: false, output: nil}
   end
 
   defp public_error({:fatal_alert, alert, _}), do: {:tls_alert, {alert, ~c"TLS protocol error"}}
@@ -743,6 +1011,4 @@ defmodule SSL.Connection do
 
   defp cancel_timer(nil), do: :ok
   defp cancel_timer(timer), do: Process.cancel_timer(timer, async: false, info: false)
-  defp send_records(_tcp, []), do: :ok
-  defp send_records(tcp, records), do: :gen_tcp.send(tcp, records)
 end
