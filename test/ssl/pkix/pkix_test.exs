@@ -56,6 +56,14 @@ defmodule SSL.PKIXTest do
     assert leaf == :public_key.pkix_decode_cert(@leaf_der, :otp)
   end
 
+  test "applies depth to PKIX path validation rather than certificate-message framing" do
+    assert {:ok, %VerifiedPeer{leaf_der: @leaf_der}} =
+             PKIX.verify([@leaf_der], @root_pem, {:dns_id, "example.test"}, depth: 0)
+
+    assert {:error, {:invalid_input, :options}} =
+             PKIX.verify([@leaf_der], @root_pem, {:dns_id, "example.test"}, depth: -1)
+  end
+
   test "honors a bounded custom hostname match function" do
     allow_alias = fn
       {:dns_id, "alias.example.test"}, {:dNSName, presented} ->

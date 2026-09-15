@@ -1,183 +1,136 @@
-# TLS client compatibility and Manifold acceptance contract
+# TLS 1.3 client compatibility
 
-This is an experimental OTP `:ssl`-compatible client API for the implemented
-feature subset. Passing tests is not a security certification. OTP remains the
-default backend. No release, merge, or production configuration change is part
-of this milestone.
+`ex_ssl` provides an experimental OTP `:ssl`-compatible client API for the
+implemented subset below. Passing the repository tests is not a security
+certification, and OTP `:ssl` remains the recommended default.
 
-## Revisions and consumer inventory
+## Public API
 
-Implementation starts at ex_ssl `04180a504c55c65d4f339d459e011e2e2307bc49`.
-The consumer audit covers Manifold `c21ea5d4e41b367bf2fa0b94dea54552cfa60af6`.
-Manifold's `docs/DESIGN.md` is its architecture/product document; it has no
-separate `ARCHITECTURE.md` or `PRD.md` at that revision.
-
-| Consumer | Actual calls/options | Acceptance gate |
-| --- | --- | --- |
-| IMAP | `imap/client.ex`: host `:ssl.connect/4`, socket upgrade `connect/3`, `send/2`, `recv(socket, 0, 30_000)`, `close/1`. Options: `:binary`, `active: false`, `packet: :raw`, `verify: :verify_peer`, `cacerts: :public_key.cacerts_get()`, charlist SNI, `customize_hostname_check: [match_fun: :public_key.pkix_verify_hostname_match_fun(:https)]`. | Authenticate, select mailbox, fetch literal/message and logout over direct TLS and STARTTLS; reject certificate/transport failures. |
-| SMTP submission | `smtp/client.ex`: same four operations and trust options; connect timeout 15 seconds; receive uses the remaining monotonic reply deadline. STARTTLS follows greeting/EHLO/220 and re-EHLO after upgrade. | Authenticate and submit to local recipients over direct TLS and STARTTLS. Preserve definite versus uncertain DATA outcomes and never replay automatically. |
-| EAS | `eas/client.ex` calls `Req.request/1`: receive timeout 60 seconds, connect timeout 15 seconds, HTTP/1 only, decoded body, compression disabled, plus request options. Supports OPTIONS/POST, query, Basic auth, cookies and binary WBXML. Locked Req 0.7.3 → Finch 0.23.0 → Mint 1.9.3. | Explicit HTTP adapter using SSL, verified server-observed ClientHello, binary exchanges and response framing. Req's `adapter` is an extension point; `connect_options.transport_opts` alone cannot replace Mint's hardwired OTP TLS transport. |
-| Unchanged | Inbound `gen_smtp` TLS, Phoenix/server TLS, database TLS, cloud HTTP, Gmail/Microsoft Graph HTTP, Resend and other unrelated Req consumers. | No backend or production configuration changes. |
-
-The paths above are under Manifold's
-`apps/manifold_connectors/lib/manifold/connectors/`. Source options, locks and
-dependency implementations were inspected, including Req's adapter boundary,
-Finch's `Mint.HTTP.connect` call and `Mint.Core.Transport.SSL`.
-
-## Public library subset
-
-| Surface | Status / restriction |
+| Surface | Supported behavior |
 | --- | --- |
-| `SSL.connect(host, port, opts, timeout)` and `/3` | TLS 1.3 client; `/3` defaults timeout to infinity. DNS routing and reference identity remain separate when connecting to an IP with DNS SNI. |
-| `SSL.connect(tcp_socket, opts, timeout)` and `/2` | Required STARTTLS upgrade; ownership and plaintext boundary requirements below. `/2` defaults timeout to infinity. |
-| `SSL.send/2` | Accepts iodata. Splits application writes into at most 16,384-byte TLS records. At most one write is admitted; concurrent writes return `{:error, :busy}`. Maximum one call is 1 MiB (`:emsgsize` above the limit). No automatic retries. |
-| `SSL.recv/3` and `/2` | Passive binary/raw only. Zero length returns available application bytes. Positive length waits for exactly that many bytes (maximum 1 MiB). Surplus/partial bytes persist. `/2` uses infinity. |
-| Receive deadlines | Non-negative milliseconds representable by the VM timer service, or `:infinity`; invalid values return `:badarg` before an operation is admitted. Durations beyond 32 bits are supported. Zero polls. Fragments do not extend the monotonic deadline. A timeout retains buffered plaintext; a dead receiver is cancelled. |
-| Concurrent receives | One pending receiver; a competing receive returns `{:error, :einval}`. This is an explicit restriction: OTP reference behavior for concurrent calls is not emulated. |
-| `SSL.close/1` | Sends close_notify when possible and closes. Idempotent for a previously closed handle; pending calls wake with `:closed`. |
-| Closed sockets | Authenticated peer close_notify preserves previously decrypted bytes for subsequent reads, then returns `{:error, :closed}`. Local close and owner shutdown also leave a `:closed` handle. Abrupt TCP loss or unexpected connection-process death returns `{:error, :econnreset}`, including later calls after process exit; undelivered bytes are discarded on transport failure. TLS authentication/protocol errors return a redacted `{:tls_alert, {category, description}}`. |
-| Other OTP API | Not exported. No success-returning compatibility stubs. |
+| `SSL.connect/2,3,4` | Authenticated TLS 1.3 client connections and passive binary/raw STARTTLS upgrades. Connect succeeds only after CertificateVerify and Finished validation. |
+| `SSL.send/2` | Valid iodata of any logical size supported by available caller memory. Data is traversed without flattening the entire write and protected in records of at most 16,384 plaintext bytes. One logical write is admitted at a time; another caller receives `{:error, :busy}`. There is no automatic replay. |
+| `SSL.recv/2,3` | Passive raw binary receive. Length zero returns available plaintext; a positive length waits for exactly that many bytes. One passive receive is admitted, and the maximum requested/buffered plaintext is 1 MiB. |
+| `SSL.setopts/2` | Atomic support for `active: false | :once`, `send_timeout`, and `send_timeout_close: true`. Unknown, duplicate, malformed, or unsupported options reject the whole request. |
+| `SSL.controlling_process/2` | Transfers the application owner and monitor. The connection process remains the TCP owner and sole owner of TLS state. Only the current application owner may transfer. |
+| `SSL.negotiated_protocol/1` | Returns authenticated ALPN as `{:ok, binary}` or `{:error, :protocol_not_negotiated}`. |
+| `SSL.close/1` | Idempotent local close. Sends close_notify when no application write is uncertain and wakes admitted calls. |
 
-OTP's independent reference probe observed either `:einval` or `:closed` for a
-send immediately after `:ssl.close/1` on OTP 28, depending on sender shutdown.
-The implemented SSL subset deliberately returns the stable `:closed` result.
+Closed and invalid handles follow the existing public call mapping. An orderly
+TLS closure produces `:closed`; abrupt TCP loss or unexpected connection-process
+loss produces `:econnreset`. TLS failures use redacted `{:tls_alert, ...}`
+reasons. Other roadmap APIs are not exported as success-returning stubs.
 
-The timer-edge OTP reference probe observes that an unrepresentable receive
-deadline can terminate OTP's connection. SSL rejects it with `:badarg` while
-preserving the live session. It checks the VM's documented
-[`end_time`](https://www.erlang.org/doc/apps/erts/erlang.html#system_info/1)
-instead of imposing an arbitrary 32-bit timeout cap.
+## Ownership and active-once behavior
 
-Supported options are `:binary` or `mode: :binary`, `active: false`,
-`packet: :raw` or `0`, `verify: :verify_peer`, `cacerts` (DER or actual OTP
-`cacerts_get` entries), `cacertfile`, DNS `server_name_indication`,
-`customize_hostname_check: [match_fun: fun]`, `versions: [:"tlsv1.3"]`, and
-`ex_ssl: [profile: :default | %SSL.ClientHello.WireProfile{}]`.
-The profile only changes offered wire capabilities. It does not replace trust or
-reference identity. Unsupported, malformed and duplicate options are rejected
-with `{:error, {:options, reason}}`; error values are redacted rather than echoing
-arbitrary option data. Trust defaults to the system CA bundle. Verification
-cannot be disabled. Named profile registries are not implemented.
+The public socket term is stable for the life of a connection. Ownership
+transfer changes only future application delivery and owner-death monitoring;
+it does not move TCP ownership, traffic keys, sequence counters, buffers, or
+replies already assigned to admitted `send`/`recv` callers.
 
-## STARTTLS caller contract
+A self-transfer succeeds. A non-owner receives `{:error, :not_owner}`. A target
+known to be dead before the transfer receives `{:error, :noproc}` without
+changing the live connection. If the target dies after the transfer is
+committed, the successful transfer stands and its `DOWN` closes the connection.
+This deliberate pre-check differs from OTP versions that can return `:ok` for an
+already-dead target and then asynchronously close. A stale `DOWN` from an old
+owner is ignored after a successful monitor replacement.
 
-Before calling `SSL.connect(tcp_socket, ...)`, the caller must:
+Messages already sent to the old owner's mailbox stay there; mailbox contents
+cannot be migrated by changing a monitor. The caller must transfer a passive
+socket before activating it when it requires a clean mailbox handoff.
 
-1. Own a connected `:gen_tcp` port socket configured binary/passive/raw.
-2. Fully consume and validate the application protocol's positive upgrade reply.
-3. Reject unexpected data in the application's own parser buffer; SSL cannot
-   inspect a buffer held by its caller.
-4. Supply the DNS reference identity as `server_name_indication`.
+Application `active: :once` is independent of the raw TCP socket's internal
+active-once processing. One activation permits at most one
+`{:ssl, socket, binary}` message and then becomes application-passive. It emits
+no `{:ssl_passive, socket}` notification. Rearming drains already-buffered
+plaintext immediately. An explicit `active: false` stops future data messages
+without retracting messages already delivered or dropping buffered bytes.
 
-The upgrade checks socket state, already-delivered TCP messages and queued TCP
-bytes before transferring ownership. Delivered messages are not silently removed.
-Unexpected queued bytes cause `:pending_plaintext` and connection closure.
-Validation/timeout/handoff/handshake failure closes an owned socket. A non-owner
-gets `:not_owner` without closing another process's socket. Never resume plaintext
-after any failed upgrade. Alternative `inet_backend: :socket` handles are not
-supported in this subset.
+An activation request while a passive `recv` is admitted returns
+`{:error, :einval}` and leaves that receive and all bytes untouched. Graceful
+and abrupt terminal events are delivered once as `{:ssl_closed, socket}` or
+`{:ssl_error, socket, reason}` for an active-once subscription, after earlier
+deliverable plaintext. Handshake traffic, NewSessionTicket, and KeyUpdate never
+consume application delivery credit.
 
-## Resource and authentication boundaries
+## Connection options
 
-One temporary `SSL.Connection` owns each TCP socket, all traffic epochs and
-sequence numbers, parser buffers, operations and application-owner monitor.
-Internal active-once delivery continues protocol processing independently of the
-public passive mode. Plaintext buffering is bounded to 1 MiB; rearming pauses
-near the limit. A single admitted write is bounded to 1 MiB, and socket send
-backpressure has a five-second send timeout. A timed-out write closes the session.
+Supported connection options are:
 
-Record limits are 16,384 bytes for plaintext and 16,640 for ciphertext; handshake
-messages are limited to 1 MiB. Certificate messages allow at most 16 certificates,
-256 KiB per certificate and 1 MiB total DER. Trust-store normalization has a separate 4,096-anchor
-limit. The opaque public socket contains a process identifier, connection reference,
-and an atomic terminal-status cell holding no TLS or application data. This cell
-preserves the distinction between authenticated closure and transport failure
-without retaining a connection process after it exits.
-Inspect/status/crash formatting redacts secret state and application payloads;
-ordinary logging and key logging are disabled. BEAM cannot guarantee deterministic
-memory zeroization.
+- `:binary` or `mode: :binary`;
+- `packet: :raw | 0`;
+- `active: false | :once` (default `false`);
+- `verify: :verify_peer`;
+- `cacerts` or `cacertfile`;
+- DNS `server_name_indication`;
+- `customize_hostname_check: [match_fun: fun]`;
+- `versions: [:"tlsv1.3"]`;
+- non-negative integer `depth` (default `10`);
+- non-negative integer or `:infinity` `send_timeout` (default 5,000 ms);
+- `send_timeout_close: true`;
+- `alpn_advertised_protocols: [nonempty_binary, ...]`;
+- `ex_ssl: [profile: :default | %SSL.ClientHello.WireProfile{}]`.
 
-RSA-PSS with RSAE keys and SHA-256/384/512, and ECDSA P-256/SHA-256 authenticate
-servers. TLS AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 and X25519/P-256 are
-the supported cryptographic algorithms where available from OTP crypto.
-HRR uses the transcript message_hash rewrite. Optional handshake
-CertificateRequest receives an empty client Certificate; client authentication
-is not supported. Peer KeyUpdate rotates independent traffic epochs and sends
-any required response before subsequent application traffic. Application writes
-automatically send an old-key KeyUpdate before switching to a fresh write epoch
-when the supported AEAD usage bound approaches. Both AES-GCM suites permit
-23,726,566 encryptions per epoch (floor of RFC 9846's 2^24.5 record bound);
-ChaCha20-Poly1305 uses the existing uint64 sequence guard. The last permitted
-encryption is reserved for KeyUpdate. Sending generations cannot exceed 2^48−1;
-an update that cannot legally advance or protect its record terminates the
-connection without retrying application data. These sending limits are not
-imposed on receiving epochs.
+Verification cannot be disabled. TLS 1.2 and mixed TLS 1.3/TLS 1.2 version
+lists are rejected. Packet modes, list mode, active true/active-N, arbitrary TCP
+options, client certificates, and `send_timeout_close: false` remain
+unsupported. Unsupported or malformed options return a redacted
+`{:error, {:options, reason}}`; supplied option data is not echoed.
 
-Session resumption remains unsupported. In accordance with RFC 9846,
-fully framed NewSessionTicket messages are silently ignored without semantic
-ticket/extension validation; global handshake framing and buffer limits remain
-enforced. Unknown CertificateRequest extensions are preserved and ignored,
-while required signature_algorithms and forbidden-context checks remain.
-Other post-handshake messages fail explicitly.
+`depth` is passed to OTP `:public_key` path validation as the maximum number of
+intermediate CA certificates. It is independent of the TLS Certificate-message
+count and the separate certificate count/byte resource limits. Differential
+tests cover direct root-signed and one-intermediate paths at both boundaries.
 
-## Evidence and staged readiness
+## ALPN and WireProfile precedence
 
-| Layer | Evidence / gate |
-| --- | --- |
-| Pure protocol/crypto/PKIX/profile components | Existing deterministic vectors, negative authentication tests, framing properties and wire checks; new incremental/HRR/post-handshake regressions. |
-| Public API | Local lifecycle suite covers buffering, partial timeouts, cancellation, owner death, concurrent close, limits and upgrade failure cleanup. |
-| Independent interoperability | Mandatory local OTP and OpenSSL peers with generated certificates; dedicated `.github/workflows/interop.yml` job. Exact validation results are recorded after completion below. |
-| Caddy fingerprints | Existing dedicated e2e workflow uses a thin public SSL API wrapper. Live Caddy execution stays in CI per `e2e/README.md`; local compile does not claim live fingerprint validation. |
-| IMAP integration | Separate [Manifold PR #3](https://github.com/gsmlg-opt/manifold/pull/3): controlled direct-TLS/STARTTLS LOGIN, SELECT, literal FETCH and LOGOUT, plus failure/cleanup regressions pass. |
-| SMTP submission integration | Same consumer change: real local direct-TLS/STARTTLS AUTH and submission workflows pass; OTP remains default and DATA outcome classification is preserved. |
-| EAS integration | Same consumer change: explicit Req HTTP/1.1 adapter passes real verified OPTIONS/WBXML exchanges, server-observed profile, framing/deadline/security failures, and no mutation replay. No HTTP/EAS code is added to ex_ssl. |
+- The default profile incorporates a top-level ALPN list in its declared order.
+- An explicit profile with no top-level ALPN is emitted unchanged.
+- An explicit profile plus top-level ALPN requires an exact ordered match.
+- A profile without ALPN never silently gains ALPN.
+- No ALPN option preserves the existing profile and does not inject HTTP
+  protocols into non-HTTP connections.
 
-Deliberate exclusions: TLS 1.2 and downgrade fallback, server TLS, DTLS, QUIC,
-HTTP/2, client certificate authentication, post-handshake authentication,
-session resumption, 0-RTT, active application modes, packet modes beyond raw,
-exporters and general OTP parity. HTTP/EAS framing belongs in Manifold.
+The server selection is validated as exactly one protocol offered by the
+materialized ClientHello. It is retained only after authenticated handshake
+validation and is never inferred from the first advertisement.
 
-### Library gate executed on 2026-09-14
+## Send deadlines, ordering, and cleanup
 
-- OTP 28.5.0.5 / Elixir 1.18.5 and OTP 29.0.6 / Elixir 1.20.4:
-  `mix test --include integration` — 282 tests and 15 properties passed,
-  with no skipped interoperability tests. Local OTP/OpenSSL peers generate
-  certificates at test time; no production endpoint or account is required.
-- `mix format --check-formatted`, `mix compile --warnings-as-errors`, and
-  `MIX_ENV=test mix compile --warnings-as-errors` passed on both toolchains.
-  `MIX_ENV=prod mix compile --warnings-as-errors` also passed locally.
-- `cd e2e && mix format --check-formatted && mix compile --warnings-as-errors`
-  passed on OTP 29. Live Caddy execution was not run locally, as required by
-  the existing e2e workflow policy. The live
-  [Caddy fingerprint job](https://github.com/gsmlg-dev/ex_ssl/actions/runs/34839788033)
-  passed in CI (one test), and the dedicated
-  [OTP/OpenSSL job](https://github.com/gsmlg-dev/ex_ssl/actions/runs/34839787990)
-  passed all 40 reference/interoperability/lifecycle tests on revision `7c2e72b`.
-  The follow-up maximum-length receive regression adds two lifecycle tests:
-  a crossing record preserves surplus bytes, and an expired near-limit receive
-  receives exactly one timeout even when later input exhausts the buffer.
-  These address consumer issue [#3](https://github.com/gsmlg-dev/ex_ssl/issues/3)
-  without reducing the receive bound or pacing the test peer.
-  The final local dedicated command passes 44 tests, including representable
-  timer limits, invalid-timeout connection preservation and a no-network connect
-  check. The full updated suite passes on both OTP toolchains above.
-- OTP 29 validation used the Docker image
-  `hexpm/elixir:1.20.4-erlang-29.0.6-ubuntu-noble-20260905`, with OpenSSL,
-  CA certificates and `libsctp1` installed, a read-only source mount and a
-  separate `/tmp/ex_ssl_build` build directory.
+Each admitted write captures the current `send_timeout` and creates one
+monotonic deadline for the whole logical write. Record fragmentation does not
+restart that deadline. `SSL.setopts/2` changes the timeout for the next admitted
+write; it does not change a write that already holds admission.
 
-Manifold's separate local gate passes 462 connector tests and 7 SMTP submission
-provider tests under its configured Elixir 1.18.4 / OTP 28.5.0.3 environment.
-Its own compatibility document records the exact dependency pin, enable/return
-configuration, final CI evidence and restricted controlled-testing scope.
+A persistent connection-owned writer performs at most one bounded ciphertext
+send at a time. The connection process remains authoritative for encryption,
+epochs, record order, and admission. It processes deferred inbound TLS traffic
+between completed writes/records, so KeyUpdate responses and alerts cannot race
+ahead of an uncertain socket send. Timeout or sender death after transmission
+starts fails the connection closed; uncertain application bytes are never
+retried. Close and owner death remain responsive even with an infinite send
+timeout, and all monitors, timers, cursors, and writer processes are cleaned up.
 
-### RFC 9846 review regression gate
+## STARTTLS and security boundaries
 
-The AEAD/KeyUpdate and post-handshake fixes pass on both toolchains above:
-`mix format --check-formatted`, `mix compile --warnings-as-errors`, and
-`MIX_ENV=test mix compile --warnings-as-errors`; `mix test` runs 258 tests and
-15 properties with 43 integration tests excluded by default;
-`mix test --include integration` passes all 301 tests and 15 properties with no
-exclusions. The dedicated interoperability/lifecycle command passes 49 tests.
-The unchanged e2e harness also formats and compiles on OTP 29; live Caddy
-fingerprint execution remains in its dedicated CI job.
+STARTTLS callers must own a connected binary/passive/raw `:gen_tcp` socket,
+fully consume and validate the positive upgrade reply, reject plaintext held in
+their own parser, and supply a DNS reference identity through
+`server_name_indication`. Queued or delivered TCP plaintext causes explicit
+failure and owned-socket closure. A non-owner's TCP socket is not closed.
+
+Profiles affect offered wire capabilities only. They cannot replace trust or
+identity verification. Record, handshake, certificate, trust-store, and passive
+plaintext bounds remain independently enforced. No traffic secrets, private
+keys, or application payloads are exposed through public metadata or ordinary
+inspection.
+
+## Remaining limitations
+
+TLS 1.2, server TLS, DTLS, QUIC/HTTP/3, client authentication, resumption,
+0-RTT, post-handshake authentication, active true/active-N, packet framing,
+exporters, and full OTP API parity are out of scope. ALPN negotiation alone is
+not evidence of an HTTP/2 request. See
+[HTTP_FETCH_INTEGRATION.md](HTTP_FETCH_INTEGRATION.md) for the separate consumer
+work still required.

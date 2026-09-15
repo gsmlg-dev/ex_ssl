@@ -1,0 +1,699 @@
+defmodule SSL.HTTPFetchTransportContractTest do
+  use ExUnit.Case, async: false
+
+  alias ExSSL.TestSupport.LocalTLSPeer, as: Peer
+
+  @moduletag :integration
+
+  test "connect worker transfers ownership, exits, and task callers can send" do
+    parent = self()
+
+    {:ok, peer} =
+      Peer.start(
+        fn socket ->
+          assert {:ok, "request"} = :ssl.recv(socket, 7, 5_000)
+          assert :ok = :ssl.send(socket, "response")
+          send(parent, :response_sent)
+          assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+          :ok
+        end,
+        ssl_options: [alpn_preferred_protocols: ["http/1.1"]]
+      )
+
+    worker =
+      spawn(fn ->
+        options =
+          [
+            :binary
+            | Keyword.put(
+                tl(Peer.client_options()),
+                :alpn_advertised_protocols,
+                ["h2", "http/1.1"]
+              )
+          ]
+
+        {:ok, socket} = SSL.connect(~c"127.0.0.1", peer.port, options, 5_000)
+        send(parent, {:worker_connected, self(), socket})
+
+        receive do
+          {:transfer_socket, owner} ->
+            send(parent, {:ownership_result, SSL.controlling_process(socket, owner)})
+        end
+      end)
+
+    worker_monitor = Process.monitor(worker)
+    assert_receive {:worker_connected, ^worker, socket}, 5_000
+    send(worker, {:transfer_socket, self()})
+    assert_receive {:ownership_result, :ok}, 1_000
+    assert_receive {:DOWN, ^worker_monitor, :process, ^worker, :normal}
+    assert Process.alive?(socket.pid)
+    assert {:ok, "http/1.1"} = SSL.negotiated_protocol(socket)
+
+    sender = Task.async(fn -> SSL.send(socket, ["req", ~c"uest"]) end)
+    assert :ok = Task.await(sender, 5_000)
+    assert_receive :response_sent, 5_000
+    assert :ok = SSL.setopts(socket, active: :once)
+    assert_receive {:ssl, ^socket, "response"}, 1_000
+    assert :ok = SSL.close(socket)
+    assert :ok = Peer.stop(peer)
+  end
+
+  test "ownership transfer rejects non-owners and dead targets without changing the owner" do
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        assert {:ok, "still-live"} = :ssl.recv(socket, 10, 5_000)
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    socket = connect(peer)
+    assert :ok = SSL.controlling_process(socket, self())
+
+    non_owner = Task.async(fn -> SSL.controlling_process(socket, self()) end)
+    assert {:error, :not_owner} = Task.await(non_owner)
+
+    dead = spawn(fn -> :ok end)
+    dead_monitor = Process.monitor(dead)
+    assert_receive {:DOWN, ^dead_monitor, :process, ^dead, :normal}
+    assert {:error, :noproc} = SSL.controlling_process(socket, dead)
+
+    assert :ok = SSL.send(socket, "still-live")
+    assert :ok = SSL.close(socket)
+    assert :ok = Peer.stop(peer)
+  end
+
+  test "repeated transfers replace the owner monitor and new owner death cleans up" do
+    parent = self()
+
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        send(parent, :peer_closed)
+        :ok
+      end)
+
+    socket = connect(peer)
+
+    final_owner =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    middle_owner =
+      spawn(fn ->
+        receive do
+          {:take, socket, final_owner} ->
+            result = SSL.controlling_process(socket, final_owner)
+            send(parent, {:second_transfer, result})
+        end
+      end)
+
+    assert :ok = SSL.controlling_process(socket, middle_owner)
+    middle_monitor = Process.monitor(middle_owner)
+    send(middle_owner, {:take, socket, final_owner})
+    assert_receive {:second_transfer, :ok}, 1_000
+    assert_receive {:DOWN, ^middle_monitor, :process, ^middle_owner, :normal}
+    assert Process.alive?(socket.pid)
+
+    connection_monitor = Process.monitor(socket.pid)
+    send(final_owner, :stop)
+    assert_receive {:DOWN, ^connection_monitor, :process, _, :normal}, 1_000
+    assert_receive :peer_closed, 1_000
+    assert {:error, :closed} = SSL.send(socket, "not replayed")
+    assert :ok = Peer.stop(peer)
+  end
+
+  test "ownership transfer racing close has one terminal outcome and no surviving connection" do
+    for _iteration <- 1..5 do
+      {:ok, peer} =
+        Peer.start(fn socket ->
+          assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+          :ok
+        end)
+
+      socket = connect(peer)
+      connection_monitor = Process.monitor(socket.pid)
+
+      target =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      closer =
+        Task.async(fn ->
+          receive do
+            :close -> SSL.close(socket)
+          end
+        end)
+
+      send(closer.pid, :close)
+      transfer_result = SSL.controlling_process(socket, target)
+
+      assert transfer_result in [:ok, {:error, :closed}, {:error, :econnreset}]
+      assert :ok = Task.await(closer, 1_000)
+      assert_receive {:DOWN, ^connection_monitor, :process, _, :normal}, 1_000
+
+      send(target, :stop)
+      assert :ok = Peer.stop(peer)
+    end
+  end
+
+  test "active once drains prebuffered data one activation at a time and reports graceful close" do
+    parent = self()
+
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        receive do
+          :first -> :ok
+        end
+
+        :ok = :ssl.send(socket, "first")
+        send(parent, :first_sent)
+
+        receive do
+          :second -> :ok
+        end
+
+        :ok = :ssl.send(socket, "second")
+        send(parent, :second_sent)
+
+        receive do
+          :close -> :ok
+        end
+
+        :ok = :ssl.close(socket)
+      end)
+
+    socket = connect(peer)
+    send(peer.task.pid, :first)
+    assert_receive :first_sent
+    wait_for_buffered(socket.pid, 5)
+
+    assert :ok = SSL.setopts(socket, active: :once)
+    assert_receive {:ssl, ^socket, "first"}, 1_000
+    refute_receive {:ssl_passive, ^socket}, 20
+
+    send(peer.task.pid, :second)
+    assert_receive :second_sent
+    wait_for_buffered(socket.pid, 6)
+    refute_receive {:ssl, ^socket, _}, 20
+
+    assert :ok = SSL.setopts(socket, active: :once)
+    assert_receive {:ssl, ^socket, "second"}, 1_000
+    refute_receive {:ssl_passive, ^socket}, 20
+
+    send(peer.task.pid, :close)
+    assert_receive {:ssl_closed, ^socket}, 1_000
+    refute_receive {:ssl_closed, ^socket}, 20
+    assert :ok = Peer.stop(peer)
+  end
+
+  test "setopts validates atomically and does not steal a pending passive receive" do
+    parent = self()
+
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        receive do
+          :send -> :ok
+        end
+
+        :ok = :ssl.send(socket, "passive")
+        send(parent, :passive_sent)
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    socket = connect(peer)
+    receiver = Task.async(fn -> SSL.recv(socket, 7, 5_000) end)
+    wait_for_pending_receiver(socket.pid)
+
+    assert {:error, :einval} = SSL.setopts(socket, active: :once)
+    assert {:error, {:options, _}} = SSL.setopts(socket, active: :once, packet: :line)
+
+    send(peer.task.pid, :send)
+    assert_receive :passive_sent
+    assert {:ok, "passive"} = Task.await(receiver)
+    refute_receive {:ssl, ^socket, _}, 20
+    assert :ok = SSL.close(socket)
+    assert :ok = Peer.stop(peer)
+  end
+
+  test "passive recv is rejected while active once is armed without consuming its credit" do
+    parent = self()
+
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        receive do
+          :send -> :ok
+        end
+
+        assert :ok = :ssl.send(socket, "active-credit")
+        send(parent, :active_credit_sent)
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    socket = connect(peer)
+    assert :ok = SSL.setopts(socket, active: :once)
+    assert {:error, :einval} = SSL.recv(socket, 13, 1_000)
+
+    send(peer.task.pid, :send)
+    assert_receive :active_credit_sent
+    assert_receive {:ssl, ^socket, "active-credit"}, 1_000
+    assert :ok = SSL.close(socket)
+    assert :ok = Peer.stop(peer)
+  end
+
+  test "switching active once back to passive retains bytes for recv" do
+    parent = self()
+
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        receive do
+          :send -> :ok
+        end
+
+        :ok = :ssl.send(socket, "retained")
+        send(parent, :retained_sent)
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    socket = connect(peer)
+    assert :ok = SSL.setopts(socket, active: :once)
+    assert :ok = SSL.setopts(socket, active: false)
+    send(peer.task.pid, :send)
+    assert_receive :retained_sent
+    wait_for_buffered(socket.pid, 8)
+    refute_receive {:ssl, ^socket, _}, 20
+    assert {:ok, "retained"} = SSL.recv(socket, 8, 1_000)
+    assert :ok = SSL.close(socket)
+    assert :ok = Peer.stop(peer)
+  end
+
+  test "one logical write one byte above 1 MiB is transmitted exactly" do
+    payload = :binary.copy("x", 1_048_577)
+
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        assert {:ok, ^payload} = :ssl.recv(socket, byte_size(payload), 15_000)
+        assert :ok = :ssl.send(socket, "accepted")
+      end)
+
+    socket = connect(peer, send_timeout: 15_000)
+    assert :ok = SSL.send(socket, payload)
+    assert {:ok, "accepted"} = SSL.recv(socket, 8, 5_000)
+    assert :ok = SSL.close(socket)
+    assert :ok = Peer.stop(peer)
+  end
+
+  test "several MiB of mixed iodata is written exactly once in order" do
+    chunks = for index <- 0..511, do: [<<rem(index, 251)>>, :binary.copy(<<index::16>>, 2_048)]
+    payload = IO.iodata_to_binary(chunks)
+    assert byte_size(payload) > 2 * 1_048_576
+
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        assert {:ok, ^payload} = :ssl.recv(socket, byte_size(payload), 15_000)
+        assert :ok = :ssl.send(socket, "accepted")
+      end)
+
+    socket = connect(peer, send_timeout: 15_000)
+    assert :ok = SSL.send(socket, chunks)
+    assert {:ok, "accepted"} = SSL.recv(socket, 8, 5_000)
+    assert :ok = SSL.close(socket)
+    assert :ok = Peer.stop(peer)
+  end
+
+  test "response larger than the passive buffer is consumed with repeated active once" do
+    payload = :binary.copy("response-block-", 100_000)
+    assert byte_size(payload) > 1_048_576
+    parent = self()
+
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        for <<chunk::binary-size(16_000) <- payload>> do
+          :ok = :ssl.send(socket, chunk)
+        end
+
+        remainder_size = rem(byte_size(payload), 16_000)
+
+        if remainder_size > 0 do
+          offset = byte_size(payload) - remainder_size
+          :ok = :ssl.send(socket, binary_part(payload, offset, remainder_size))
+        end
+
+        send(parent, :large_response_sent)
+        assert {:error, :closed} = :ssl.recv(socket, 0, 15_000)
+        :ok
+      end)
+
+    socket = connect(peer)
+    received = receive_active(socket, byte_size(payload), [])
+    assert IO.iodata_to_binary(Enum.reverse(received)) == payload
+    assert_receive :large_response_sent, 5_000
+    assert :ok = SSL.close(socket)
+    assert :ok = Peer.stop(peer)
+  end
+
+  for protocol <- ["h2", "http/1.1"] do
+    test "negotiated_protocol returns authenticated #{protocol} after ownership transfer" do
+      protocol = unquote(protocol)
+
+      {:ok, peer} =
+        Peer.start(
+          fn socket ->
+            assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+            :ok
+          end,
+          ssl_options: [alpn_preferred_protocols: [protocol]]
+        )
+
+      socket =
+        connect(peer,
+          alpn_advertised_protocols: ["h2", "http/1.1"]
+        )
+
+      owner = self()
+      assert :ok = SSL.controlling_process(socket, owner)
+      assert {:ok, ^protocol} = SSL.negotiated_protocol(socket)
+      assert :ok = SSL.close(socket)
+      assert :ok = Peer.stop(peer)
+    end
+  end
+
+  test "negotiated_protocol reports an absent ALPN selection" do
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    socket = connect(peer, alpn_advertised_protocols: ["h2", "http/1.1"])
+    assert {:error, :protocol_not_negotiated} = SSL.negotiated_protocol(socket)
+    assert :ok = SSL.close(socket)
+    assert :ok = Peer.stop(peer)
+  end
+
+  test "a conflicting explicit-profile ALPN is rejected before TCP connect" do
+    assert {:ok, %{profile: profile}} =
+             SSL.Options.normalize("exssl.test", alpn_advertised_protocols: ["h2"])
+
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, {_address, port}} = :inet.sockname(listener)
+
+    options =
+      [:binary]
+      |> Kernel.++(tl(Peer.client_options()))
+      |> Keyword.put(:ex_ssl, profile: profile)
+      |> Keyword.put(:alpn_advertised_protocols, ["http/1.1"])
+
+    assert {:error, {:options, {:alpn_advertised_protocols, :profile_conflict}}} =
+             SSL.connect(~c"127.0.0.1", port, options, 1_000)
+
+    assert {:error, :timeout} = :gen_tcp.accept(listener, 25)
+    assert :ok = :gen_tcp.close(listener)
+  end
+
+  test "logical send timeout closes an in-flight write without extending per record" do
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    socket = connect(peer, send_timeout: 30)
+    {:connected, state} = :sys.get_state(socket.pid)
+    writer_monitor = Process.monitor(state.writer)
+    connection_monitor = Process.monitor(socket.pid)
+    assert true = :erlang.suspend_process(state.writer)
+
+    sender = Task.async(fn -> SSL.send(socket, :binary.copy("x", 64_000)) end)
+    wait_for_admitted_write(socket.pid)
+    assert {:error, :timeout} = Task.await(sender, 1_000)
+    assert_receive {:DOWN, ^connection_monitor, :process, _, :normal}, 1_000
+    assert_receive {:DOWN, ^writer_monitor, :process, _, :killed}, 1_000
+    assert {:error, :econnreset} = SSL.send(socket, "no retry")
+    assert :ok = Peer.stop(peer)
+  end
+
+  test "infinite-timeout write remains cancellable by close and releases its writer" do
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    socket = connect(peer, send_timeout: :infinity)
+    {:connected, state} = :sys.get_state(socket.pid)
+    writer_monitor = Process.monitor(state.writer)
+    assert true = :erlang.suspend_process(state.writer)
+
+    sender = Task.async(fn -> SSL.send(socket, :binary.copy("x", 64_000)) end)
+    wait_for_admitted_write(socket.pid)
+    assert :ok = SSL.close(socket)
+    assert {:error, :closed} = Task.await(sender, 1_000)
+    assert_receive {:DOWN, ^writer_monitor, :process, _, :killed}, 1_000
+    assert :ok = Peer.stop(peer)
+  end
+
+  test "owner death during an admitted write fails closed and cleans up the writer" do
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    socket = connect(peer, send_timeout: :infinity)
+    {:connected, state} = :sys.get_state(socket.pid)
+    assert true = :erlang.suspend_process(state.writer)
+
+    owner =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    assert :ok = SSL.controlling_process(socket, owner)
+    connection_monitor = Process.monitor(socket.pid)
+    writer_monitor = Process.monitor(state.writer)
+    sender = Task.async(fn -> SSL.send(socket, :binary.copy("owner-write-", 8_000)) end)
+    wait_for_admitted_write(socket.pid)
+
+    Process.exit(owner, :kill)
+
+    assert {:error, :closed} = Task.await(sender, 1_000)
+    assert_receive {:DOWN, ^connection_monitor, :process, _, :normal}, 1_000
+    assert_receive {:DOWN, ^writer_monitor, :process, _, :killed}, 1_000
+    assert :ok = Peer.stop(peer)
+  end
+
+  test "sender death before and during transmission releases or fails closed deterministically" do
+    parent = self()
+
+    {:ok, first_peer} =
+      Peer.start(fn socket ->
+        assert {:ok, "after-cancel"} = :ssl.recv(socket, 12, 5_000)
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    first_socket = connect(first_peer)
+
+    reserver =
+      spawn(fn ->
+        {:ok, _token} =
+          :gen_statem.call(first_socket.pid, {first_socket.ref, :reserve_write}, :infinity)
+
+        send(parent, {:reserved, self()})
+        Process.sleep(:infinity)
+      end)
+
+    reserver_monitor = Process.monitor(reserver)
+    assert_receive {:reserved, ^reserver}
+    Process.exit(reserver, :kill)
+    assert_receive {:DOWN, ^reserver_monitor, :process, ^reserver, :killed}
+    wait_for_write_release(first_socket.pid)
+    assert :ok = SSL.send(first_socket, "after-cancel")
+    assert :ok = SSL.close(first_socket)
+    assert :ok = Peer.stop(first_peer)
+
+    {:ok, second_peer} =
+      Peer.start(fn socket ->
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    second_socket = connect(second_peer, send_timeout: :infinity)
+    {:connected, second_state} = :sys.get_state(second_socket.pid)
+    assert true = :erlang.suspend_process(second_state.writer)
+    connection_monitor = Process.monitor(second_socket.pid)
+
+    sender = spawn(fn -> SSL.send(second_socket, :binary.copy("y", 64_000)) end)
+    wait_for_admitted_write(second_socket.pid)
+    sender_monitor = Process.monitor(sender)
+    Process.exit(sender, :kill)
+    assert_receive {:DOWN, ^sender_monitor, :process, ^sender, :killed}
+    assert_receive {:DOWN, ^connection_monitor, :process, _, :normal}, 1_000
+    assert {:error, :econnreset} = SSL.send(second_socket, "must not replay")
+    assert :ok = Peer.stop(second_peer)
+  end
+
+  test "active once is accepted at connect and abrupt transport loss emits one ssl_error" do
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        assert :ok = :ssl.send(socket, "connected-active")
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    {:ok, proxy} = Peer.start_fragmenting_proxy(peer.port, self())
+
+    try do
+      options = [:binary | Keyword.put(tl(Peer.client_options()), :active, :once)]
+      assert {:ok, socket} = SSL.connect(~c"127.0.0.1", proxy.port, options, 5_000)
+      assert_receive {:ssl, ^socket, "connected-active"}, 1_000
+
+      Peer.stop_fragmenting_proxy(proxy)
+      assert_receive {:ssl_error, ^socket, :econnreset}, 1_000
+      refute_receive {:ssl_error, ^socket, _}, 20
+    after
+      if Process.alive?(proxy.task.pid), do: Peer.stop_fragmenting_proxy(proxy)
+      assert :ok = Peer.stop(peer)
+    end
+  end
+
+  test "single-writer admission rejects a concurrent logical write without retaining it" do
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    socket = connect(peer, send_timeout: :infinity)
+    {:connected, state} = :sys.get_state(socket.pid)
+    assert true = :erlang.suspend_process(state.writer)
+
+    first = Task.async(fn -> SSL.send(socket, :binary.copy("a", 64_000)) end)
+    wait_for_admitted_write(socket.pid)
+    assert {:error, :busy} = SSL.send(socket, :binary.copy("b", 64_000))
+    assert :ok = SSL.close(socket)
+    assert {:error, :closed} = Task.await(first, 1_000)
+    assert :ok = Peer.stop(peer)
+  end
+
+  test "peer KeyUpdate during a multi-record logical write preserves exact ordering" do
+    parent = self()
+    payload = :binary.copy("key-update-write-", 90_000)
+
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        receive do
+          :update -> :ok
+        end
+
+        assert :ok = :ssl.update_keys(socket, :write)
+        assert {:ok, ^payload} = :ssl.recv(socket, byte_size(payload), 15_000)
+        assert :ok = :ssl.send(socket, "ordered")
+        send(parent, :key_update_exchange_done)
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    socket = connect(peer, send_timeout: :infinity)
+    {:connected, state} = :sys.get_state(socket.pid)
+    assert true = :erlang.suspend_process(state.writer)
+    sender = Task.async(fn -> SSL.send(socket, payload) end)
+    wait_for_admitted_write(socket.pid)
+    send(peer.task.pid, :update)
+    assert true = :erlang.resume_process(state.writer)
+
+    assert :ok = Task.await(sender, 15_000)
+    assert {:ok, "ordered"} = SSL.recv(socket, 7, 5_000)
+    assert_receive :key_update_exchange_done, 5_000
+    assert :ok = SSL.close(socket)
+    assert :ok = Peer.stop(peer)
+  end
+
+  defp receive_active(_socket, 0, chunks), do: chunks
+
+  defp receive_active(socket, remaining, chunks) do
+    assert :ok = SSL.setopts(socket, active: :once)
+
+    receive do
+      {:ssl, ^socket, bytes} ->
+        assert byte_size(bytes) <= remaining
+        receive_active(socket, remaining - byte_size(bytes), [bytes | chunks])
+    after
+      5_000 -> flunk("active-once response stalled with #{remaining} bytes remaining")
+    end
+  end
+
+  defp connect(peer, extra_options \\ []) do
+    options = [:binary | Keyword.merge(tl(Peer.client_options()), extra_options)]
+    assert {:ok, socket} = SSL.connect(~c"127.0.0.1", peer.port, options, 5_000)
+    socket
+  end
+
+  defp wait_for_buffered(pid, minimum, attempts \\ 200)
+  defp wait_for_buffered(_pid, _minimum, 0), do: flunk("plaintext was not buffered")
+
+  defp wait_for_buffered(pid, minimum, attempts) do
+    case :sys.get_state(pid) do
+      {:connected, %{size: size}} when size >= minimum ->
+        :ok
+
+      _ ->
+        Process.sleep(1)
+        wait_for_buffered(pid, minimum, attempts - 1)
+    end
+  end
+
+  defp wait_for_pending_receiver(pid, attempts \\ 200)
+  defp wait_for_pending_receiver(_pid, 0), do: flunk("receiver did not become pending")
+
+  defp wait_for_pending_receiver(pid, attempts) do
+    case :sys.get_state(pid) do
+      {:connected, %{recv: %{} = _receiver}} ->
+        :ok
+
+      _ ->
+        Process.sleep(1)
+        wait_for_pending_receiver(pid, attempts - 1)
+    end
+  end
+
+  defp wait_for_admitted_write(pid, attempts \\ 200)
+  defp wait_for_admitted_write(_pid, 0), do: flunk("write was not admitted")
+
+  defp wait_for_admitted_write(pid, attempts) do
+    case :sys.get_state(pid) do
+      {:connected, %{write: %{from: from, waiting: waiting}}}
+      when not is_nil(from) and not is_nil(waiting) ->
+        :ok
+
+      _ ->
+        Process.sleep(1)
+        wait_for_admitted_write(pid, attempts - 1)
+    end
+  end
+
+  defp wait_for_write_release(pid, attempts \\ 200)
+  defp wait_for_write_release(_pid, 0), do: flunk("write reservation was not released")
+
+  defp wait_for_write_release(pid, attempts) do
+    case :sys.get_state(pid) do
+      {:connected, %{write: nil}} ->
+        :ok
+
+      _ ->
+        Process.sleep(1)
+        wait_for_write_release(pid, attempts - 1)
+    end
+  end
+end

@@ -1,12 +1,11 @@
 defmodule SSL.Connection do
   @moduledoc false
   @behaviour :gen_statem
-  alias SSL.{Options, Socket}
+  alias SSL.{ConnectionWriter, IodataCursor, Options, Socket}
   alias SSL.ClientHello.Materializer
   alias SSL.Protocol.{HandshakeMachine, RecordFramer}
 
   @max_plaintext 1_048_576
-  @max_write 1_048_576
   @rearm_reserve 65_536
   @alert_codes %{
     unexpected_message: 10,
@@ -41,17 +40,23 @@ defmodule SSL.Connection do
       :connect_from,
       :recv,
       :write,
+      :writer,
+      :writer_monitor,
       :handshake_timer,
+      :active,
+      :send_timeout,
+      :send_timeout_close,
+      :negotiated_protocol,
+      :deferred_tcp,
       records: nil,
       buffer: :queue.new(),
       size: 0,
       armed: false,
-      closed: false
+      closed: false,
+      active_terminal: false,
+      terminal_notified: false
     ]
   end
-
-  @spec max_write_size() :: pos_integer()
-  def max_write_size, do: @max_write
 
   def child_spec(args),
     do: %{id: __MODULE__, start: {__MODULE__, :start_link, [args]}, restart: :temporary}
@@ -71,6 +76,10 @@ defmodule SSL.Connection do
       owner_monitor: Process.monitor(owner),
       options: options,
       deadline: deadline,
+      active: options.active,
+      send_timeout: options.send_timeout,
+      send_timeout_close: options.send_timeout_close,
+      active_terminal: options.active == :once,
       records: RecordFramer.new(),
       handshake_timer: timer(deadline, :handshake_timeout)
     }
@@ -94,8 +103,8 @@ defmodule SSL.Connection do
                :binary,
                packet: :raw,
                active: false,
-               send_timeout: 5_000,
-               send_timeout_close: true,
+               send_timeout: state.send_timeout,
+               send_timeout_close: state.send_timeout_close,
                buffer: 16_640
              ]),
            {:ok, materialized} <-
@@ -109,7 +118,8 @@ defmodule SSL.Connection do
                materialized,
                state.options.trust_source,
                state.options.identity,
-               customize_hostname_check: state.options.hostname_check
+               customize_hostname_check: state.options.hostname_check,
+               depth: state.options.depth
              ),
            :ok <- :gen_tcp.send(tcp, outbound) do
         continue(:handshaking, %{state | machine: machine, options: nil})
@@ -122,14 +132,74 @@ defmodule SSL.Connection do
   def handle_event({:call, from}, {_ref, :close}, _phase, state) do
     Socket.mark_terminal(state.socket, true)
     notify_pending(state, {:error, :closed})
-    state = close_notify(state)
+    state = if(state.write, do: state, else: close_notify(state))
     {:stop_and_reply, :normal, [{:reply, from, :ok}], state}
+  end
+
+  def handle_event(
+        {:call, from},
+        {_ref, {:controlling_process, new_owner}},
+        _phase,
+        state
+      ) do
+    caller = elem(from, 0)
+
+    cond do
+      caller != state.owner ->
+        reply(from, {:error, :not_owner})
+
+      new_owner == state.owner ->
+        reply(from, :ok)
+
+      not Process.alive?(new_owner) ->
+        reply(from, {:error, :noproc})
+
+      true ->
+        monitor = Process.monitor(new_owner)
+
+        if Process.alive?(new_owner) do
+          Process.demonitor(state.owner_monitor, [:flush])
+
+          {:keep_state, %{state | owner: new_owner, owner_monitor: monitor},
+           [{:reply, from, :ok}]}
+        else
+          Process.demonitor(monitor, [:flush])
+          reply(from, {:error, :noproc})
+        end
+    end
+  end
+
+  def handle_event({:call, from}, {_ref, {:setopts, options}}, :connected, state) do
+    if options[:active] == :once and state.recv != nil do
+      reply(from, {:error, :einval})
+    else
+      state =
+        state
+        |> apply_send_options(options)
+        |> apply_active_option(options)
+        |> deliver(true)
+
+      continue(:connected, state, [{:reply, from, :ok}])
+    end
+  end
+
+  def handle_event({:call, from}, {_ref, :negotiated_protocol}, :connected, state) do
+    result =
+      case state.negotiated_protocol do
+        protocol when is_binary(protocol) -> {:ok, protocol}
+        nil -> {:error, :protocol_not_negotiated}
+      end
+
+    reply(from, result)
   end
 
   def handle_event({:call, from}, {_ref, {:recv, length, deadline}}, :connected, state) do
     cond do
       length > @max_plaintext ->
         reply(from, {:error, :emsgsize})
+
+      state.active != false ->
+        reply(from, {:error, :einval})
 
       state.recv != nil ->
         reply(from, {:error, :einval})
@@ -161,12 +231,19 @@ defmodule SSL.Connection do
       true ->
         token = make_ref()
 
+        {:ok, deadline} = Options.deadline(state.send_timeout)
+
         write = %{
           token: token,
           owner: elem(from, 0),
           monitor: Process.monitor(elem(from, 0)),
           from: nil,
-          data: nil
+          cursor: nil,
+          size: nil,
+          waiting: nil,
+          deadline: deadline,
+          timer: timer(deadline, {:write_timeout, token}),
+          send_timeout: state.send_timeout
         }
 
         {:keep_state, %{state | write: write}, [{:reply, from, {:ok, token}}]}
@@ -175,35 +252,46 @@ defmodule SSL.Connection do
 
   def handle_event(
         {:call, from},
-        {_ref, {:send, token, iodata}},
+        {_ref, {:send, token, cursor, size}},
         :connected,
         %{write: %{token: token, owner: owner, from: nil} = write} = state
       )
       when elem(from, 0) == owner do
-    case write_bytes(iodata) do
-      {:ok, bytes} ->
-        send(self(), :write_next)
-        {:keep_state, %{state | write: %{write | from: from, data: bytes}}}
+    cond do
+      Options.remaining(write.deadline) == 0 ->
+        fail(%{state | write: %{write | from: from}}, :timeout)
 
-      {:error, reason} ->
-        Process.demonitor(write.monitor, [:flush])
-        {:keep_state, %{state | write: nil}, [{:reply, from, {:error, reason}}]}
+      true ->
+        with :ok <-
+               :inet.setopts(state.tcp,
+                 send_timeout: write.send_timeout,
+                 send_timeout_close: true
+               ) do
+          send(self(), :write_next)
+          {:keep_state, %{state | write: %{write | from: from, cursor: cursor, size: size}}}
+        else
+          {:error, reason} -> fail(%{state | write: %{write | from: from}}, reason)
+        end
     end
   end
 
   def handle_event({:call, from}, {_ref, _}, _phase, _state), do: reply(from, {:error, :closed})
 
-  def handle_event(:info, {:tcp, tcp, bytes}, phase, %{tcp: tcp} = state) do
-    state = %{state | armed: false}
+  def handle_event(
+        :info,
+        {:tcp, tcp, bytes},
+        _phase,
+        %{tcp: tcp, deferred_tcp: nil, write: %{waiting: waiting}} = state
+      )
+      when not is_nil(waiting),
+      do: {:keep_state, %{state | armed: false, deferred_tcp: bytes}}
 
-    with {:ok, records, framer} <- RecordFramer.feed(state.records, bytes),
-         {:ok, state} <- process_records(records, %{state | records: framer}) do
-      phase = if state.connect_from == nil, do: :connected, else: phase
-      continue(phase, deliver(state))
-    else
-      {:error, reason, failed_state} -> fail(failed_state, public_error(reason))
-      {:error, reason} -> fail(state, public_error(reason))
-    end
+  def handle_event(:info, {:tcp, tcp, bytes}, phase, %{tcp: tcp} = state) do
+    process_tcp(phase, bytes, %{state | armed: false})
+  end
+
+  def handle_event(:info, {:deferred_tcp, bytes}, phase, %{deferred_tcp: nil} = state) do
+    process_tcp(phase, bytes, state)
   end
 
   def handle_event(:info, {:tcp_closed, tcp}, _phase, %{tcp: tcp} = state) do
@@ -221,30 +309,67 @@ defmodule SSL.Connection do
     continue(:connected, state)
   end
 
-  def handle_event(:info, :write_next, :connected, %{write: %{from: from, data: <<>>}} = state)
-      when from != nil do
-    :gen_statem.reply(from, :ok)
-    Process.demonitor(state.write.monitor, [:flush])
-    {:keep_state, %{state | write: nil}}
-  end
+  def handle_event(:info, :write_next, :connected, %{write: %{cursor: cursor} = write} = state)
+      when not is_nil(cursor) do
+    cond do
+      not Process.alive?(write.owner) ->
+        fail(state, :closed)
 
-  def handle_event(:info, :write_next, :connected, %{write: %{data: bytes} = write} = state)
-      when is_binary(bytes) do
-    size = min(byte_size(bytes), 16_384)
-    <<chunk::binary-size(^size), rest::binary>> = bytes
+      Options.remaining(write.deadline) == 0 ->
+        fail(state, :timeout)
 
-    with true <- Process.alive?(write.owner),
-         {:ok, record, machine} <-
-           HandshakeMachine.encrypt(state.machine, :application_data, chunk),
-         state = %{state | machine: machine},
-         :ok <- :gen_tcp.send(state.tcp, record) do
-      send(self(), :write_next)
-      {:keep_state, %{state | write: %{write | data: rest}}}
-    else
-      false -> fail(state, :closed)
-      {:error, reason} -> fail(state, public_error(reason))
+      true ->
+        case IodataCursor.next(cursor, 16_384) do
+          :done ->
+            finish_write(state, :ok)
+
+          {:ok, chunk, cursor} ->
+            with {:ok, record, machine} <-
+                   HandshakeMachine.encrypt(state.machine, :application_data, chunk) do
+              token = make_ref()
+              send(state.writer, {:send, token, state.tcp, record})
+
+              {:keep_state,
+               %{
+                 state
+                 | machine: machine,
+                   write: %{write | cursor: cursor, waiting: token}
+               }}
+            else
+              {:error, reason} -> fail(state, public_error(reason))
+            end
+        end
     end
   end
+
+  def handle_event(
+        :info,
+        {:writer_result, writer, token, :ok},
+        :connected,
+        %{writer: writer, write: %{waiting: token} = write} = state
+      ) do
+    state = %{state | write: %{write | waiting: nil}}
+
+    if state.deferred_tcp do
+      send(self(), {:deferred_tcp, state.deferred_tcp})
+      send(self(), :write_next)
+      {:keep_state, %{state | deferred_tcp: nil}}
+    else
+      send(self(), :write_next)
+      {:keep_state, state}
+    end
+  end
+
+  def handle_event(
+        :info,
+        {:writer_result, writer, token, {:error, reason}},
+        _phase,
+        %{writer: writer, write: %{waiting: token}} = state
+      ),
+      do: fail(state, reason)
+
+  def handle_event(:info, {:write_timeout, token}, _phase, %{write: %{token: token}} = state),
+    do: fail(state, :timeout)
 
   def handle_event(
         :info,
@@ -253,8 +378,17 @@ defmodule SSL.Connection do
         %{owner_monitor: monitor} = state
       ) do
     Socket.mark_terminal(state.socket, true)
-    fail(close_notify(state), :closed)
+    state = if(state.write, do: state, else: close_notify(state))
+    fail(state, :closed)
   end
+
+  def handle_event(
+        :info,
+        {:DOWN, monitor, :process, pid, _reason},
+        _phase,
+        %{writer_monitor: monitor, writer: pid} = state
+      ),
+      do: fail(%{state | writer: nil, writer_monitor: nil}, :econnreset)
 
   def handle_event(
         :info,
@@ -272,10 +406,26 @@ defmodule SSL.Connection do
         _phase,
         %{write: %{monitor: monitor, from: from}} = state
       ) do
-    if from == nil, do: {:keep_state, %{state | write: nil}}, else: fail(state, :closed)
+    if from == nil do
+      cancel_timer(state.write.timer)
+      {:keep_state, %{state | write: nil}}
+    else
+      fail(state, :closed)
+    end
   end
 
   def handle_event(:info, _message, _phase, _state), do: :keep_state_and_data
+
+  defp process_tcp(phase, bytes, state) do
+    with {:ok, records, framer} <- RecordFramer.feed(state.records, bytes),
+         {:ok, state} <- process_records(records, %{state | records: framer}) do
+      phase = if state.connect_from == nil, do: :connected, else: phase
+      continue(phase, deliver(state))
+    else
+      {:error, reason, failed_state} -> fail(failed_state, public_error(reason))
+      {:error, reason} -> fail(state, public_error(reason))
+    end
+  end
 
   @impl true
   def terminate(_reason, _phase, state) do
@@ -289,6 +439,9 @@ defmodule SSL.Connection do
     end
 
     if state.write, do: Process.demonitor(state.write.monitor, [:flush])
+    if state.write, do: cancel_timer(state.write.timer)
+    if state.writer, do: Process.exit(state.writer, :kill)
+    if state.writer_monitor, do: Process.demonitor(state.writer_monitor, [:flush])
     Process.demonitor(state.owner_monitor, [:flush])
     :ok
   end
@@ -322,13 +475,22 @@ defmodule SSL.Connection do
 
   defp apply_events([], state), do: {:ok, state}
 
-  defp apply_events([:connected | rest], state) do
+  defp apply_events([{:connected, negotiated_protocol} | rest], state) do
     if Options.remaining(state.deadline) == 0 do
       {:error, :timeout, state}
     else
+      {writer, writer_monitor} = ConnectionWriter.start(self())
       :gen_statem.reply(state.connect_from, {:ok, state.socket})
       cancel_timer(state.handshake_timer)
-      apply_events(rest, %{state | connect_from: nil, handshake_timer: nil})
+
+      apply_events(rest, %{
+        state
+        | connect_from: nil,
+          handshake_timer: nil,
+          negotiated_protocol: negotiated_protocol,
+          writer: writer,
+          writer_monitor: writer_monitor
+      })
     end
   end
 
@@ -346,10 +508,15 @@ defmodule SSL.Connection do
     apply_events(rest, %{state | closed: true, tcp: nil, machine: nil, armed: false})
   end
 
-  defp deliver(state, immediate \\ false)
-  defp deliver(%{recv: nil} = state, _immediate), do: state
+  defp deliver(state, immediate \\ false) do
+    state
+    |> deliver_recv(immediate)
+    |> deliver_active()
+  end
 
-  defp deliver(%{recv: receiver} = state, immediate) do
+  defp deliver_recv(%{recv: nil} = state, _immediate), do: state
+
+  defp deliver_recv(%{recv: receiver} = state, immediate) do
     cond do
       not Process.alive?(elem(receiver.from, 0)) ->
         cancel_timer(receiver.timer)
@@ -375,6 +542,21 @@ defmodule SSL.Connection do
         state
     end
   end
+
+  defp deliver_active(%{recv: nil, active: :once, size: size} = state) when size > 0 do
+    {bytes, buffer} = take(state.buffer, size, [])
+    send(state.owner, {:ssl, state.socket, bytes})
+
+    %{
+      state
+      | active: false,
+        active_terminal: true,
+        buffer: buffer,
+        size: 0
+    }
+  end
+
+  defp deliver_active(state), do: state
 
   defp buffer_application_data(state, bytes)
        when state.size + byte_size(bytes) <= @max_plaintext do
@@ -429,21 +611,29 @@ defmodule SSL.Connection do
     %{state | recv: nil}
   end
 
-  defp continue(_phase, %{closed: true, size: 0} = state) do
+  defp continue(phase, state, actions \\ [])
+
+  defp continue(_phase, %{closed: true, size: 0} = state, actions) do
     notify_pending(state, {:error, :closed})
-    {:stop, :normal, state}
+    state = notify_active_terminal(state, :closed)
+
+    if actions == [] do
+      {:stop, :normal, state}
+    else
+      {:stop_and_reply, :normal, actions, state}
+    end
   end
 
-  defp continue(phase, state) do
+  defp continue(phase, state, actions) do
     can_read = state.size < @max_plaintext - @rearm_reserve or state.recv != nil
 
     if state.tcp && not state.armed && not state.closed && can_read do
       case :inet.setopts(state.tcp, active: :once) do
-        :ok -> {:next_state, phase, %{state | armed: true}}
+        :ok -> {:next_state, phase, %{state | armed: true}, actions}
         {:error, reason} -> fail(state, reason)
       end
     else
-      {:next_state, phase, state}
+      {:next_state, phase, state, actions}
     end
   end
 
@@ -454,11 +644,13 @@ defmodule SSL.Connection do
       end)
 
     notify_pending(state, {:error, {:tls_alert, {category, ~c"Peer terminated TLS"}}})
+    state = notify_active_terminal(state, {:tls_alert, {category, ~c"Peer terminated TLS"}})
     {:stop, :normal, state}
   end
 
   defp fail(state, reason) do
     notify_pending(state, {:error, reason})
+    state = notify_active_terminal(state, reason)
     {:stop, :normal, fatal_alert(state, reason)}
   end
 
@@ -483,6 +675,43 @@ defmodule SSL.Connection do
     if state.connect_from, do: :gen_statem.reply(state.connect_from, result)
     if state.recv, do: :gen_statem.reply(state.recv.from, result)
     if state.write && state.write.from, do: :gen_statem.reply(state.write.from, result)
+  end
+
+  defp notify_active_terminal(%{active_terminal: true, terminal_notified: false} = state, :closed) do
+    send(state.owner, {:ssl_closed, state.socket})
+    %{state | terminal_notified: true}
+  end
+
+  defp notify_active_terminal(
+         %{active_terminal: true, terminal_notified: false} = state,
+         reason
+       ) do
+    send(state.owner, {:ssl_error, state.socket, reason})
+    %{state | terminal_notified: true}
+  end
+
+  defp notify_active_terminal(state, _reason), do: state
+
+  defp apply_active_option(state, options) do
+    case Keyword.fetch(options, :active) do
+      {:ok, :once} -> %{state | active: :once, active_terminal: true}
+      {:ok, false} -> %{state | active: false, active_terminal: false}
+      :error -> state
+    end
+  end
+
+  defp apply_send_options(state, options) do
+    case Keyword.fetch(options, :send_timeout) do
+      {:ok, timeout} -> %{state | send_timeout: timeout}
+      :error -> state
+    end
+  end
+
+  defp finish_write(state, result) do
+    :gen_statem.reply(state.write.from, result)
+    cancel_timer(state.write.timer)
+    Process.demonitor(state.write.monitor, [:flush])
+    continue(:connected, %{state | write: nil})
   end
 
   defp close_notify(%{machine: nil} = state), do: state
@@ -516,12 +745,4 @@ defmodule SSL.Connection do
   defp cancel_timer(timer), do: Process.cancel_timer(timer, async: false, info: false)
   defp send_records(_tcp, []), do: :ok
   defp send_records(tcp, records), do: :gen_tcp.send(tcp, records)
-
-  defp write_bytes(iodata) do
-    if :erlang.iolist_size(iodata) <= @max_write,
-      do: {:ok, IO.iodata_to_binary(iodata)},
-      else: {:error, :emsgsize}
-  rescue
-    ArgumentError -> {:error, :badarg}
-  end
 end

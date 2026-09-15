@@ -21,15 +21,108 @@ defmodule SSL.OptionsTest do
   test "rejects unsupported security and socket options" do
     for option <- [
           active: true,
-          active: :once,
           packet: :line,
           mode: :list,
           verify: :verify_none,
           versions: [:"tlsv1.2"],
-          depth: 5,
           customize_hostname_check: [fail_callback: fn _ -> true end]
         ] do
       assert {:error, {:options, _}} = SSL.Options.normalize(~c"mail.example", [option])
+    end
+  end
+
+  test "normalizes active-once, depth, and send policy without accepting weaker variants" do
+    assert {:ok, %{active: :once, depth: 2, send_timeout: :infinity, send_timeout_close: true}} =
+             SSL.Options.normalize("mail.example",
+               active: :once,
+               depth: 2,
+               send_timeout: :infinity,
+               send_timeout_close: true
+             )
+
+    for option <- [
+          active: true,
+          depth: -1,
+          depth: 1.5,
+          send_timeout: -1,
+          send_timeout: 1.5,
+          send_timeout_close: false
+        ] do
+      assert {:error, {:options, _}} = SSL.Options.normalize("mail.example", [option])
+    end
+
+    end_time =
+      :erlang.system_info(:end_time)
+      |> :erlang.convert_time_unit(:native, :millisecond)
+
+    unrepresentable_timeout = end_time - System.monotonic_time(:millisecond) + 1_000
+
+    assert {:error, {:options, _}} =
+             SSL.Options.normalize("mail.example", send_timeout: unrepresentable_timeout)
+  end
+
+  test "normalizes a complete setopts request atomically" do
+    assert {:ok, [active: :once, send_timeout: :infinity, send_timeout_close: true]} =
+             SSL.Options.normalize_setopts(
+               active: :once,
+               send_timeout: :infinity,
+               send_timeout_close: true
+             )
+
+    for options <- [
+          [active: :once, active: false],
+          [packet: :raw],
+          [depth: 1],
+          [send_timeout_close: false],
+          [unknown: :value]
+        ] do
+      assert {:error, {:options, _}} = SSL.Options.normalize_setopts(options)
+    end
+  end
+
+  test "adds ordered ALPN to the default profile" do
+    assert {:ok, %{profile: profile, alpn_advertised_protocols: ["h2", "http/1.1"]}} =
+             SSL.Options.normalize("mail.example", alpn_advertised_protocols: ["h2", "http/1.1"])
+
+    assert {:alpn, ["h2", "http/1.1"]} = Enum.find(profile.extensions, &match?({:alpn, _}, &1))
+  end
+
+  test "requires an exact ALPN match for an explicit profile" do
+    profile = default_profile_with_alpn(["h2", "http/1.1"])
+
+    assert {:ok, %{profile: ^profile}} =
+             SSL.Options.normalize("mail.example",
+               ex_ssl: [profile: profile],
+               alpn_advertised_protocols: ["h2", "http/1.1"]
+             )
+
+    assert {:error, {:options, {:alpn_advertised_protocols, :profile_conflict}}} =
+             SSL.Options.normalize("mail.example",
+               ex_ssl: [profile: profile],
+               alpn_advertised_protocols: ["http/1.1", "h2"]
+             )
+  end
+
+  test "does not inject top-level ALPN into an explicit profile without ALPN" do
+    profile = default_profile_with_alpn(nil)
+
+    assert {:error, {:options, {:alpn_advertised_protocols, :profile_conflict}}} =
+             SSL.Options.normalize("mail.example",
+               ex_ssl: [profile: profile],
+               alpn_advertised_protocols: ["h2"]
+             )
+  end
+
+  test "rejects malformed or oversized ALPN lists before connecting" do
+    for protocols <- [
+          [],
+          [""],
+          [:h2],
+          [String.duplicate("a", 256)],
+          List.duplicate("a", 32_768)
+        ] do
+      assert {:error, {:options, {:alpn_advertised_protocols, :unsupported_or_invalid}}} =
+               SSL.Options.normalize("mail.example", alpn_advertised_protocols: protocols)
     end
   end
 
@@ -80,5 +173,17 @@ defmodule SSL.OptionsTest do
              SSL.Options.normalize("mail.example",
                ex_ssl: [profile: %SSL.ClientHello.WireProfile{}]
              )
+  end
+
+  defp default_profile_with_alpn(protocols) do
+    assert {:ok, %{profile: profile}} = SSL.Options.normalize("mail.example", [])
+
+    extensions =
+      case protocols do
+        nil -> profile.extensions
+        protocols -> profile.extensions ++ [{:alpn, protocols}]
+      end
+
+    %{profile | extensions: extensions}
   end
 end

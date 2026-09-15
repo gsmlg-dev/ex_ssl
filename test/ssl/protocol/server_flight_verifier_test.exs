@@ -148,6 +148,13 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
              ServerFlightVerifier.verify(input(identity: {:dns_id, "wrong.example.test"}))
   end
 
+  test "passes depth through to PKIX path validation" do
+    assert {:ok, %Result{}} = ServerFlightVerifier.verify(input(), depth: 0)
+
+    assert {:error, {:fatal_alert, :decode_error, {:invalid_options, :depth}}} =
+             ServerFlightVerifier.verify(input(), depth: -1)
+  end
+
   test "maps an invalid caller DNS identity to illegal_parameter" do
     identity = {:dns_id, ".example.test"}
 
@@ -169,11 +176,15 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
   test "validates ALPN as exact opaque values and permits an absent response" do
     for protocol <- ["h2", "http/1.1"] do
       flight = constructed_flight(encrypted_extensions: [{16, alpn_payload([protocol])}])
-      assert {:ok, %Result{}} = ServerFlightVerifier.verify(input_from_flight(flight))
+
+      assert {:ok, %Result{negotiated_protocol: ^protocol}} =
+               ServerFlightVerifier.verify(input_from_flight(flight))
     end
 
     absent = constructed_flight(encrypted_extensions: [])
-    assert {:ok, %Result{}} = ServerFlightVerifier.verify(input_from_flight(absent))
+
+    assert {:ok, %Result{negotiated_protocol: nil}} =
+             ServerFlightVerifier.verify(input_from_flight(absent))
 
     case_mismatch =
       constructed_flight(

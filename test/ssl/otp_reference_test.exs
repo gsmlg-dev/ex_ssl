@@ -104,4 +104,92 @@ defmodule SSL.OTPReferenceTest do
     assert :ok = :ssl.close(socket)
     assert :ok = LocalTLSPeer.stop(peer)
   end
+
+  test "OTP active once delivers one message without ssl_passive" do
+    parent = self()
+
+    {:ok, peer} =
+      LocalTLSPeer.start(fn socket ->
+        receive do
+          :send -> :ok
+        end
+
+        :ok = :ssl.send(socket, "active-once")
+        send(parent, :otp_active_sent)
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    {:ok, socket} =
+      :ssl.connect(~c"127.0.0.1", peer.port, LocalTLSPeer.client_options(), 5_000)
+
+    assert :ok = :ssl.setopts(socket, active: :once)
+    assert {:error, :einval} = :ssl.recv(socket, 1, 0)
+    send(peer.task.pid, :send)
+    assert_receive :otp_active_sent
+    assert_receive {:ssl, ^socket, "active-once"}, 1_000
+    refute_receive {:ssl_passive, ^socket}, 20
+    assert :ok = :ssl.close(socket)
+    assert :ok = LocalTLSPeer.stop(peer)
+  end
+
+  test "OTP ownership probe permits a non-owner no-op and may admit a dead target" do
+    {:ok, peer} =
+      LocalTLSPeer.start(fn socket ->
+        drain_until_closed(socket)
+      end)
+
+    {:ok, socket} =
+      :ssl.connect(~c"127.0.0.1", peer.port, LocalTLSPeer.client_options(), 5_000)
+
+    owner = self()
+    non_owner = Task.async(fn -> :ssl.controlling_process(socket, owner) end)
+
+    # OTP 28 permits this call even though the task is not the owner. ex_ssl
+    # deliberately enforces the task contract's stricter current-owner rule.
+    assert :ok = Task.await(non_owner)
+
+    dead =
+      spawn(fn ->
+        receive do
+          :exit -> :ok
+        end
+      end)
+
+    monitor = Process.monitor(dead)
+    send(dead, :exit)
+    assert_receive {:DOWN, ^monitor, :process, ^dead, :normal}
+
+    # OTP 28 returns :ok and then closes asynchronously; some later OTP builds
+    # reject the target before committing. ex_ssl deliberately uses the latter,
+    # deterministic behavior while leaving the live socket untouched.
+    case :ssl.controlling_process(socket, dead) do
+      :ok -> assert eventually_closed(socket)
+      {:error, :noproc} -> assert :ok = :ssl.close(socket)
+    end
+
+    assert :ok = LocalTLSPeer.stop(peer)
+  end
+
+  defp eventually_closed(socket, attempts \\ 100)
+  defp eventually_closed(_socket, 0), do: false
+
+  defp eventually_closed(socket, attempts) do
+    case :ssl.send(socket, "probe") do
+      {:error, _reason} ->
+        true
+
+      :ok ->
+        Process.sleep(1)
+        eventually_closed(socket, attempts - 1)
+    end
+  end
+
+  defp drain_until_closed(socket) do
+    case :ssl.recv(socket, 0, 5_000) do
+      {:ok, _bytes} -> drain_until_closed(socket)
+      {:error, :closed} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
 end

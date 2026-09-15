@@ -3,7 +3,19 @@ defmodule SSL.Options do
   alias SSL.ClientHello.{Profile, WireProfile}
 
   @derive {Inspect, only: [:identity]}
-  defstruct [:profile, :identity, :trust_source, context: %{}, hostname_check: []]
+  defstruct [
+    :profile,
+    :identity,
+    :trust_source,
+    :alpn_advertised_protocols,
+    active: false,
+    depth: 10,
+    send_timeout: 5_000,
+    send_timeout_close: true,
+    context: %{},
+    hostname_check: []
+  ]
+
   @type t :: %__MODULE__{}
 
   @capabilities %{
@@ -19,12 +31,16 @@ defmodule SSL.Options do
     :mode,
     :active,
     :packet,
+    :depth,
+    :send_timeout,
+    :send_timeout_close,
     :verify,
     :cacerts,
     :cacertfile,
     :server_name_indication,
     :customize_hostname_check,
     :versions,
+    :alpn_advertised_protocols,
     :ex_ssl
   ]
 
@@ -88,8 +104,21 @@ defmodule SSL.Options do
          identity: identity,
          context: context,
          trust_source: trust,
+         alpn_advertised_protocols: profile_alpn(profile),
+         active: Keyword.get(options, :active, false),
+         depth: Keyword.get(options, :depth, 10),
+         send_timeout: Keyword.get(options, :send_timeout, 5_000),
+         send_timeout_close: Keyword.get(options, :send_timeout_close, true),
          hostname_check: Keyword.get(options, :customize_hostname_check, [])
        }}
+    end
+  end
+
+  @spec normalize_setopts(term()) :: {:ok, keyword()} | {:error, term()}
+  def normalize_setopts(options) do
+    with {:ok, options} <- option_list(options),
+         :ok <- validate_setopts(options) do
+      {:ok, options}
     end
   end
 
@@ -137,11 +166,30 @@ defmodule SSL.Options do
     end)
   end
 
+  defp validate_setopts(options) do
+    Enum.reduce_while(options, :ok, fn {key, value}, :ok ->
+      if key in [:active, :send_timeout, :send_timeout_close] and valid_option?(key, value),
+        do: {:cont, :ok},
+        else: {:halt, option_error({key, :unsupported_or_invalid})}
+    end)
+  end
+
   defp valid_option?(:mode, value), do: value == :binary
-  defp valid_option?(:active, value), do: value == false
+  defp valid_option?(:active, value), do: value in [false, :once]
   defp valid_option?(:packet, value), do: value in [:raw, 0]
+  defp valid_option?(:depth, value), do: is_integer(value) and value >= 0
+
+  defp valid_option?(:send_timeout, :infinity), do: true
+
+  defp valid_option?(:send_timeout, value) when is_integer(value) and value >= 0,
+    do: match?({:ok, _deadline}, deadline(value))
+
+  defp valid_option?(:send_timeout, _value), do: false
+
+  defp valid_option?(:send_timeout_close, value), do: value == true
   defp valid_option?(:verify, value), do: value == :verify_peer
   defp valid_option?(:versions, value), do: value == [:"tlsv1.3"]
+  defp valid_option?(:alpn_advertised_protocols, value), do: valid_alpn_protocols?(value)
   defp valid_option?(:cacerts, value), do: is_list(value) and value != []
 
   defp valid_option?(:cacertfile, value),
@@ -240,16 +288,37 @@ defmodule SSL.Options do
   end
 
   defp profile(options, context) do
+    advertised_protocols = Keyword.get(options, :alpn_advertised_protocols)
+    explicit_profile? = Keyword.has_key?(options, :ex_ssl)
     profile = get_in(options, [:ex_ssl, :profile]) || :default
-    profile = if profile == :default, do: default_profile(context), else: profile
 
+    with {:ok, profile} <-
+           if(profile == :default,
+             do: {:ok, default_profile(context, advertised_protocols)},
+             else: resolve_explicit_profile(profile, advertised_protocols, explicit_profile?)
+           ) do
+      validate_profile(profile)
+    end
+  end
+
+  defp validate_profile(profile) do
     case Profile.validate(profile, capabilities()) do
       {:ok, profile} -> require_runtime_extensions(profile)
       {:error, _} -> option_error({:ex_ssl, :unsupported_profile})
     end
   end
 
-  defp default_profile(context) do
+  defp resolve_explicit_profile(profile, nil, _explicit_profile?), do: {:ok, profile}
+
+  defp resolve_explicit_profile(profile, protocols, true) do
+    if profile_alpn(profile) == protocols do
+      {:ok, profile}
+    else
+      option_error({:alpn_advertised_protocols, :profile_conflict})
+    end
+  end
+
+  defp default_profile(context, alpn_protocols) do
     capabilities = capabilities()
     groups = Enum.filter(capabilities.groups, &is_integer/1)
 
@@ -264,9 +333,28 @@ defmodule SSL.Options do
             {:signature_algorithms,
              Enum.filter(capabilities.signature_algorithms, &is_integer/1)},
             {:key_share, Enum.take(groups, 1)}
-          ]
+          ] ++ alpn_extension(alpn_protocols)
     }
   end
+
+  defp alpn_extension(nil), do: []
+  defp alpn_extension(protocols), do: [{:alpn, protocols}]
+
+  defp profile_alpn(%WireProfile{extensions: extensions}) do
+    Enum.find_value(extensions, fn
+      {:alpn, protocols} -> protocols
+      _extension -> nil
+    end)
+  end
+
+  defp profile_alpn(_profile), do: nil
+
+  defp valid_alpn_protocols?(protocols) when is_list(protocols) and protocols != [] do
+    Enum.all?(protocols, &(is_binary(&1) and byte_size(&1) in 1..255)) and
+      Enum.reduce(protocols, 2, fn protocol, size -> size + 1 + byte_size(protocol) end) <= 0xFFFF
+  end
+
+  defp valid_alpn_protocols?(_protocols), do: false
 
   defp require_runtime_extensions(profile) do
     required = [:supported_versions, :supported_groups, :signature_algorithms, :key_share]

@@ -180,6 +180,9 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
   defp certificate_pair(%{expired_certfile: certfile, keyfile: keyfile}, :expired),
     do: {certfile, keyfile}
 
+  defp certificate_pair(%{chain_certfile: certfile, chain_keyfile: keyfile}, :intermediate_chain),
+    do: {certfile, keyfile}
+
   @spec stop(t()) :: term()
   def stop(%__MODULE__{listener: listener, listener_kind: kind, task: task}) do
     _ = if(kind == :tcp, do: :gen_tcp.close(listener), else: :ssl.close(listener))
@@ -345,6 +348,14 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
         requestfile = Path.join(tmpdir, "server.csr")
         ecdsa_requestfile = Path.join(tmpdir, "server-ecdsa.csr")
         expired_certfile = Path.join(tmpdir, "server-expired.pem")
+        intermediate_keyfile = Path.join(tmpdir, "intermediate-key.pem")
+        intermediate_requestfile = Path.join(tmpdir, "intermediate.csr")
+        intermediate_certfile = Path.join(tmpdir, "intermediate.pem")
+        chain_keyfile = Path.join(tmpdir, "server-chain-key.pem")
+        chain_requestfile = Path.join(tmpdir, "server-chain.csr")
+        chain_leaf_certfile = Path.join(tmpdir, "server-chain-leaf.pem")
+        chain_certfile = Path.join(tmpdir, "server-chain.pem")
+        intermediate_extensions = Path.join(tmpdir, "intermediate.ext")
         ca_config = Path.join(tmpdir, "ca.cnf")
         indexfile = Path.join(tmpdir, "index.txt")
         serialfile = Path.join(tmpdir, "serial")
@@ -371,6 +382,70 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
               "keyUsage=critical,keyCertSign,cRLSign",
               "-days",
               "2"
+            ],
+            stderr_to_stdout: true
+          )
+
+        File.write!(
+          intermediate_extensions,
+          "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always,issuer\n"
+        )
+
+        {_, 0} =
+          System.cmd(
+            "openssl",
+            [
+              "req",
+              "-newkey",
+              "rsa:2048",
+              "-nodes",
+              "-keyout",
+              intermediate_keyfile,
+              "-out",
+              intermediate_requestfile,
+              "-subj",
+              "/CN=ex-ssl test intermediate CA"
+            ],
+            stderr_to_stdout: true
+          )
+
+        {_, 0} =
+          System.cmd(
+            "openssl",
+            [
+              "x509",
+              "-req",
+              "-in",
+              intermediate_requestfile,
+              "-CA",
+              cafile,
+              "-CAkey",
+              cakeyfile,
+              "-CAcreateserial",
+              "-out",
+              intermediate_certfile,
+              "-days",
+              "2",
+              "-extfile",
+              intermediate_extensions
+            ],
+            stderr_to_stdout: true
+          )
+
+        {_, 0} =
+          System.cmd(
+            "openssl",
+            [
+              "req",
+              "-newkey",
+              "rsa:2048",
+              "-nodes",
+              "-keyout",
+              chain_keyfile,
+              "-out",
+              chain_requestfile,
+              "-subj",
+              "/CN=exssl.test"
             ],
             stderr_to_stdout: true
           )
@@ -443,6 +518,34 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
         File.write!(
           extensions,
           "subjectAltName=DNS:exssl.test\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n"
+        )
+
+        {_, 0} =
+          System.cmd(
+            "openssl",
+            [
+              "x509",
+              "-req",
+              "-in",
+              chain_requestfile,
+              "-CA",
+              intermediate_certfile,
+              "-CAkey",
+              intermediate_keyfile,
+              "-CAcreateserial",
+              "-out",
+              chain_leaf_certfile,
+              "-days",
+              "2",
+              "-extfile",
+              extensions
+            ],
+            stderr_to_stdout: true
+          )
+
+        File.write!(
+          chain_certfile,
+          File.read!(chain_leaf_certfile) <> File.read!(intermediate_certfile)
         )
 
         {_, 0} =
@@ -529,6 +632,9 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
           ecdsa_certfile: ecdsa_certfile,
           ecdsa_keyfile: ecdsa_keyfile,
           expired_certfile: expired_certfile,
+          chain_certfile: chain_certfile,
+          chain_keyfile: chain_keyfile,
+          intermediate_certfile: intermediate_certfile,
           tmpdir: tmpdir
         }
 
