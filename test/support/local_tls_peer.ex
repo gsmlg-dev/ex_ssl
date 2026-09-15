@@ -553,7 +553,7 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
        do: {Enum.reverse(records), buffer}
 
   defp take_tls_records(<<type, version::16, length::16, rest::binary>>, records) do
-    <<record_body::binary-size(length), remainder::binary>> = rest
+    <<record_body::binary-size(^length), remainder::binary>> = rest
 
     take_tls_records(remainder, [<<type, version::16, length::16, record_body::binary>> | records])
   end

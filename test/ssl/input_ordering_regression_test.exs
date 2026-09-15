@@ -5,6 +5,85 @@ defmodule SSL.InputOrderingRegressionTest do
 
   @moduletag :integration
 
+  test "raw TCP is rearmed between records of one long logical write" do
+    parent = self()
+    payload = :binary.copy("l", 16 * 1_048_576)
+
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        receive do
+          :send_first -> :ok
+        end
+
+        assert :ok = :ssl.send(socket, "first")
+        send(parent, :first_progress_record_sent)
+
+        receive do
+          :send_second -> :ok
+        end
+
+        assert :ok = :ssl.send(socket, "second")
+        send(parent, :second_progress_record_sent)
+
+        receive do
+          :send_key_update -> :ok
+        end
+
+        assert :ok = :ssl.update_keys(socket, :read_write)
+        assert :ok = :ssl.send(socket, "after-key-update")
+        send(parent, :progress_key_update_sent)
+        send(parent, {:progress_peer_payload, :ssl.recv(socket, byte_size(payload), 30_000)})
+        assert {:error, :closed} = :ssl.recv(socket, 0, 5_000)
+        :ok
+      end)
+
+    socket = connect(peer.port, send_timeout: :infinity)
+
+    on_exit(fn ->
+      if Process.alive?(socket.pid), do: SSL.close(socket)
+      stop_peer_on_failure(peer)
+    end)
+
+    {:connected, state} = :sys.get_state(socket.pid)
+    writer = state.writer
+    assert true = :erlang.suspend_process(writer)
+    sender = Task.async(fn -> SSL.send(socket, payload) end)
+    wait_for_writer(socket.pid)
+
+    first_receive = Task.async(fn -> SSL.recv(socket, 5, 5_000) end)
+    send(peer.task.pid, :send_first)
+    assert_receive :first_progress_record_sent, 1_000
+    wait_for_deferred_input(socket.pid)
+    assert true = :erlang.resume_process(writer)
+    assert {:ok, "first"} = Task.await(first_receive, 5_000)
+    assert true = :erlang.suspend_process(writer)
+    assert Task.yield(sender, 0) == nil
+    wait_for_writer(socket.pid)
+
+    second_receive = Task.async(fn -> SSL.recv(socket, 6, 5_000) end)
+    send(peer.task.pid, :send_second)
+    assert_receive :second_progress_record_sent, 1_000
+    wait_for_deferred_input(socket.pid)
+    assert true = :erlang.resume_process(writer)
+    assert {:ok, "second"} = Task.await(second_receive, 5_000)
+    assert true = :erlang.suspend_process(writer)
+    assert Task.yield(sender, 0) == nil
+    wait_for_writer(socket.pid)
+
+    key_update_receive = Task.async(fn -> SSL.recv(socket, 16, 5_000) end)
+    send(peer.task.pid, :send_key_update)
+    assert_receive :progress_key_update_sent, 1_000
+    wait_for_deferred_input(socket.pid)
+    assert true = :erlang.resume_process(writer)
+    assert {:ok, "after-key-update"} = Task.await(key_update_receive, 5_000)
+    assert Task.yield(sender, 0) == nil
+
+    assert :ok = Task.await(sender, 30_000)
+    assert_receive {:progress_peer_payload, {:ok, ^payload}}, 30_000
+    assert :ok = SSL.close(socket)
+    assert :ok = Peer.stop(peer)
+  end
+
   test "a deferred KeyUpdate is consumed before a rearmed later record" do
     parent = self()
 
@@ -174,7 +253,7 @@ defmodule SSL.InputOrderingRegressionTest do
 
       [first, second, third] = records
       split = div(byte_size(first), 2)
-      <<first_half::binary-size(split), second_half::binary>> = first
+      <<first_half::binary-size(^split), second_half::binary>> = first
       send(socket.pid, {:tcp, state.tcp, first_half})
       assert :ok = SSL.setopts(socket, active: :once)
       send(socket.pid, {:tcp, state.tcp, second_half})
@@ -277,7 +356,7 @@ defmodule SSL.InputOrderingRegressionTest do
       send(socket.pid, {:tcp_closed, state.tcp})
       assert true = :erlang.resume_process(state.writer)
 
-      assert {:error, :econnreset} = Task.await(sender, 5_000)
+      assert :ok = Task.await(sender, 5_000)
       assert_receive {:ssl, ^socket, "before-abrupt-eof"}, 5_000
       assert_receive {:ssl_error, ^socket, :econnreset}, 5_000
       refute_receive {:ssl_error, ^socket, _reason}, 20

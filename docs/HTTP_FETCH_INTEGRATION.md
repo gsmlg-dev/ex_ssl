@@ -90,6 +90,21 @@ bounded to 1 MiB and raw reads pause near that boundary. Repeated active-once
 delivery drains the buffer and resumes progress, permitting responses larger
 than the bound without increasing it.
 
+Internally, received TCP data and EOF/error events are held in arrival order in
+a bounded FIFO whenever an output record is pending. After each bounded writer
+completion, ex_ssl drains older input and safely rearms raw TCP before producing
+the next application record. A several-MiB request therefore does not starve
+response bytes or peer-requested KeyUpdate traffic, while a control response
+still cannot overtake already-protected application ciphertext. Consumer calls
+must not use repeated `setopts/2` as a polling mechanism for TLS progress.
+
+All TLS output paths share the same connection-owned asynchronous writer.
+Handshake deadlines include ClientHello/retry/client-Finished transport output;
+logical send deadlines are not restarted by interleaved input or control
+traffic. If an output is blocked and its result is uncertain, abort closes the
+transport without replay rather than attempting to append close_notify behind
+it.
+
 The existing Manifold passive direct-TLS and STARTTLS subset remains supported.
 This work does not weaken its verification, plaintext-boundary, close, or
 receive-timeout behavior.

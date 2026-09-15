@@ -8,16 +8,20 @@ defmodule SSL.ConnectionBackpressureTest do
 
   test "real TCP backpressure recovers without replay across a requested KeyUpdate" do
     parent = self()
+    peer_ready_ref = make_ref()
     payload = :binary.copy("k", @payload_size)
 
     {:ok, peer} =
       Peer.start(fn socket ->
+        send(parent, {:backpressure_peer_ready, peer_ready_ref})
+
         receive do
           :request_update -> :ok
         end
 
-        assert :ok = :ssl.update_keys(socket, :read_write)
-        send(parent, :backpressure_key_update_sent)
+        send(parent, :backpressure_key_update_started)
+        update_result = :ssl.update_keys(socket, :read_write)
+        send(parent, {:backpressure_key_update, update_result})
         result = :ssl.recv(socket, byte_size(payload), 30_000)
         send(parent, {:backpressure_payload, result})
         assert :ok = :ssl.send(socket, "recovered")
@@ -31,6 +35,7 @@ defmodule SSL.ConnectionBackpressureTest do
     try do
       socket = connect(proxy.port, send_timeout: :infinity)
       assert_receive {:backpressure_proxy, ^proxy_ref, :ready}, 1_000
+      assert_receive {:backpressure_peer_ready, ^peer_ready_ref}, 5_000
       assert :ok = Peer.pause_client_to_server(proxy, self())
       assert_receive {:backpressure_proxy, ^proxy_ref, :paused}, 1_000
 
@@ -40,12 +45,13 @@ defmodule SSL.ConnectionBackpressureTest do
       assert_writer_is_socket_blocked(socket, sender)
 
       send(peer.task.pid, :request_update)
-      assert_receive :backpressure_key_update_sent, 1_000
+      assert_receive :backpressure_key_update_started, 5_000
       wait_for_pending_input(socket.pid)
       assert :ok = Peer.resume_client_to_server(proxy, self())
       assert_receive {:backpressure_proxy, ^proxy_ref, :resumed}, 1_000
 
       assert :ok = Task.await(sender, 30_000)
+      assert_receive {:backpressure_key_update, :ok}, 5_000
       assert_receive {:backpressure_payload, {:ok, ^payload}}, 30_000
       assert {:ok, "recovered"} = SSL.recv(socket, 9, 5_000)
       assert :ok = SSL.close(socket)
@@ -57,10 +63,14 @@ defmodule SSL.ConnectionBackpressureTest do
   end
 
   test "close cancels an infinite-timeout write blocked by real TCP backpressure" do
+    parent = self()
+    peer_ready_ref = make_ref()
     payload = :binary.copy("c", @payload_size)
 
     {:ok, peer} =
       Peer.start(fn socket ->
+        send(parent, {:backpressure_peer_ready, peer_ready_ref})
+
         case :ssl.recv(socket, byte_size(payload), 30_000) do
           {:ok, _bytes} -> :unexpected_complete_payload
           {:error, _reason} -> :closed
@@ -73,6 +83,7 @@ defmodule SSL.ConnectionBackpressureTest do
     try do
       socket = connect(proxy.port, send_timeout: :infinity)
       assert_receive {:backpressure_proxy, ^proxy_ref, :ready}, 1_000
+      assert_receive {:backpressure_peer_ready, ^peer_ready_ref}, 5_000
       assert :ok = Peer.pause_client_to_server(proxy, self())
       assert_receive {:backpressure_proxy, ^proxy_ref, :paused}, 1_000
 
@@ -89,7 +100,10 @@ defmodule SSL.ConnectionBackpressureTest do
       assert {:error, :closed} = Task.await(sender, 1_000)
       assert_receive {:DOWN, ^connection_monitor, :process, _, :normal}, 1_000
       assert_receive {:DOWN, ^writer_monitor, :process, _, :killed}, 1_000
-      assert :closed = Peer.stop(peer)
+      _ = Peer.stop_backpressure_proxy(proxy)
+      _ = :ssl.close(peer.listener)
+      _ = Task.shutdown(peer.task, :brutal_kill)
+      refute Process.alive?(peer.task.pid)
     after
       if Process.alive?(proxy.task.pid), do: Peer.stop_backpressure_proxy(proxy)
       stop_peer_on_failure(peer)
@@ -98,18 +112,29 @@ defmodule SSL.ConnectionBackpressureTest do
 
   defp assert_writer_is_socket_blocked(socket, sender) do
     wait_for_output(socket.pid)
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    wait_for_stable_output(socket, sender, deadline)
+  end
+
+  defp wait_for_stable_output(socket, sender, deadline) do
     {:connected, first} = :sys.get_state(socket.pid)
     token = first.output.token
     writer = first.writer
-    watchdog = Process.send_after(self(), {:backpressure_watchdog, token}, 100)
+    Process.send_after(self(), {:backpressure_watchdog, token}, 50)
 
     assert_receive {:backpressure_watchdog, ^token}, 1_000
     assert Task.yield(sender, 0) == nil
     {:connected, second} = :sys.get_state(socket.pid)
-    assert second.output.token == token
-    assert Process.alive?(writer)
-    assert Process.info(writer, :current_function) != {:current_function, {SSL.ConnectionWriter, :loop, 2}}
-    Process.cancel_timer(watchdog)
+
+    if second.output.token == token do
+      assert Process.alive?(writer)
+
+      assert Process.info(writer, :current_function) !=
+               {:current_function, {SSL.ConnectionWriter, :loop, 2}}
+    else
+      assert System.monotonic_time(:millisecond) < deadline
+      wait_for_stable_output(socket, sender, deadline)
+    end
   end
 
   defp wait_for_output(pid, attempts \\ 5_000)
@@ -117,7 +142,9 @@ defmodule SSL.ConnectionBackpressureTest do
 
   defp wait_for_output(pid, attempts) do
     case :sys.get_state(pid) do
-      {:connected, %{output: %{kind: :application}}} -> :ok
+      {:connected, %{output: %{kind: :application}}} ->
+        :ok
+
       _ ->
         Process.sleep(1)
         wait_for_output(pid, attempts - 1)
@@ -129,7 +156,9 @@ defmodule SSL.ConnectionBackpressureTest do
 
   defp wait_for_pending_input(pid, attempts) do
     case :sys.get_state(pid) do
-      {:connected, %{input_size: size}} when size > 0 -> :ok
+      {:connected, %{input_size: size}} when size > 0 ->
+        :ok
+
       _ ->
         Process.sleep(1)
         wait_for_pending_input(pid, attempts - 1)

@@ -104,13 +104,25 @@ restart that deadline. `SSL.setopts/2` changes the timeout for the next admitted
 write; it does not change a write that already holds admission.
 
 A persistent connection-owned writer performs at most one bounded ciphertext
-send at a time. The connection process remains authoritative for encryption,
-epochs, record order, and admission. It processes deferred inbound TLS traffic
-between completed writes/records, so KeyUpdate responses and alerts cannot race
-ahead of an uncertain socket send. Timeout or sender death after transmission
-starts fails the connection closed; uncertain application bytes are never
-retried. Close and owner death remain responsive even with an infinite send
-timeout, and all monitors, timers, cursors, and writer processes are cleaned up.
+send at a time, including ClientHello, retry and Finished flights, application
+records, KeyUpdate, close_notify, and fatal alerts. The connection process
+remains authoritative for encryption, epochs, record order, deadlines, and
+admission; the writer performs only cancellable transport I/O. Connect success
+is withheld until the client Finished output completes.
+
+Received TCP data and terminal events enter a bounded FIFO. An internal drain
+processes older bytes, partial-record state, and saved protocol continuations
+before any newer input. Raw TCP is rearmed only after that FIFO and the current
+output barrier clear. During a multi-record logical write, rearming happens
+before the next bounded `:write_next` step, so responses and peer KeyUpdate
+messages continue to make progress without bypassing older input. Application
+active-once credit remains independent of this internal rearming.
+
+Timeout or sender death after transmission starts fails the connection closed;
+uncertain application bytes are never retried. Close and owner death abort an
+uncertain blocked output immediately, including for an infinite send timeout.
+Orderly close and fatal-alert output use a bounded writer shutdown; teardown
+releases the TCP port, monitors, timers, cursors, and writer process.
 
 ## STARTTLS and security boundaries
 

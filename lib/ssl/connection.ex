@@ -500,8 +500,8 @@ defmodule SSL.Connection do
       not :queue.is_empty(state.input) ->
         {:next_state, phase, state, [{:next_event, :internal, :drain_input} | actions]}
 
-      phase == :connected and ready_for_write?(state) ->
-        {:next_state, phase, state, [{:next_event, :internal, :write_next} | actions]}
+      phase == :connected and not state.closed and ready_for_write?(state) ->
+        continue(phase, state, [{:next_event, :internal, :write_next} | actions])
 
       true ->
         continue(phase, state, actions)
@@ -917,7 +917,12 @@ defmodule SSL.Connection do
 
   defp complete_output(phase, %{continuation: :application}, %{write: write} = state) do
     state = %{state | write: %{write | waiting: nil}}
-    drain_or_continue(phase, state)
+
+    if state.write.cursor == [] do
+      finish_write(state, :ok)
+    else
+      drain_or_continue(phase, state)
+    end
   end
 
   defp complete_output(phase, %{continuation: {:protocol, events, rest}}, state) do
@@ -991,7 +996,14 @@ defmodule SSL.Connection do
   end
 
   defp close_transport(state) do
-    if state.tcp, do: :gen_tcp.close(state.tcp)
+    if is_port(state.tcp) do
+      try do
+        Port.close(state.tcp)
+      rescue
+        ArgumentError -> :ok
+      end
+    end
+
     %{state | tcp: nil, machine: nil, armed: false, output: nil}
   end
 
