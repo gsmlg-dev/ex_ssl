@@ -72,8 +72,15 @@ defmodule SSL.HTTPFetchTransportContractTest do
     non_owner = Task.async(fn -> SSL.controlling_process(socket, self()) end)
     assert {:error, :not_owner} = Task.await(non_owner)
 
-    dead = spawn(fn -> :ok end)
+    dead =
+      spawn(fn ->
+        receive do
+          :exit -> :ok
+        end
+      end)
+
     dead_monitor = Process.monitor(dead)
+    send(dead, :exit)
     assert_receive {:DOWN, ^dead_monitor, :process, ^dead, :normal}
     assert {:error, :noproc} = SSL.controlling_process(socket, dead)
 
