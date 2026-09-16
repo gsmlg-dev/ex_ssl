@@ -9,7 +9,7 @@ certification, and OTP `:ssl` remains the recommended default.
 | Surface | Supported behavior |
 | --- | --- |
 | `SSL.connect/2,3,4` | Authenticated TLS 1.3 client connections and passive binary/raw STARTTLS upgrades. Connect succeeds only after CertificateVerify and Finished validation. |
-| `SSL.send/2` | Valid iodata of any logical size supported by available caller memory. Data is traversed without flattening the entire write and protected in records of at most 16,384 plaintext bytes. One logical write is admitted at a time; another caller receives `{:error, :busy}`. There is no automatic replay. |
+| `SSL.send/2` | Valid iodata of any logical size supported by available caller memory. Data is traversed without flattening the entire write and protected in records of at most 16,384 plaintext bytes. One logical write is admitted at a time; another caller receives `{:error, :busy}`. There is no automatic replay. An unfinished admitted send is settled promptly as `{:error, :closed}` after an authenticated peer closure makes further writes impossible; a send already acknowledged in full remains `:ok`. |
 | `SSL.recv/2,3` | Passive raw binary receive. Length zero returns available plaintext; a positive length waits for exactly that many bytes. One passive receive is admitted, and the maximum requested/buffered plaintext is 1 MiB. |
 | `SSL.setopts/2` | Atomic support for `active: false | :once`, `send_timeout`, and `send_timeout_close: true`. Unknown, duplicate, malformed, or unsupported options reject the whole request. |
 | `SSL.controlling_process/2` | Transfers the application owner and monitor. The connection process remains the TCP owner and sole owner of TLS state. Only the current application owner may transfer. |
@@ -121,8 +121,20 @@ active-once credit remains independent of this internal rearming.
 Timeout or sender death after transmission starts fails the connection closed;
 uncertain application bytes are never retried. Close and owner death abort an
 uncertain blocked output immediately, including for an infinite send timeout.
-Orderly close and fatal-alert output use a bounded writer shutdown; teardown
-releases the TCP port, monitors, timers, cursors, and writer process.
+Likewise, after an authenticated peer closure under the current closure policy,
+an unfinished admitted send settles promptly as `{:error, :closed}` independently
+of inbound drainage. Its deadline timer and sender monitor are cancelled, its
+admission is released, and its unsent cursor and retained write state are
+discarded. Stale writer acknowledgements, timers, and sender `DOWN` messages
+cannot produce a second completion. Plaintext authenticated before the closure
+remains available to passive `recv` or active-once delivery, with data before the
+terminal event. An already fully acknowledged logical send remains `:ok`.
+Abrupt transport failure retains its existing `:econnreset` classification; it
+is not treated as authenticated closure. Failure of the reciprocal close-notify
+writer after authenticated closure does not discard buffered plaintext or
+reclassify the terminal state. Orderly close and fatal-alert output use a bounded
+writer shutdown; teardown releases the TCP port, monitors, timers, cursors, and
+writer process.
 
 ## STARTTLS and security boundaries
 

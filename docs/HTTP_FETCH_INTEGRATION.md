@@ -105,6 +105,22 @@ traffic. If an output is blocked and its result is uncertain, abort closes the
 transport without replay rather than attempting to append close_notify behind
 it.
 
+An authenticated peer close that makes further application writes impossible
+settles an unfinished admitted `SSL.send/2` promptly as `{:error, :closed}`.
+This outbound settlement is independent of preserved inbound plaintext
+drainage: a passive consumer may await the send result without calling `recv`,
+then consume the response exactly once, followed by `{:error, :closed}`; an
+active-once consumer receives buffered data before its terminal closure event.
+The connection cancels the send timer, releases admission, demonitors the
+sender, and discards the cursor and retained write state for that operation, so
+an infinite or long send timeout does not delay the closure result and stale
+completion messages cannot reply twice. A logical send already fully acknowledged
+by the transport remains `:ok`; uncertain or partial bytes are not retried or
+replayed. Abrupt transport failure keeps its existing error classification rather
+than being converted to authenticated closure. Once authenticated closure is
+accepted, failure of the reciprocal close-notify writer does not discard the
+buffered response or reclassify the terminal state.
+
 The existing Manifold passive direct-TLS and STARTTLS subset remains supported.
 This work does not weaken its verification, plaintext-boundary, close, or
 receive-timeout behavior.
@@ -143,4 +159,6 @@ HTTP/2:
 - cancellation and connection teardown with no replay or leaked task/socket.
 
 Only those consumer tests can establish actual HTTP integration. The ex_ssl
-fixture establishes that the underlying transport contract is available.
+fixture establishes that the underlying transport contract is available; this
+library-only lifecycle behavior does not complete the separate http_fetch
+adapter migration.

@@ -468,6 +468,114 @@ defmodule SSL.HTTPFetchTransportContractTest do
     assert :ok = Peer.stop(peer)
   end
 
+  test "peer close settles an unfinished infinite-timeout send before buffered response drainage" do
+    assert_peer_close_settles_unfinished_send(:infinity, :complete_shutdown)
+  end
+
+  test "peer close settles an unfinished send before its finite deadline" do
+    assert_peer_close_settles_unfinished_send(5_000, :kill_shutdown_writer)
+  end
+
+  test "peer close settles a send after active-once credit is consumed with response buffered" do
+    parent = self()
+    first = "rejected"
+    buffered = "response remains buffered"
+    payload = :binary.copy("unfinished-active-upload-", 32_768)
+
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        receive do
+          :reject_upload -> :ok
+        end
+
+        assert :ok = :ssl.send(socket, first)
+        assert :ok = :ssl.send(socket, buffered)
+        send(parent, :active_rejection_sent)
+        assert :ok = :ssl.close(socket)
+      end)
+
+    {:ok, proxy} = Peer.start_record_gate_proxy(peer.port, self())
+    proxy_ref = proxy.ref
+
+    on_exit(fn ->
+      if Process.alive?(proxy.task.pid), do: Peer.stop_record_gate_proxy(proxy)
+
+      if Process.alive?(peer.task.pid) do
+        _ = :ssl.close(peer.listener)
+        _ = Task.shutdown(peer.task, 1_000)
+      end
+    end)
+
+    socket = connect(proxy, send_timeout: :infinity, active: :once)
+    {:connected, initial_state} = :sys.get_state(socket.pid)
+    writer = initial_state.writer
+    assert true = :erlang.suspend_process(writer)
+
+    try do
+      sender = Task.async(fn -> SSL.send(socket, payload) end)
+      pending = wait_for_admitted_write(socket.pid)
+      assert :erlang.iolist_size(pending.write.cursor) > 3 * 16_384
+      assert :ok = Peer.gate_server_records(proxy)
+      assert_receive {:tls_record_proxy, ^proxy_ref, :gated}, 1_000
+
+      send(peer.task.pid, :reject_upload)
+      assert_receive :active_rejection_sent, 1_000
+
+      records =
+        for count <- 1..3 do
+          assert_receive {:tls_record_proxy, ^proxy_ref, :queued, ^count}, 1_000
+          assert_receive {:tls_record_proxy, ^proxy_ref, :record, record}, 1_000
+          record
+        end
+
+      Enum.each(records, &send(socket.pid, {:tcp, initial_state.tcp, &1}))
+      wait_for_deferred_input(socket.pid, 3)
+
+      assert :ok = :sys.suspend(socket.pid)
+      assert true = :erlang.resume_process(writer)
+      wait_for_writer_idle(writer)
+      assert true = :erlang.suspend_process(writer)
+      assert :ok = :sys.resume(socket.pid)
+
+      assert {:ok, {:error, :closed}} =
+               Task.yield(sender, 1_000) ||
+                 flunk("send stayed pending after active-once credit was consumed")
+
+      assert_receive {:ssl, ^socket, ^first}, 1_000
+      refute_receive {:ssl, ^socket, _bytes}, 20
+      refute_receive {:ssl_closed, ^socket}, 20
+
+      assert {:connected, settled} = :sys.get_state(socket.pid)
+      assert settled.active == false
+      assert settled.write == nil
+      assert is_port(settled.tcp)
+      assert settled.output.kind == :close_notify
+      assert settled.size == byte_size(buffered)
+
+      assert true = :erlang.resume_process(writer)
+      settled = wait_for_peer_shutdown(socket.pid)
+      assert settled.tcp == nil
+      assert settled.output == nil
+      assert settled.size == byte_size(buffered)
+
+      writer_monitor = Process.monitor(writer)
+      Process.exit(writer, :kill)
+      assert_receive {:DOWN, ^writer_monitor, :process, ^writer, :killed}, 1_000
+      settled = wait_for_closed_writer_cleanup(socket.pid)
+      assert settled.size == byte_size(buffered)
+
+      connection_monitor = Process.monitor(socket.pid)
+      assert {:ok, ^buffered} = SSL.recv(socket, byte_size(buffered), 1_000)
+      assert_receive {:ssl_closed, ^socket}, 1_000
+      assert_receive {:DOWN, ^connection_monitor, :process, _, :normal}, 1_000
+      assert {:error, :closed} = SSL.recv(socket, 0, 1_000)
+      assert :ok = Peer.stop(peer)
+    after
+      resume_connection(socket.pid)
+      resume_if_suspended(writer)
+    end
+  end
+
   test "owner death during an admitted write fails closed and cleans up the writer" do
     {:ok, peer} =
       Peer.start(fn socket ->
@@ -647,6 +755,143 @@ defmodule SSL.HTTPFetchTransportContractTest do
     socket
   end
 
+  defp assert_peer_close_settles_unfinished_send(send_timeout, shutdown_outcome) do
+    parent = self()
+    response = "request rejected"
+    payload = :binary.copy("unfinished-upload-", 32_768)
+
+    {:ok, peer} =
+      Peer.start(fn socket ->
+        receive do
+          :reject_upload -> :ok
+        end
+
+        assert :ok = :ssl.send(socket, response)
+        send(parent, :early_response_sent)
+        assert :ok = :ssl.close(socket)
+      end)
+
+    {:ok, proxy} = Peer.start_record_gate_proxy(peer.port, self())
+    proxy_ref = proxy.ref
+
+    on_exit(fn ->
+      if Process.alive?(proxy.task.pid), do: Peer.stop_record_gate_proxy(proxy)
+
+      if Process.alive?(peer.task.pid) do
+        _ = :ssl.close(peer.listener)
+        _ = Task.shutdown(peer.task, 1_000)
+      end
+    end)
+
+    socket = connect(proxy, send_timeout: send_timeout)
+    {:connected, initial_state} = :sys.get_state(socket.pid)
+    writer = initial_state.writer
+    assert true = :erlang.suspend_process(writer)
+
+    try do
+      sender = Task.async(fn -> SSL.send(socket, payload) end)
+      pending = wait_for_admitted_write(socket.pid)
+      assert pending.write.size == byte_size(payload)
+      assert :erlang.iolist_size(pending.write.cursor) > 16_384
+      assert pending.output.kind == :application
+      assert :ok = Peer.gate_server_records(proxy)
+      assert_receive {:tls_record_proxy, ^proxy_ref, :gated}, 1_000
+
+      send(peer.task.pid, :reject_upload)
+      assert_receive :early_response_sent, 1_000
+
+      records =
+        for count <- 1..2 do
+          assert_receive {:tls_record_proxy, ^proxy_ref, :queued, ^count}, 1_000
+          assert_receive {:tls_record_proxy, ^proxy_ref, :record, record}, 1_000
+          record
+        end
+
+      Enum.each(records, &send(socket.pid, {:tcp, initial_state.tcp, &1}))
+      wait_for_deferred_input(socket.pid, 2)
+      started_at = System.monotonic_time(:millisecond)
+      assert :ok = :sys.suspend(socket.pid)
+      assert true = :erlang.resume_process(writer)
+      wait_for_writer_idle(writer)
+      assert true = :erlang.suspend_process(writer)
+      assert :ok = :sys.resume(socket.pid)
+
+      assert {:ok, {:error, :closed}} =
+               Task.yield(sender, 1_000) ||
+                 flunk("send stayed pending before response drainage")
+
+      elapsed = System.monotonic_time(:millisecond) - started_at
+      if is_integer(send_timeout), do: assert(elapsed < send_timeout)
+      if pending.write.timer, do: assert(Process.read_timer(pending.write.timer) == false)
+
+      assert {:connected, settled} = :sys.get_state(socket.pid)
+      assert settled.closed
+      assert is_port(settled.tcp)
+      assert settled.output.kind == :close_notify
+      assert settled.write == nil
+      assert settled.size == byte_size(response)
+
+      {:monitors, monitors} = Process.info(socket.pid, :monitors)
+      refute {:process, sender.pid} in monitors
+
+      send(socket.pid, {:writer_result, writer, pending.output.token, :ok})
+      send(socket.pid, {:output_timeout, pending.output.token})
+      send(socket.pid, {:write_timeout, pending.write.token})
+      send(socket.pid, {:DOWN, pending.write.monitor, :process, sender.pid, :normal})
+
+      assert {:connected, after_stale} = :sys.get_state(socket.pid)
+      assert after_stale.write == nil
+      assert after_stale.output.kind == :close_notify
+      assert after_stale.size == byte_size(response)
+
+      writer_cleanup = finish_test_peer_shutdown(writer, shutdown_outcome)
+      after_shutdown = wait_for_peer_shutdown(socket.pid)
+      assert after_shutdown.tcp == nil
+      assert after_shutdown.output == nil
+      assert after_shutdown.size == byte_size(response)
+      if shutdown_outcome == :kill_shutdown_writer, do: assert(after_shutdown.writer == nil)
+
+      connection_monitor = Process.monitor(socket.pid)
+      assert {:ok, ^response} = SSL.recv(socket, byte_size(response), 1_000)
+      assert_receive {:DOWN, ^connection_monitor, :process, _, :normal}, 1_000
+
+      if writer_cleanup do
+        assert_receive {:DOWN, ^writer_cleanup, :process, _, :killed}, 1_000
+      end
+
+      assert {:error, :closed} = SSL.recv(socket, 0, 1_000)
+      assert :ok = Peer.stop(peer)
+    after
+      resume_connection(socket.pid)
+      resume_if_suspended(writer)
+    end
+  end
+
+  defp resume_if_suspended(pid) do
+    if Process.alive?(pid), do: :erlang.resume_process(pid)
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp resume_connection(pid) do
+    if Process.alive?(pid), do: :sys.resume(pid, 50)
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp finish_test_peer_shutdown(writer, :complete_shutdown) do
+    monitor = Process.monitor(writer)
+    assert true = :erlang.resume_process(writer)
+    monitor
+  end
+
+  defp finish_test_peer_shutdown(writer, :kill_shutdown_writer) do
+    monitor = Process.monitor(writer)
+    Process.exit(writer, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^writer, :killed}, 1_000
+    nil
+  end
+
   defp wait_for_buffered(pid, minimum, attempts \\ 200)
   defp wait_for_buffered(_pid, _minimum, 0), do: flunk("plaintext was not buffered")
 
@@ -680,13 +925,74 @@ defmodule SSL.HTTPFetchTransportContractTest do
 
   defp wait_for_admitted_write(pid, attempts) do
     case :sys.get_state(pid) do
-      {:connected, %{write: %{from: from, waiting: waiting}}}
+      {:connected, %{write: %{from: from, waiting: waiting}} = state}
       when not is_nil(from) and not is_nil(waiting) ->
-        :ok
+        state
 
       _ ->
         Process.sleep(1)
         wait_for_admitted_write(pid, attempts - 1)
+    end
+  end
+
+  defp wait_for_deferred_input(pid, minimum_events, attempts \\ 200)
+  defp wait_for_deferred_input(_pid, _minimum_events, 0), do: flunk("TLS input was not deferred")
+
+  defp wait_for_deferred_input(pid, minimum_events, attempts) do
+    case :sys.get_state(pid) do
+      {:connected, %{input: input}} ->
+        if :queue.len(input) >= minimum_events do
+          :ok
+        else
+          Process.sleep(1)
+          wait_for_deferred_input(pid, minimum_events, attempts - 1)
+        end
+
+      _ ->
+        Process.sleep(1)
+        wait_for_deferred_input(pid, minimum_events, attempts - 1)
+    end
+  end
+
+  defp wait_for_writer_idle(writer, attempts \\ 200)
+  defp wait_for_writer_idle(_writer, 0), do: flunk("application writer did not finish its output")
+
+  defp wait_for_writer_idle(writer, attempts) do
+    case Process.info(writer, [:status, :current_function, :messages]) do
+      [status: :waiting, current_function: {SSL.ConnectionWriter, :loop, 2}, messages: []] ->
+        :ok
+
+      _ ->
+        Process.sleep(1)
+        wait_for_writer_idle(writer, attempts - 1)
+    end
+  end
+
+  defp wait_for_peer_shutdown(pid, attempts \\ 200)
+  defp wait_for_peer_shutdown(_pid, 0), do: flunk("peer shutdown did not finish")
+
+  defp wait_for_peer_shutdown(pid, attempts) do
+    case :sys.get_state(pid) do
+      {:connected, %{closed: true, tcp: nil, output: nil} = state} ->
+        state
+
+      _ ->
+        Process.sleep(1)
+        wait_for_peer_shutdown(pid, attempts - 1)
+    end
+  end
+
+  defp wait_for_closed_writer_cleanup(pid, attempts \\ 200)
+  defp wait_for_closed_writer_cleanup(_pid, 0), do: flunk("closed writer was not cleaned up")
+
+  defp wait_for_closed_writer_cleanup(pid, attempts) do
+    case :sys.get_state(pid) do
+      {:connected, %{closed: true, writer: nil, writer_monitor: nil} = state} ->
+        state
+
+      _ ->
+        Process.sleep(1)
+        wait_for_closed_writer_cleanup(pid, attempts - 1)
     end
   end
 

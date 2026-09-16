@@ -425,6 +425,26 @@ defmodule SSL.Connection do
   def handle_event(
         :info,
         {:DOWN, monitor, :process, pid, _reason},
+        phase,
+        %{
+          writer_monitor: monitor,
+          writer: pid,
+          closed: true
+        } = state
+      ) do
+    if state.output, do: cancel_timer(state.output.timer)
+
+    finish_shutdown(phase, :peer, %{
+      state
+      | writer: nil,
+        writer_monitor: nil,
+        output: nil
+    })
+  end
+
+  def handle_event(
+        :info,
+        {:DOWN, monitor, :process, pid, _reason},
         _phase,
         %{writer_monitor: monitor, writer: pid} = state
       ),
@@ -630,7 +650,7 @@ defmodule SSL.Connection do
     Socket.mark_terminal(state.socket, true)
 
     if rest == [] do
-      state = %{state | closed: true, armed: false}
+      state = %{state | closed: true, armed: false} |> settle_write({:error, :closed})
 
       case begin_shutdown(state, :peer, []) do
         {:ok, state} -> {:paused, phase, state}
@@ -865,10 +885,17 @@ defmodule SSL.Connection do
   end
 
   defp finish_write(state, result) do
-    :gen_statem.reply(state.write.from, result)
-    cancel_timer(state.write.timer)
-    Process.demonitor(state.write.monitor, [:flush])
-    drain_or_continue(:connected, %{state | write: nil})
+    state = settle_write(state, result)
+    drain_or_continue(:connected, state)
+  end
+
+  defp settle_write(%{write: nil} = state, _result), do: state
+
+  defp settle_write(%{write: write} = state, result) do
+    if write.from, do: :gen_statem.reply(write.from, result)
+    cancel_timer(write.timer)
+    Process.demonitor(write.monitor, [:flush])
+    %{state | write: nil}
   end
 
   defp start_output(
