@@ -81,7 +81,8 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       :client_finished_record,
       :client_application_state,
       :server_application_state,
-      :transcript
+      :transcript,
+      :negotiated_protocol
     ]
     defstruct @enforce_keys
 
@@ -92,7 +93,8 @@ defmodule SSL.Protocol.ServerFlightVerifier do
             client_finished_record: binary(),
             client_application_state: TrafficState.t(),
             server_application_state: TrafficState.t(),
-            transcript: Transcript.t()
+            transcript: Transcript.t(),
+            negotiated_protocol: binary() | nil
           }
   end
 
@@ -108,7 +110,8 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       :transcript,
       :server_handshake_state
     ]
-    defstruct @enforce_keys ++ [verified_peer: nil, certificate_request_context: nil]
+    defstruct @enforce_keys ++
+                [verified_peer: nil, certificate_request_context: nil, negotiated_protocol: nil]
   end
 
   @default_max_records 64
@@ -123,7 +126,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
     :offered_extension_ids,
     :allowed_signature_schemes
   ]
-  @option_keys [:max_records, :customize_hostname_check | @server_flight_option_keys]
+  @option_keys [:max_records, :depth, :customize_hostname_check | @server_flight_option_keys]
 
   @type fatal_alert ::
           :bad_record_mac
@@ -217,6 +220,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
        %{
          state
          | phase: :certificate_or_request,
+           negotiated_protocol: selected_alpn(message),
            transcript: Transcript.append(state.transcript, encoded)
        }}
     end
@@ -295,14 +299,15 @@ defmodule SSL.Protocol.ServerFlightVerifier do
          {:ok, secrets} <- derive_handshake_secrets(input, suite, hash, peer_public_key),
          {:ok, messages, server_handshake_state} <-
            decrypt_records(input.records, secrets.server_handshake_state, config),
-         {:ok, verified_peer, transcript} <-
+         {:ok, verified_peer, transcript, negotiated_protocol} <-
            verify_messages(messages, input, secrets, config, offer),
          {:ok, result} <-
            finish_client_flight(
              verified_peer,
              transcript,
              secrets,
-             server_handshake_state
+             server_handshake_state,
+             negotiated_protocol
            ) do
       {:ok, result}
     end
@@ -660,7 +665,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
            decode_message(finished, ServerFinished, options),
          :ok <- verify_server_finished(finished, transcript, secrets),
          transcript = Transcript.append(transcript, finished.encoded) do
-      {:ok, verified_peer, transcript}
+      {:ok, verified_peer, transcript, selected_alpn(encrypted_extensions)}
     end
   end
 
@@ -768,7 +773,8 @@ defmodule SSL.Protocol.ServerFlightVerifier do
     chain = Enum.map(entries, & &1.der)
 
     case PKIX.verify(chain, input.trust_source, input.identity,
-           customize_hostname_check: config.hostname_check
+           customize_hostname_check: config.hostname_check,
+           depth: config.depth
          ) do
       {:ok, verified_peer} ->
         {:ok, verified_peer}
@@ -844,6 +850,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
         client_finished_record: client_finished_record,
         client_application_state: client_application_state,
         server_application_state: server_application_state,
+        negotiated_protocol: state.negotiated_protocol,
         transcript: Transcript.append(transcript, client_finished)
       }
 
@@ -886,7 +893,13 @@ defmodule SSL.Protocol.ServerFlightVerifier do
     end
   end
 
-  defp finish_client_flight(verified_peer, transcript, secrets, server_handshake_state) do
+  defp finish_client_flight(
+         verified_peer,
+         transcript,
+         secrets,
+         server_handshake_state,
+         negotiated_protocol
+       ) do
     transcript_hash = Transcript.digest(transcript)
 
     with {:ok, client_application_secret} <-
@@ -929,9 +942,17 @@ defmodule SSL.Protocol.ServerFlightVerifier do
          client_finished_record: client_finished_record,
          client_application_state: client_application_state,
          server_application_state: server_application_state,
+         negotiated_protocol: negotiated_protocol,
          transcript: Transcript.append(transcript, client_finished)
        }}
     end
+  end
+
+  defp selected_alpn(%EncryptedExtensions{extensions: extensions}) do
+    Enum.find_value(extensions, fn
+      {:alpn, protocol} -> protocol
+      _extension -> nil
+    end)
   end
 
   defp message_types(messages) do
@@ -959,13 +980,15 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       case Keyword.get(options, :max_records, @default_max_records) do
         maximum when is_integer(maximum) and maximum > 0 ->
           server_flight_options =
-            Keyword.drop(options, [:max_records, :customize_hostname_check])
+            Keyword.drop(options, [:max_records, :depth, :customize_hostname_check])
 
           with :ok <- validate_signature_policy_option(server_flight_options),
-               :ok <- validate_hostname_check_option(options) do
+               :ok <- validate_hostname_check_option(options),
+               :ok <- validate_depth_option(options) do
             {:ok,
              %{
                max_records: maximum,
+               depth: Keyword.get(options, :depth, 10),
                hostname_check: Keyword.get(options, :customize_hostname_check, []),
                max_handshake_length:
                  Keyword.get(options, :max_handshake_length, @maximum_handshake_length),
@@ -1000,6 +1023,13 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       [] -> :ok
       [match_fun: fun] when is_function(fun, 2) -> :ok
       _other -> alert(:decode_error, {:invalid_options, :customize_hostname_check})
+    end
+  end
+
+  defp validate_depth_option(options) do
+    case Keyword.get(options, :depth, 10) do
+      depth when is_integer(depth) and depth >= 0 -> :ok
+      _depth -> alert(:decode_error, {:invalid_options, :depth})
     end
   end
 

@@ -29,7 +29,7 @@ defmodule SSL.Protocol.HandshakeMachineTest do
     assert {:ok, machine, [], []} = HandshakeMachine.feed(machine, @capture.record_1)
     assert {:ok, machine, [], []} = HandshakeMachine.feed(machine, @capture.record_2)
 
-    assert {:ok, _machine, [client_finished], [:connected]} =
+    assert {:ok, _machine, [client_finished], [{:connected, nil}]} =
              HandshakeMachine.feed(machine, @capture.record_3)
 
     assert client_finished == @capture.client_finished_record
@@ -43,7 +43,9 @@ defmodule SSL.Protocol.HandshakeMachineTest do
 
     {:ok, machine, [], []} = HandshakeMachine.feed(machine, @capture.record_1)
     {:ok, machine, [], []} = HandshakeMachine.feed(machine, @capture.record_2)
-    {:ok, machine, [_finished], [:connected]} = HandshakeMachine.feed(machine, @capture.record_3)
+
+    {:ok, machine, [_finished], [{:connected, nil}]} =
+      HandshakeMachine.feed(machine, @capture.record_3)
 
     server_write = machine.read_state
     client_read = machine.write_state
@@ -469,7 +471,7 @@ defmodule SSL.Protocol.HandshakeMachineTest do
 
     {:ok, machine, [], []} = HandshakeMachine.feed(machine, @capture.record_1)
     {:ok, machine, [], []} = HandshakeMachine.feed(machine, @capture.record_2)
-    {:ok, machine, [_], [:connected]} = HandshakeMachine.feed(machine, @capture.record_3)
+    {:ok, machine, [_], [{:connected, nil}]} = HandshakeMachine.feed(machine, @capture.record_3)
     machine
   end
 

@@ -2,9 +2,11 @@ defmodule SSL do
   @moduledoc """
   OTP `:ssl`-compatible client facade for the implemented `ex_ssl` feature subset.
 
-  This experimental client supports TLS 1.3, binary passive raw sockets and
-  mandatory peer verification. These restricted defaults differ from OTP.
-  Unsupported options return explicit `{:error, {:options, reason}}` errors.
+  This experimental client supports TLS 1.3, binary raw sockets, passive and
+  active-once delivery, application ownership transfer, authenticated ALPN,
+  bounded streaming writes, and mandatory peer verification. These restricted
+  defaults differ from OTP. Unsupported options return explicit
+  `{:error, {:options, reason}}` errors.
 
   STARTTLS callers must own a passive binary/raw TCP socket, fully consume and
   validate the application's upgrade response, and reject any buffered plaintext.
@@ -13,7 +15,7 @@ defmodule SSL do
   never resume. A socket belonging to another process is left untouched.
   """
   import Kernel, except: [send: 2]
-  alias SSL.{Connection, Options, Socket}
+  alias SSL.{Connection, IodataCursor, Options, Socket}
 
   @spec connect(:gen_tcp.socket(), list()) :: {:ok, Socket.t()} | {:error, term()}
   def connect(tcp_socket, options), do: connect(tcp_socket, options, :infinity)
@@ -48,8 +50,8 @@ defmodule SSL do
                :binary,
                active: false,
                packet: :raw,
-               send_timeout: 5_000,
-               send_timeout_close: true,
+               send_timeout: options.send_timeout,
+               send_timeout_close: options.send_timeout_close,
                buffer: 16_640
              ],
              Options.remaining(deadline)
@@ -63,19 +65,31 @@ defmodule SSL do
 
   def connect(_, _, _, _), do: {:error, :badarg}
 
-  @doc "Writes iodata once. A write is limited to 1 MiB; concurrent writes return `:busy`."
+  @doc "Writes iodata as one ordered logical write. Concurrent writes return `:busy`."
   @spec send(Socket.t(), iodata()) :: :ok | {:error, term()}
   def send(socket, data) do
-    size = :erlang.iolist_size(data)
-
-    if size > Connection.max_write_size() do
-      {:error, :emsgsize}
-    else
-      with {:ok, token} <- call(socket, :reserve_write), do: call(socket, {:send, token, data})
-    end
-  rescue
-    ArgumentError -> {:error, :badarg}
+    with {:ok, cursor, size} <- IodataCursor.new(data),
+         {:ok, token} <- call(socket, :reserve_write),
+         do: call(socket, {:send, token, cursor, size})
   end
+
+  @doc "Atomically changes supported application delivery and send options."
+  @spec setopts(Socket.t(), list()) :: :ok | {:error, term()}
+  def setopts(socket, options) do
+    with {:ok, normalized} <- Options.normalize_setopts(options),
+         do: call(socket, {:setopts, normalized})
+  end
+
+  @doc "Transfers application ownership while the TLS process retains the TCP socket."
+  @spec controlling_process(Socket.t(), pid()) :: :ok | {:error, term()}
+  def controlling_process(socket, owner) when is_pid(owner),
+    do: call(socket, {:controlling_process, owner})
+
+  def controlling_process(_, _), do: {:error, :badarg}
+
+  @doc "Returns the authenticated ALPN selection, if the server negotiated one."
+  @spec negotiated_protocol(Socket.t()) :: {:ok, binary()} | {:error, term()}
+  def negotiated_protocol(socket), do: call(socket, :negotiated_protocol)
 
   @doc "Receives available bytes for length 0, or exactly length bytes. Timeout retains buffered data."
   @spec recv(Socket.t(), non_neg_integer(), timeout()) :: {:ok, binary()} | {:error, term()}

@@ -45,6 +45,7 @@ defmodule SSL.PKIX do
     :max_der_bytes,
     :max_total_der_bytes,
     :max_pem_bytes,
+    :depth,
     :customize_hostname_check
   ]
 
@@ -55,6 +56,7 @@ defmodule SSL.PKIX do
           | {:max_der_bytes, pos_integer()}
           | {:max_total_der_bytes, pos_integer()}
           | {:max_pem_bytes, pos_integer()}
+          | {:depth, non_neg_integer()}
           | {:customize_hostname_check, keyword()}
   @type error_reason ::
           :empty_certificate_chain
@@ -94,7 +96,8 @@ defmodule SSL.PKIX do
     with :ok <- validate_identity(identity),
          {:ok, chain} <- decode_chain(chain, options),
          {:ok, trust_anchors} <- normalize_trust(trust_source, options),
-         {:ok, public_key} <- validate_path(chain, trust_anchors),
+         {:ok, public_key} <-
+           validate_path(chain, trust_anchors, Keyword.get(options, :depth, 10)),
          [leaf | _] <- chain,
          :ok <-
            verify_identity(
@@ -241,12 +244,12 @@ defmodule SSL.PKIX do
     _kind, _reason -> :error
   end
 
-  defp validate_path(chain, trust_anchors) do
+  defp validate_path(chain, trust_anchors, depth) do
     Enum.reduce_while(trust_anchors, {:error, {:path_validation_failed, :unknown_ca}}, fn anchor,
                                                                                           _error ->
       path = otp_path(chain, anchor)
 
-      case safe_path_validation(anchor.der, path) do
+      case safe_path_validation(anchor.der, path, depth) do
         {:ok, public_key} -> {:halt, {:ok, public_key}}
         {:error, reason} -> {:cont, {:error, {:path_validation_failed, reason}}}
       end
@@ -267,8 +270,8 @@ defmodule SSL.PKIX do
     end
   end
 
-  defp safe_path_validation(anchor_der, path) do
-    case :public_key.pkix_path_validation(anchor_der, path, []) do
+  defp safe_path_validation(anchor_der, path, depth) do
+    case :public_key.pkix_path_validation(anchor_der, path, max_path_length: depth) do
       {:ok, {public_key_info, _policy_tree}} ->
         {:ok, certificate_verify_key(public_key_info)}
 
@@ -505,7 +508,7 @@ defmodule SSL.PKIX do
       limit_options = Keyword.drop(options, [:customize_hostname_check])
 
       if Enum.all?(limit_options, fn {key, value} ->
-           key in @option_keys and valid_limit?(value)
+           key in @option_keys and valid_pkix_option?(key, value)
          end) and
            valid_hostname_options?(Keyword.get(options, :customize_hostname_check, [])) do
         {:ok,
@@ -529,6 +532,8 @@ defmodule SSL.PKIX do
   defp limits(_options), do: {:error, {:invalid_input, :options}}
 
   defp valid_limit?(value), do: is_integer(value) and value > 0
+  defp valid_pkix_option?(:depth, value), do: is_integer(value) and value >= 0
+  defp valid_pkix_option?(_key, value), do: valid_limit?(value)
 
   defp valid_hostname_options?([]), do: true
   defp valid_hostname_options?(match_fun: fun) when is_function(fun, 2), do: true

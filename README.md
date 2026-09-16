@@ -7,7 +7,11 @@
 
 The OTP application is `:ex_ssl`. The public compatibility module is `SSL` (`Elixir.SSL`), which does not conflict with Erlang's built-in `:ssl` module.
 
-> **Status:** experimental TLS 1.3 client runtime under validation for an opt-in Manifold backend. The public API supports authenticated connections, passive binary/raw application traffic, and TCP-to-TLS upgrades. See the [compatibility matrix](docs/COMPATIBILITY.md) for the exact scope, test evidence, restrictions, and consumer gates. OTP `:ssl` remains the default recommendation.
+> **Status:** experimental TLS 1.3 client runtime with authenticated connections,
+> passive and active-once binary/raw traffic, application ownership transfer,
+> ALPN lookup, bounded streaming writes, and TCP-to-TLS upgrades. See the
+> [compatibility matrix](docs/COMPATIBILITY.md) for exact restrictions. OTP
+> `:ssl` remains the default recommendation.
 
 ## Installation
 
@@ -16,7 +20,7 @@ Once published, add the `ex_ssl` package to your dependencies:
 ```elixir
 def deps do
   [
-    {:ex_ssl, "~> 0.1.0"}
+    {:ex_ssl, "~> 0.2.0"}
   ]
 end
 ```
@@ -81,10 +85,11 @@ feature subset.
 
 The initial compatibility baseline is the Erlang/OTP 29 `:ssl` client API.
 
-Implemented client functions are `connect/2,3,4`, `send/2`, `recv/2,3`, and
-`close/1`. Calls return success only after CertificateVerify and Finished
-verification and transmission of client Finished. The connection runs as a
-temporary supervised `:gen_statem`; a failed session is never restarted.
+Implemented client functions are `connect/2,3,4`, `send/2`, `recv/2,3`,
+`close/1`, `setopts/2`, `controlling_process/2`, and
+`negotiated_protocol/1`. Calls return success only after CertificateVerify and
+Finished verification and transmission of client Finished. The connection runs
+as a temporary supervised `:gen_statem`; a failed session is never restarted.
 
 Defaults are deliberately restricted to binary, passive, raw, verified TLS 1.3.
 They differ from OTP's defaults. Supported options and receive/upgrade ownership
@@ -95,13 +100,10 @@ The wider roadmap (not implemented API) includes:
 ```text
 close/2
 shutdown/2
-setopts/2
 getopts/2
-controlling_process/2
 peername/1
 sockname/1
 peercert/1
-negotiated_protocol/1
 connection_information/1,2
 getstat/1,2
 update_keys/2
@@ -256,15 +258,11 @@ The implementation uses OTP `:crypto` and `:public_key` for cryptographic primit
 
 ## Development status
 
-The foundation gate, the Phase 3D/4A deterministic wire/parsing milestone, and the pure Phase 4 authenticated server-flight gate are complete. Development continues through these staged gates:
-
-1. first authenticated TLS 1.3 connection;
-2. application data;
-3. OTP active/passive compatibility;
-4. STARTTLS;
-5. broader OTP API/options;
-6. KeyUpdate/exporters/resumption;
-7. verified real-world profiles and hardening.
+The authenticated TLS 1.3 client, passive/active-once raw application traffic,
+STARTTLS, ownership transfer, public ALPN, KeyUpdate handling, and bounded
+multi-record writes are implemented. Development continues toward broader OTP
+API/options, active modes, packet modes, exporters/resumption, verified
+real-world profiles, performance work, and independent security review.
 
 See:
 
@@ -286,15 +284,15 @@ Cryptographic and transcript operations are checked against independent known re
 
 Parsers are tested across arbitrary TCP, record, and handshake fragmentation boundaries.
 
-### Planned interoperability tests
+### Interoperability tests
 
-The compatibility harness is currently a skeleton. Future phases will connect
-`ex_ssl` to independent TLS implementations such as OTP `:ssl` and OpenSSL.
+Integration tests connect ex_ssl to generated local OTP `:ssl` peers and
+OpenSSL. The dedicated Caddy workflow validates fingerprint behavior.
 
-### Planned differential compatibility tests
+### Differential compatibility tests
 
-Future phases will run equivalent socket/API scenarios against `:ssl` and `SSL`,
-comparing externally visible behavior.
+Focused scenarios compare OTP `:ssl` and `SSL` behavior for implemented receive,
+path-depth, ownership, timeout, and active-mode semantics.
 
 A compatibility claim is not complete until covered by tests.
 

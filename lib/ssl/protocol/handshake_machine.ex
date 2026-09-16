@@ -33,6 +33,7 @@ defmodule SSL.Protocol.HandshakeMachine do
     :server_hello,
     :read_state,
     :write_state,
+    :negotiated_protocol,
     :phase,
     :framer,
     :verifier,
@@ -41,7 +42,8 @@ defmodule SSL.Protocol.HandshakeMachine do
     options: []
   ]
 
-  @type event :: :connected | {:application_data, binary()} | :closed
+  @type event ::
+          {:connected, binary() | nil} | {:application_data, binary()} | :closed
   @type t :: %__MODULE__{}
 
   @spec init(Materialized.t(), term(), SSL.PKIX.identity(), keyword()) ::
@@ -262,10 +264,13 @@ defmodule SSL.Protocol.HandshakeMachine do
                 key_pair: nil,
                 hrr_transcript: nil,
                 read_state: result.server_application_state,
-                write_state: result.client_application_state
+                write_state: result.client_application_state,
+                negotiated_protocol: result.negotiated_protocol
             }
 
-            {:cont, {:ok, connected, out ++ records, events ++ [:connected]}}
+            {:cont,
+             {:ok, connected, out ++ records,
+              events ++ [{:connected, result.negotiated_protocol}]}}
 
           {:error, _} = error ->
             {:halt, error}
@@ -604,6 +609,7 @@ defmodule SSL.Protocol.HandshakeMachine do
     do:
       Keyword.take(options, [
         :customize_hostname_check,
+        :depth,
         :max_handshake_length,
         :max_certificate_count,
         :max_total_certificate_bytes,

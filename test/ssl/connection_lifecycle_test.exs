@@ -231,10 +231,16 @@ defmodule SSL.ConnectionLifecycleTest do
     assert {:error, :closed} = Task.await(receiver)
     assert {:error, :closed} = SSL.recv(socket, 0, 0)
     assert {:error, :closed} = SSL.send(socket, [])
+    assert {:error, :closed} = SSL.setopts(socket, active: :once)
+    assert {:error, :closed} = SSL.controlling_process(socket, self())
+    assert {:error, :closed} = SSL.negotiated_protocol(socket)
+    assert {:error, :badarg} = SSL.setopts(:not_a_socket, active: false)
+    assert {:error, :badarg} = SSL.controlling_process(:not_a_socket, self())
+    assert {:error, :badarg} = SSL.negotiated_protocol(:not_a_socket)
     Peer.stop(peer)
   end
 
-  test "limits and malformed calls do not send or consume application data" do
+  test "receive limits and malformed calls do not send or consume application data" do
     {:ok, peer} =
       Peer.start(fn socket ->
         assert {:ok, "valid"} = :ssl.recv(socket, 5, 5_000)
@@ -251,7 +257,6 @@ defmodule SSL.ConnectionLifecycleTest do
     unrepresentable_timeout = end_time - System.monotonic_time(:millisecond) + 1_000
 
     assert {:error, :badarg} = SSL.send(socket, [:invalid])
-    assert {:error, :emsgsize} = SSL.send(socket, :binary.copy("x", 1_048_577))
     assert {:error, :badarg} = SSL.recv(socket, -1, 0)
     assert {:error, :badarg} = SSL.recv(socket, 0, -1)
     assert {:error, :badarg} = SSL.recv(socket, 0, unrepresentable_timeout)

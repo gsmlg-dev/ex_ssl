@@ -37,7 +37,7 @@ defmodule SSL.Protocol.CertificateRequestCompatibilityTest do
     assert {:ok, machine, [], []} = HandshakeMachine.feed(machine, flight.record_1)
     assert {:ok, machine, [], []} = HandshakeMachine.feed(machine, flight.record_2)
 
-    assert {:ok, %{phase: :connected}, [certificate, finished], [:connected]} =
+    assert {:ok, %{phase: :connected}, [certificate, finished], [{:connected, nil}]} =
              HandshakeMachine.feed(machine, flight.record_3)
 
     assert certificate == flight.client_empty_certificate_record

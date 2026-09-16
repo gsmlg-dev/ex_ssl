@@ -40,4 +40,13 @@ jobs:
         run: MIX_ENV=test mix compile --warnings-as-errors
 
       - name: Run mandatory OTP and OpenSSL interoperability tests
-        run: mix test --include integration test/ssl/connection_lifecycle_test.exs test/ssl/otp_reference_test.exs test/ssl/connection_interop_test.exs
+        run: >-
+          mix test --include integration
+          test/ssl/connection_lifecycle_test.exs
+          test/ssl/otp_reference_test.exs
+          test/ssl/connection_interop_test.exs
+          test/ssl/depth_interop_test.exs
+          test/ssl/input_ordering_regression_test.exs
+          test/ssl/connection_output_test.exs
+          test/ssl/connection_backpressure_test.exs
+          test/ssl/http_fetch_transport_contract_test.exs
