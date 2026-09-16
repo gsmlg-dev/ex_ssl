@@ -390,7 +390,7 @@ defmodule SSL.Connection do
         phase,
         %{writer: writer, output: %{token: token} = output} = state
       ),
-      do: output_failed(phase, output, %{state | output: nil}, reason)
+      do: output_failed(phase, output, state, reason)
 
   def handle_event(
         :info,
@@ -398,7 +398,7 @@ defmodule SSL.Connection do
         phase,
         %{output: %{token: token} = output} = state
       ),
-      do: output_failed(phase, output, %{state | output: nil}, :timeout)
+      do: output_failed(phase, output, state, :timeout)
 
   def handle_event(:info, {:write_timeout, token}, _phase, %{write: %{token: token}} = state),
     do: fail(state, :timeout)
@@ -565,19 +565,19 @@ defmodule SSL.Connection do
   @impl true
   def terminate(_reason, _phase, state) do
     Socket.mark_terminal(state.socket, false)
-    if state.tcp, do: :gen_tcp.close(state.tcp)
     cancel_timer(state.handshake_timer)
 
     if state.recv do
       cancel_timer(state.recv.timer)
-      Process.demonitor(state.recv.monitor, [:flush])
+      if state.recv.monitor, do: Process.demonitor(state.recv.monitor, [:flush])
     end
 
-    if state.write, do: Process.demonitor(state.write.monitor, [:flush])
+    if state.write && state.write.monitor, do: Process.demonitor(state.write.monitor, [:flush])
     if state.write, do: cancel_timer(state.write.timer)
     if state.writer, do: Process.exit(state.writer, :kill)
     if state.writer_monitor, do: Process.demonitor(state.writer_monitor, [:flush])
-    Process.demonitor(state.owner_monitor, [:flush])
+    if state.owner_monitor, do: Process.demonitor(state.owner_monitor, [:flush])
+    close_transport(state)
     :ok
   end
 
@@ -765,6 +765,12 @@ defmodule SSL.Connection do
   end
 
   defp continue(phase, state, actions \\ [])
+
+  # Delivery may exhaust the buffer before reciprocal close_notify completes.
+  # Keep its deadline serviceable instead of entering termination mid-output.
+  defp continue(phase, %{closed: true, size: 0, output: output} = state, actions)
+       when not is_nil(output),
+       do: {:next_state, phase, state, actions}
 
   defp continue(_phase, %{closed: true, size: 0} = state, actions) do
     notify_pending(state, {:error, :closed})
@@ -1023,7 +1029,18 @@ defmodule SSL.Connection do
   end
 
   defp close_transport(state) do
+    if state.output, do: cancel_timer(state.output.timer)
+
+    # Port.close does not block the callback, but inet can retain the port
+    # while flushing. Discard pending output at this terminal boundary;
+    # leave ordinary, acknowledged empty-queue closes graceful.
     if is_port(state.tcp) do
+      pending = :inet.getstat(state.tcp, [:send_pend])
+
+      if state.output != nil or match?({:ok, [{:send_pend, size}]} when size > 0, pending) do
+        _ = :inet.setopts(state.tcp, linger: {true, 0})
+      end
+
       try do
         Port.close(state.tcp)
       rescue

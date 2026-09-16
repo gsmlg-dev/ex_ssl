@@ -6,6 +6,50 @@ defmodule SSL.ConnectionOutputTest do
 
   @moduletag :integration
 
+  test "termination cancels every retained timer and is safe after partial initialization" do
+    {:ok, options} = Options.normalize("exssl.test", Peer.client_options())
+    {:ok, deadline} = Options.deadline(60_000)
+    status = :atomics.new(1, signed: false)
+    {:ok, connection} = Connection.start_link({self(), make_ref(), status, options, deadline})
+    {:handoff, initial} = :sys.get_state(connection)
+    writer_monitor = Process.monitor(initial.writer)
+
+    # No transport has been attached; termination must still cancel the
+    # handshake deadline and release its writer and monitors.
+    assert :ok = :sys.terminate(connection, :normal, 1_000)
+    assert_receive {:DOWN, ^writer_monitor, :process, _, :killed}, 1_000
+    assert Process.read_timer(initial.handshake_timer) == false
+
+    timers = for _ <- 1..4, do: Process.send_after(self(), :unexpected_timer, 60_000)
+    [handshake, output, recv, write] = timers
+    monitors = for _ <- 1..3, do: Process.monitor(self())
+    [owner_monitor, recv_monitor, write_monitor] = monitors
+
+    state = %Connection.State{
+      socket: initial.socket,
+      owner_monitor: owner_monitor,
+      handshake_timer: handshake,
+      output: %{timer: output},
+      recv: %{timer: recv, monitor: recv_monitor},
+      write: %{timer: write, monitor: write_monitor}
+    }
+
+    on_exit(fn -> Enum.each(timers, &Process.cancel_timer/1) end)
+
+    assert :ok = Connection.terminate(:test_failure, :connected, state)
+    assert :ok = Connection.terminate(:test_failure, :connected, state)
+    assert Enum.map(timers, &Process.read_timer/1) == [false, false, false, false]
+
+    {:ok, tcp} = :gen_tcp.listen(0, active: false)
+    assert true = Port.close(tcp)
+    assert :ok = Connection.terminate(:test_failure, :connected, %{state | tcp: tcp})
+
+    assert :ok =
+             Connection.terminate(:test_failure, :handoff, %Connection.State{
+               socket: initial.socket
+             })
+  end
+
   test "the handshake deadline cancels a ClientHello blocked in the connection writer" do
     {:ok, listener} =
       :gen_tcp.listen(0, [:binary, active: false, packet: :raw, reuseaddr: true])

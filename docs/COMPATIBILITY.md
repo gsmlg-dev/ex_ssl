@@ -136,6 +136,18 @@ reclassify the terminal state. Orderly close and fatal-alert output use a bounde
 writer shutdown; teardown releases the TCP port, monitors, timers, cursors, and
 writer process.
 
+Consuming the final buffered response does not bypass pending reciprocal
+close-notify output. The connection continues servicing the existing 250 ms
+shutdown deadline, allowing graceful completion when possible. Expiry or an
+explicit local close aborts remaining output through the supported inet port
+backend. Final termination never waits for TCP output to drain: it cancels
+retained timers, releases monitors and the writer, and closes the port directly.
+Pending writer output or a nonempty inet send queue uses zero linger so the
+driver cannot retain a flushing port after the connection exits. Empty-queue,
+acknowledged shutdowns retain ordinary graceful transport closure.
+Passive reads and active-once delivery need not wait for reciprocal shutdown
+before consuming authenticated response bytes.
+
 ## STARTTLS and security boundaries
 
 STARTTLS callers must own a connected binary/passive/raw `:gen_tcp` socket,

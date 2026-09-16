@@ -476,6 +476,15 @@ defmodule SSL.HTTPFetchTransportContractTest do
     assert_peer_close_settles_unfinished_send(5_000, :kill_shutdown_writer)
   end
 
+  for mode <- [:passive, :once], outcome <- [:complete, :deadline, :local_close] do
+    test "#{mode} drainage before pending peer shutdown uses bounded #{outcome} cleanup" do
+      assert_peer_close_settles_unfinished_send(
+        :infinity,
+        {:drain_first, unquote(mode), unquote(outcome)}
+      )
+    end
+  end
+
   test "peer close settles a send after active-once credit is consumed with response buffered" do
     parent = self()
     first = "rejected"
@@ -844,27 +853,95 @@ defmodule SSL.HTTPFetchTransportContractTest do
       assert after_stale.output.kind == :close_notify
       assert after_stale.size == byte_size(response)
 
-      writer_cleanup = finish_test_peer_shutdown(writer, shutdown_outcome)
-      after_shutdown = wait_for_peer_shutdown(socket.pid)
-      assert after_shutdown.tcp == nil
-      assert after_shutdown.output == nil
-      assert after_shutdown.size == byte_size(response)
-      if shutdown_outcome == :kill_shutdown_writer, do: assert(after_shutdown.writer == nil)
-
-      connection_monitor = Process.monitor(socket.pid)
-      assert {:ok, ^response} = SSL.recv(socket, byte_size(response), 1_000)
-      assert_receive {:DOWN, ^connection_monitor, :process, _, :normal}, 1_000
-
-      if writer_cleanup do
-        assert_receive {:DOWN, ^writer_cleanup, :process, _, :killed}, 1_000
-      end
-
-      assert {:error, :closed} = SSL.recv(socket, 0, 1_000)
+      assert_shutdown_and_drain(socket, writer, response, shutdown_outcome)
       assert :ok = Peer.stop(peer)
     after
       resume_connection(socket.pid)
       resume_if_suspended(writer)
     end
+  end
+
+  defp assert_shutdown_and_drain(socket, writer, response, {:drain_first, mode, outcome}) do
+    watchdog =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        after
+          2_000 ->
+            Process.exit(socket.pid, :kill)
+            Process.exit(writer, :kill)
+        end
+      end)
+
+    on_exit(fn ->
+      send(watchdog, :done)
+      if Process.alive?(socket.pid), do: Process.exit(socket.pid, :kill)
+      if Process.alive?(writer), do: Process.exit(writer, :kill)
+    end)
+
+    connection_monitor = Process.monitor(socket.pid)
+    writer_monitor = Process.monitor(writer)
+    {:connected, before_drain} = :sys.get_state(socket.pid)
+    shutdown = before_drain.output
+    tcp = before_drain.tcp
+    started = System.monotonic_time(:millisecond)
+
+    case mode do
+      :passive ->
+        assert {:ok, ^response} = SSL.recv(socket, byte_size(response), 1_000)
+
+      :once ->
+        assert :ok = SSL.setopts(socket, active: :once)
+        assert_receive {:ssl, ^socket, ^response}, 1_000
+    end
+
+    # Draining the last byte must leave the shutdown deadline serviceable.
+    assert {:connected, drained} = :sys.get_state(socket.pid)
+    assert drained.size == 0
+    assert drained.write == nil
+    assert drained.output.token == shutdown.token
+    assert is_integer(Process.read_timer(shutdown.timer))
+
+    case outcome do
+      :complete -> assert true = :erlang.resume_process(writer)
+      :deadline -> :ok
+      :local_close -> assert :ok = SSL.close(socket)
+    end
+
+    assert_receive {:DOWN, ^connection_monitor, :process, _, :normal}, 1_000
+    assert_receive {:DOWN, ^writer_monitor, :process, _, :killed}, 1_000
+    assert System.monotonic_time(:millisecond) - started < 1_000
+    assert Port.info(tcp) == nil
+    assert Process.read_timer(shutdown.timer) == false
+    assert {:error, :closed} = SSL.recv(socket, 0, 0)
+    assert :ok = SSL.close(socket)
+    assert :ok = SSL.close(socket)
+    send(watchdog, :done)
+
+    if mode == :once and outcome != :local_close do
+      assert_receive {:ssl_closed, ^socket}, 1_000
+      refute_receive {:ssl, ^socket, _}, 0
+      refute_receive {:ssl_closed, ^socket}, 0
+    end
+  end
+
+  defp assert_shutdown_and_drain(socket, writer, response, shutdown_outcome) do
+    writer_cleanup = finish_test_peer_shutdown(writer, shutdown_outcome)
+    after_shutdown = wait_for_peer_shutdown(socket.pid)
+    assert after_shutdown.tcp == nil
+    assert after_shutdown.output == nil
+    assert after_shutdown.size == byte_size(response)
+    if shutdown_outcome == :kill_shutdown_writer, do: assert(after_shutdown.writer == nil)
+
+    connection_monitor = Process.monitor(socket.pid)
+    assert {:ok, ^response} = SSL.recv(socket, byte_size(response), 1_000)
+    assert_receive {:DOWN, ^connection_monitor, :process, _, :normal}, 1_000
+
+    if writer_cleanup do
+      assert_receive {:DOWN, ^writer_cleanup, :process, _, :killed}, 1_000
+    end
+
+    assert {:error, :closed} = SSL.recv(socket, 0, 1_000)
   end
 
   defp resume_if_suspended(pid) do

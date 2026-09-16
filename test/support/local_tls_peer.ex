@@ -228,7 +228,7 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
     {:ok, %{listener: listener, port: port, ref: ref, task: task, controller: controller}}
   end
 
-  @spec start_backpressure_proxy(:inet.port_number(), pid()) ::
+  @spec start_backpressure_proxy(:inet.port_number(), pid(), keyword()) ::
           {:ok,
            %{
              listener: port(),
@@ -237,8 +237,10 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
              task: Task.t(),
              controller: pid()
            }}
-  def start_backpressure_proxy(upstream_port, observer)
+  def start_backpressure_proxy(upstream_port, observer, options \\ [])
       when is_integer(upstream_port) and is_pid(observer) do
+    hold_upstream_close = Keyword.get(options, :hold_upstream_close, false)
+
     {:ok, listener} =
       :gen_tcp.listen(0, [
         :binary,
@@ -286,7 +288,18 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
           send(observer, {:backpressure_proxy, ref, :ready})
 
           receive do
-            {:proxy_direction_done, _pid, result} -> result
+            {:proxy_direction_done, ^server_to_client, {:error, :closed}}
+            when hold_upstream_close ->
+              # Preserve downstream backpressure after the TLS peer's FIN.
+              # Only explicit controller cleanup may release that queue.
+              send(observer, {:backpressure_proxy, ref, :upstream_closed})
+
+              receive do
+                {:proxy_direction_done, ^controller, result} -> result
+              end
+
+            {:proxy_direction_done, _pid, result} ->
+              result
           end
 
           Process.exit(controller, :kill)

@@ -121,6 +121,13 @@ than being converted to authenticated closure. Once authenticated closure is
 accepted, failure of the reciprocal close-notify writer does not discard the
 buffered response or reclassify the terminal state.
 
+The consumer may drain that response immediately, even while reciprocal
+close-notify output is pending. The connection retains its existing bounded
+shutdown deadline after the last byte is delivered; it does not enter a blocking
+TCP flush in its termination callback. A concurrent or subsequent `SSL.close/1`
+can abort remaining output, including with `send_timeout: :infinity`. This
+teardown rule applies to both passive receive and active-once delivery.
+
 The existing Manifold passive direct-TLS and STARTTLS subset remains supported.
 This work does not weaken its verification, plaintext-boundary, close, or
 receive-timeout behavior.
