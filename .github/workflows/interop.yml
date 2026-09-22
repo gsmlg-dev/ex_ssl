@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   tls13-client:
-    name: OTP and OpenSSL TLS 1.3 peers
+    name: OTP TLS 1.3 and OpenSSL dual-version peers
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -45,6 +45,17 @@ jobs:
           test/ssl/connection_lifecycle_test.exs
           test/ssl/otp_reference_test.exs
           test/ssl/connection_interop_test.exs
+          test/ssl/resumption_interop_test.exs
+          test/ssl/resumption_resource_test.exs
+          test/ssl/diagnostics_test.exs
+          test/ssl/tls12_interop_test.exs
+          test/ssl/tls12_machine_test.exs
+          test/ssl/p384_interop_test.exs
+          test/ssl/client_auth_interop_test.exs
+          test/ssl/client_auth_lifecycle_test.exs
+          test/ssl/tls_policy_interop_test.exs
+          test/ssl/tcp_options_test.exs
+          test/ssl/crypto/signature_expansion_test.exs
           test/ssl/depth_interop_test.exs
           test/ssl/input_ordering_regression_test.exs
           test/ssl/connection_output_test.exs

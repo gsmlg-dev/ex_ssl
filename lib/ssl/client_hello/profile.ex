@@ -7,11 +7,14 @@ defmodule SSL.ClientHello.Profile do
   """
 
   alias SSL.ClientHello.{GreasePolicy, RecordPolicy, WireProfile}
+  alias SSL.Capabilities
 
   @extension_ids %{
     server_name: 0,
     supported_groups: 10,
     ec_point_formats: 11,
+    extended_master_secret: 23,
+    renegotiation_info: 0xFF01,
     signature_algorithms: 13,
     alpn: 16,
     padding: 21,
@@ -23,7 +26,6 @@ defmodule SSL.ClientHello.Profile do
   }
 
   @typed_extension_ids Map.values(@extension_ids)
-  @known_key_share_sizes %{x25519: 32, secp256r1: 65, secp384r1: 97}
 
   @typedoc "Capabilities the current TLS engine can safely advertise."
   @type capabilities :: %{
@@ -32,6 +34,7 @@ defmodule SSL.ClientHello.Profile do
           required(:groups) => [WireProfile.group()],
           optional(:raw_extensions) => [0..0xFFFF],
           optional(:signature_algorithms) => [atom() | 0..0xFFFF],
+          optional(:certificate_signature_algorithms) => [atom() | 0..0xFFFF],
           optional(:psk_key_exchange_modes) => [atom() | 0..0xFF],
           optional(:key_share_sizes) => %{optional(WireProfile.group()) => pos_integer()}
         }
@@ -65,6 +68,8 @@ defmodule SSL.ClientHello.Profile do
          :ok <- require_capability_list(capabilities, :ciphers),
          :ok <- require_capability_list(capabilities, :groups),
          :ok <- validate_optional_capability_list(capabilities, :signature_algorithms),
+         :ok <-
+           validate_optional_capability_list(capabilities, :certificate_signature_algorithms),
          :ok <- validate_optional_capability_list(capabilities, :psk_key_exchange_modes),
          :ok <- validate_raw_extension_capability(capabilities),
          :ok <- validate_key_share_size_capability(capabilities) do
@@ -178,6 +183,8 @@ defmodule SSL.ClientHello.Profile do
   defp valid_extension?({:server_name, :from_connection}), do: true
   defp valid_extension?({:supported_groups, groups}), do: uint16_vector?(groups)
   defp valid_extension?({:ec_point_formats, formats}), do: uint8_integer_vector?(formats)
+  defp valid_extension?({:extended_master_secret, <<>>}), do: true
+  defp valid_extension?({:renegotiation_info, <<0>>}), do: true
   defp valid_extension?({:signature_algorithms, algorithms}), do: uint16_vector?(algorithms)
   defp valid_extension?({:signature_algorithms_cert, algorithms}), do: uint16_vector?(algorithms)
   defp valid_extension?({:alpn, protocols}), do: is_list(protocols)
@@ -386,18 +393,30 @@ defmodule SSL.ClientHello.Profile do
   end
 
   defp validate_signature_algorithms(extensions, capabilities) do
-    algorithms =
+    handshake =
       Enum.flat_map(extensions, fn
         {:signature_algorithms, algorithms} -> algorithms
+        _extension -> []
+      end)
+
+    certificates =
+      Enum.flat_map(extensions, fn
         {:signature_algorithms_cert, algorithms} -> algorithms
         _extension -> []
       end)
 
-    reject_unsupported(
-      without_grease(algorithms),
-      Map.get(capabilities, :signature_algorithms, []),
-      :unsupported_signature_algorithms
-    )
+    with :ok <-
+           reject_unsupported(
+             without_grease(handshake),
+             Map.get(capabilities, :signature_algorithms, []),
+             :unsupported_signature_algorithms
+           ) do
+      reject_unsupported(
+        without_grease(certificates),
+        Map.get(capabilities, :certificate_signature_algorithms, []),
+        :unsupported_certificate_signature_algorithms
+      )
+    end
   end
 
   defp validate_psk_modes(extensions, capabilities) do
@@ -431,6 +450,12 @@ defmodule SSL.ClientHello.Profile do
     supported_groups = Enum.find(extensions, &match?({:supported_groups, _groups}, &1))
     key_shares = Enum.find(extensions, &match?({:key_share, _groups}, &1))
 
+    versions =
+      Enum.find_value(extensions, [], fn
+        {:supported_versions, values} -> values
+        _ -> nil
+      end)
+
     with :ok <- reject_supported_group_duplicates(supported_groups) do
       case {supported_groups, key_shares} do
         {nil, nil} ->
@@ -440,7 +465,9 @@ defmodule SSL.ClientHello.Profile do
           {:error, :key_share_requires_supported_groups}
 
         {{:supported_groups, _groups}, nil} ->
-          {:error, :supported_groups_requires_key_share}
+          if versions != [] and Enum.all?(versions, &(&1 in [0x0303, :tlsv1_2])),
+            do: :ok,
+            else: {:error, :supported_groups_requires_key_share}
 
         {{:supported_groups, supported_groups}, {:key_share, key_shares}} ->
           require_ordered_subset(key_shares, supported_groups)
@@ -518,6 +545,9 @@ defmodule SSL.ClientHello.Profile do
   defp extension_payload_length({:ec_point_formats, formats}, _capabilities),
     do: 1 + length(formats)
 
+  defp extension_payload_length({:extended_master_secret, <<>>}, _capabilities), do: 0
+  defp extension_payload_length({:renegotiation_info, <<0>>}, _capabilities), do: 1
+
   defp extension_payload_length({:signature_algorithms, algorithms}, _capabilities),
     do: 2 + 2 * length(algorithms)
 
@@ -557,7 +587,7 @@ defmodule SSL.ClientHello.Profile do
   defp key_share_size(group, capabilities) do
     capabilities
     |> Map.get(:key_share_sizes, %{})
-    |> Map.get(group, Map.get(@known_key_share_sizes, group))
+    |> Map.get(group, Map.get(Capabilities.key_share_sizes(), group))
   end
 
   defp without_grease(values), do: Enum.reject(values, &match?({:grease, _slot}, &1))

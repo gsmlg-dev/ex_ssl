@@ -1,9 +1,11 @@
 # http_fetch opt-in transport integration
 
-This guide records the library contract audited against `gsmlg-dev/http_fetch`
-revision `540225cec69cd2c1e41eb80b956fd6f1a8df7b70`. The ex_ssl fixture proves
-the transport lifecycle below; it does not claim that `HTTP.fetch` already uses
-ex_ssl.
+The opt-in integration exists in `gsmlg-dev/http_fetch` PR #14 at
+`690258ac38e50b0d1a968d9d5e510c560f45f5d4` (open, unmerged on 2026-09-22).
+Its adapter serves HTTPS fetch, WSS, and EventSource while OTP remains the
+default. The library fixture proves the transport lifecycle; consumer tests
+prove real HTTP exchanges. Current execution evidence and remaining gates are
+recorded in [EX_SSL_HTTP_FETCH_PROGRESS.md](EX_SSL_HTTP_FETCH_PROGRESS.md).
 
 ## Audited consumer contract
 
@@ -59,9 +61,9 @@ Keep protocol choice in http_fetch: `h2` selects HTTP/2; an absent or
 `http/1.1` selection follows the requested HTTP mode. ex_ssl does not implement
 HTTP framing.
 
-Use the exact TLS version list `versions: [:"tlsv1.3"]`. The current OTP adapter
-defaults to `[:"tlsv1.3", :"tlsv1.2"]`, which ex_ssl correctly rejects rather
-than silently advertising unsupported TLS 1.2. Preserve `depth: 4`, peer
+Keep `versions: [:"tlsv1.3"]` as the ex_ssl adapter default. The source candidate
+also accepts caller-selected TLS1.2-only or mixed lists under its mandatory EMS
+policy; the released0.3.0 dependency still rejects them. Preserve `depth: 4`, peer
 verification, CA overrides, SNI, and hostname checking.
 
 The consumer currently places `send_timeout` and `send_timeout_close` in its
@@ -132,19 +134,25 @@ The existing Manifold passive direct-TLS and STARTTLS subset remains supported.
 This work does not weaken its verification, plaintext-boundary, close, or
 receive-timeout behavior.
 
-## Consumer integration status
+## Implemented consumer integration
 
-The consumer adapter described above is implemented in http_fetch PR #14 at
-`690258a`. It keeps OTP `:ssl` as the default, selects `:ex_ssl` only when
-explicitly configured, pins that backend through redirects and reconnects, and
-uses the transport contract for ALPN, passive reads, active-once delivery,
-deadlines, backpressure, and cleanup. Unsupported options are rejected before
-I/O where possible. HTTP/3 and WebTransport remain on the QUIC path.
+PR #14 implements explicit backend selection, TLS-1.3-specific ex_ssl options,
+transport-neutral ALPN and passive WebSocket receive, socket ownership handoff,
+and adapter error propagation. It preserves backend selection through redirects
+and EventSource reconnects. HTTP/3 and WebTransport retain the QUIC path and
+reject an explicit TCP TLS backend.
 
-The current http_fetch branch has HTTP/1.1, HTTP/2, WSS, and EventSource
-integration coverage, including the cross-record HTTP/2 closure regressions.
-This document records the adapter contract; release-readiness evidence and
-unimplemented ex_ssl phases remain tracked in the progress ledger.
+The existing HTTP/2 close fix permits drainage only after an ex_ssl optional
+control write returns `:closed`. Response completion still requires END_STREAM
+and complete header blocks. A completed early response stops unsent upload DATA;
+an unfinished upload alone does not invalidate the response. Truncation, actual
+required-write failures, other transport errors, cancellation, and the original
+operation deadline remain errors. No request bytes are replayed.
+
+The Phase 0 continuation adds HTTP/2 Content-Length validation, bounded
+frame/header accumulation, and exact-once completion checks. Its core and real
+TLS regressions are recorded in the progress ledger alongside the preserved
+closure/early-response evidence.
 
 ## Consumer acceptance checklist
 
@@ -165,6 +173,77 @@ HTTP/2:
   behavior through the existing HTTP/2 implementation;
 - cancellation and connection teardown with no replay or leaked task/socket.
 
-Those consumer tests establish actual HTTP integration for the documented
-subset. The ex_ssl fixture remains useful as a focused transport-contract test,
-but it is not a substitute for the consumer-level HTTP matrix.
+Consumer tests establish the tested HTTP integration subset. The ex_ssl
+fixture separately establishes the transport lifecycle contract. Neither suite
+establishes full OTP parity, release readiness, or all server/runtime combinations.
+
+## Candidate algorithm validation
+
+The Phase 1 source candidate adds P-384 ECDHE/ECDSA, Ed25519, and
+RSA-PSS-PSS SHA-256/384/512. These changes are not in the published 0.3.0
+dependency. The consumer's `scripts/ex_ssl_source_smoke.sh` builds fresh HTTP
+package artifacts and uses an explicit `EX_SSL_SOURCE_DIR` override only in a
+temporary consumer project. It tests every new signature over HTTP/1.1 with
+P-384 HRR and HTTP/2 with a direct P-384 share, plus hostname rejection. The
+separate `external_consumer_smoke.sh` validates released dependency metadata
+without that override. No installed dependency sources are modified.
+
+
+## Candidate client authentication
+
+The Phase 2 source candidate supports one initial-handshake client identity.
+These options use the existing HTTP transport's `ssl:` path:
+
+```elixir
+HTTP.fetch("https://service.example/resource",
+  tls_backend: :ex_ssl,
+  ssl: [
+    cacertfile: "/etc/service/server-ca.pem",
+    certfile: "/etc/service/client-chain.pem",
+    keyfile: "/etc/service/client-key.pem"
+  ]
+)
+```
+
+Client identity and server trust remain separate. The key must match the leaf
+certificate; files must be unencrypted. Peer acceptance is observed through the
+HTTP result, because TLS 1.3 permits a client-identity rejection after the local
+client Finished write. No retry, backend fallback or weakened verification is
+performed. See the compatibility matrix for input forms, chain bounds and
+CertificateRequest selection constraints. For automatic ex_ssl redirects, a
+configured identity remains within its original scheme, case-insensitive hostname
+and effective port. A change returns `:client_identity_cross_origin_redirect`
+before connecting. `redirect: :manual` followed by a new, deliberate request
+permits broader reuse. OTP redirect behavior is unchanged.
+
+The P2.3 source gate verifies RSA/EC/large-certificate mTLS over HTTP/1.1 and
+HTTP/2, required/optional failures, same-origin/manual redirects, and WSS and
+EventSource reconnects with exact peer-observed client identities. The released
+0.3.0 dependency does not contain this feature. Source-candidate validation is
+separate from released-dependency packaging evidence.
+
+## Source candidate option gate (Phase 3)
+
+The source candidate supports ordered suite/group/handshake-signature and
+certificate-signature policies plus safe TCP nodelay/keepalive/sndbuf/recbuf/local
+ip/port. The consumer adapter forwards only the tested allowlist; keyword
+containers and duplicate keys fail before fetch modifies ALPN or deadlines.
+IPv6 literals infer family and IPv6 local binds select IPv6 DNS. Raw active/packet
+controls and unsafe linger remain private/unsupported. The released0.3.0 package
+has not gained these features. See COMPATIBILITY.md for exact forms and limits.
+
+## Source candidate dual-version and resumption gates (Phases 4–5)
+
+The source candidate supports explicit TLS 1.2-only and mixed offers through the
+same shared adapter, retaining TLS 1.3-only as the library default and OTP as the
+consumer default. Independent OpenSSL package tests cover required mTLS HTTP/1.1,
+HTTP/2 ALPN with a 262,144-byte response crossing both flow-control windows, WSS
+and pinned EventSource reconnects. A capable mixed-version peer selects TLS 1.3.
+The safe TLS 1.2 subset requires EMS and secure-renegotiation indication; see the
+compatibility matrix for its four ECDHE AES-GCM suites and exclusions.
+
+`ssl: [versions: [:"tlsv1.3"], session_tickets: :auto]` enables the optional bounded
+TLS 1.3 cache without client credentials. Two fresh packaged HTTP/1.1 fetches
+prove actual OpenSSL session reuse. It does not change request retry semantics,
+backend selection, credentials across redirects, or the QUIC path. The published
+0.3.0 dependency remains separate from these unreleased source-candidate features.

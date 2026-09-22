@@ -4,11 +4,12 @@ defmodule SSL.PKIX.VerifiedPeer do
   """
 
   @enforce_keys [:leaf_der, :leaf, :public_key]
-  defstruct [:leaf_der, :leaf, :public_key]
+  defstruct [:leaf_der, :leaf, :public_key, chain: []]
 
   @type t :: %__MODULE__{
           leaf_der: binary(),
           leaf: term(),
-          public_key: term()
+          public_key: term(),
+          chain: [binary()]
         }
 end

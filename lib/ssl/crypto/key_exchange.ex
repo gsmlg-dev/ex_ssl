@@ -21,6 +21,11 @@ defmodule SSL.Crypto.KeyExchange do
   end
 
   alias __MODULE__.KeyPair
+  alias SSL.Capabilities
+
+  @p384_order Base.decode16!(
+                "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC7634D81F4372DDF581A0DB248B0A77AECEC196ACCC52973"
+              )
 
   @type group :: KeyPair.group()
   @type error_reason ::
@@ -33,11 +38,7 @@ defmodule SSL.Crypto.KeyExchange do
           | :invalid_key_pair
 
   @spec supported?(term()) :: boolean()
-  def supported?(group) when group in [:x25519, :secp256r1, :secp384r1] do
-    group in :crypto.supports(:curves) and :ecdh in :crypto.supports(:public_keys)
-  end
-
-  def supported?(_group), do: false
+  def supported?(group), do: group in Capabilities.identifiers(:group)
 
   @spec generate(term()) :: {:ok, KeyPair.t()} | {:error, error_reason()}
   def generate(group) when group in [:x25519, :secp256r1, :secp384r1] do
@@ -106,7 +107,10 @@ defmodule SSL.Crypto.KeyExchange do
   end
 
   defp validate_private_key(group, private_key)
-       when is_binary(private_key) and byte_size(private_key) in [32, 48] do
+       when is_binary(private_key) and
+              ((group in [:x25519, :secp256r1] and byte_size(private_key) == 32) or
+                 (group == :secp384r1 and byte_size(private_key) == 48 and
+                    private_key > <<0::384>> and private_key < @p384_order)) do
     case :crypto.generate_key(:ecdh, group, private_key) do
       {<<_public_key::binary-size(32)>>, ^private_key} when group == :x25519 ->
         :ok

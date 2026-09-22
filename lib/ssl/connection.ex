@@ -1,7 +1,7 @@
 defmodule SSL.Connection do
   @moduledoc false
   @behaviour :gen_statem
-  alias SSL.{ConnectionWriter, IodataCursor, Options, Socket}
+  alias SSL.{ConnectionWriter, Diagnostics, IodataCursor, Options, Socket, TCPOptions}
   alias SSL.ClientHello.Materializer
   alias SSL.Protocol.{HandshakeMachine, RecordFramer}
 
@@ -40,6 +40,7 @@ defmodule SSL.Connection do
       :options,
       :deadline,
       :machine,
+      :ticket_key,
       :connect_from,
       :recv,
       :write,
@@ -109,31 +110,38 @@ defmodule SSL.Connection do
       fail(state, :timeout)
     else
       with :ok <-
-             :inet.setopts(tcp, [
-               :binary,
-               packet: :raw,
-               active: false,
-               send_timeout: state.send_timeout,
-               send_timeout_close: state.send_timeout_close,
-               buffer: 16_640
-             ]),
+             :inet.setopts(
+               tcp,
+               [
+                 :binary,
+                 packet: :raw,
+                 active: false,
+                 send_timeout: state.send_timeout,
+                 send_timeout_close: state.send_timeout_close,
+                 buffer: 16_640
+               ] ++ TCPOptions.mutable(state.options.tcp_options)
+             ),
+           {:ok, options, ticket, ticket_key} <- prepare_resumption(state.options, tcp),
            {:ok, materialized} <-
              Materializer.materialize(
-               state.options.profile,
+               options.profile,
                Options.capabilities(),
-               state.options.context
+               options.context
              ),
            {:ok, machine, outbound} <-
              HandshakeMachine.init(
                materialized,
-               state.options.trust_source,
-               state.options.identity,
-               customize_hostname_check: state.options.hostname_check,
-               depth: state.options.depth
+               options.trust_source,
+               options.identity,
+               customize_hostname_check: options.hostname_check,
+               depth: options.depth,
+               client_identity: options.client_identity,
+               ticket: ticket,
+               enable_tickets: options.session_tickets == :auto
              ),
            {:ok, state} <-
              start_output(
-               %{state | machine: machine, options: nil},
+               %{state | machine: machine, options: nil, ticket_key: ticket_key},
                outbound,
                :handshake,
                :handshake_start,
@@ -201,13 +209,19 @@ defmodule SSL.Connection do
     if options[:active] == :once and state.recv != nil do
       reply(from, {:error, :einval})
     else
-      state =
-        state
-        |> apply_send_options(options)
-        |> apply_active_option(options)
-        |> deliver(true)
+      case apply_tcp_options(state.tcp, TCPOptions.mutable(options)) do
+        :ok ->
+          state =
+            state
+            |> apply_send_options(options)
+            |> apply_active_option(options)
+            |> deliver(true)
 
-      continue(:connected, state, [{:reply, from, :ok}])
+          continue(:connected, state, [{:reply, from, :ok}])
+
+        {:error, reason} ->
+          reply(from, {:error, reason})
+      end
     end
   end
 
@@ -220,6 +234,36 @@ defmodule SSL.Connection do
 
     reply(from, result)
   end
+
+  def handle_event({:call, from}, {_ref, request}, :connected, %{closed: false, tcp: tcp} = state)
+      when request in [:peercert, :peername, :sockname] and not is_nil(tcp) do
+    result =
+      case request do
+        :peercert -> Diagnostics.peercert(state.machine)
+        :peername -> diagnostic_result(:inet.peername(tcp))
+        :sockname -> diagnostic_result(:inet.sockname(tcp))
+      end
+
+    reply(from, result)
+  end
+
+  def handle_event(
+        {:call, from},
+        {_ref, {:connection_information, keys}},
+        :connected,
+        %{closed: false, tcp: tcp} = state
+      )
+      when not is_nil(tcp) do
+    reply(from, Diagnostics.connection_information(state.machine, keys))
+  end
+
+  def handle_event({:call, from}, {_ref, request}, _phase, _state)
+      when request in [:peercert, :peername, :sockname] do
+    reply(from, {:error, :closed})
+  end
+
+  def handle_event({:call, from}, {_ref, {:connection_information, _keys}}, _phase, _state),
+    do: reply(from, {:error, :closed})
 
   def handle_event({:call, from}, {_ref, {:recv, length, deadline}}, :connected, state) do
     cond do
@@ -621,7 +665,20 @@ defmodule SSL.Connection do
     end
   end
 
+  defp prepare_resumption(%{session_tickets: :disabled} = options, _tcp),
+    do: SSL.ResumptionContext.prepare(options, nil)
+
+  defp prepare_resumption(options, tcp) do
+    with {:ok, endpoint} <- :inet.peername(tcp),
+         do: SSL.ResumptionContext.prepare(options, endpoint)
+  end
+
   defp apply_events(phase, [], state), do: {:ok, phase, state}
+
+  defp apply_events(phase, [{:session_ticket, material} | rest], state) do
+    :ok = SSL.ResumptionContext.store(state.ticket_key, material)
+    apply_events(phase, rest, state)
+  end
 
   defp apply_events(_phase, [{:connected, negotiated_protocol} | rest], state) do
     if Options.remaining(state.deadline) == 0 do
@@ -890,6 +947,10 @@ defmodule SSL.Connection do
     end
   end
 
+  defp apply_tcp_options(_tcp, []), do: :ok
+  defp apply_tcp_options(nil, _options), do: {:error, :closed}
+  defp apply_tcp_options(tcp, options), do: :inet.setopts(tcp, options)
+
   defp finish_write(state, result) do
     state = settle_write(state, result)
     drain_or_continue(:connected, state)
@@ -1050,6 +1111,9 @@ defmodule SSL.Connection do
 
     %{state | tcp: nil, machine: nil, armed: false, output: nil}
   end
+
+  defp diagnostic_result({:error, _}), do: {:error, :closed}
+  defp diagnostic_result(result), do: result
 
   defp public_error({:fatal_alert, alert, _}), do: {:tls_alert, {alert, ~c"TLS protocol error"}}
   defp public_error({:peer_alert, _, _} = alert), do: alert

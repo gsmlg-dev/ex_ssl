@@ -14,6 +14,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
 
   alias SSL.Protocol.{
     ClientOffer,
+    ClientAuthentication,
     HandshakeFramer,
     Record,
     ServerFlight,
@@ -38,6 +39,8 @@ defmodule SSL.Protocol.ServerFlightVerifier do
     alias SSL.Crypto.KeyExchange.KeyPair
     alias SSL.Protocol.ServerHello
 
+    @derive {Inspect,
+             except: [:client_hello, :client_key_pair, :trust_source, :client_identity, :ticket]}
     @enforce_keys [
       :client_hello,
       :server_hello,
@@ -46,7 +49,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       :trust_source,
       :identity
     ]
-    defstruct @enforce_keys
+    defstruct @enforce_keys ++ [client_identity: nil, ticket: nil, enable_tickets: false]
 
     @type t :: %__MODULE__{
             client_hello: binary(),
@@ -54,7 +57,8 @@ defmodule SSL.Protocol.ServerFlightVerifier do
             client_key_pair: KeyPair.t(),
             records: [binary()],
             trust_source: term(),
-            identity: SSL.PKIX.identity()
+            identity: SSL.PKIX.identity(),
+            client_identity: SSL.ClientIdentity.t() | nil
           }
   end
 
@@ -72,7 +76,10 @@ defmodule SSL.Protocol.ServerFlightVerifier do
                :server_handshake_state,
                :client_handshake_state,
                :client_application_state,
-               :server_application_state
+               :server_application_state,
+               :client_auth_records,
+               :resumption_master,
+               :transcript
              ]}
     @enforce_keys [
       :verified_peer,
@@ -84,7 +91,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       :transcript,
       :negotiated_protocol
     ]
-    defstruct @enforce_keys
+    defstruct @enforce_keys ++ [client_auth_records: [], resumption_master: nil, resumed: false]
 
     @type t :: %__MODULE__{
             verified_peer: VerifiedPeer.t(),
@@ -100,7 +107,15 @@ defmodule SSL.Protocol.ServerFlightVerifier do
 
   defmodule Incremental do
     @moduledoc false
-    @derive {Inspect, except: [:secrets, :server_handshake_state, :verified_peer]}
+    @derive {Inspect,
+             except: [
+               :secrets,
+               :server_handshake_state,
+               :verified_peer,
+               :certificate_request,
+               :offer,
+               :transcript
+             ]}
     @enforce_keys [
       :input,
       :offer,
@@ -111,7 +126,11 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       :server_handshake_state
     ]
     defstruct @enforce_keys ++
-                [verified_peer: nil, certificate_request_context: nil, negotiated_protocol: nil]
+                [
+                  verified_peer: nil,
+                  certificate_request: nil,
+                  negotiated_protocol: nil
+                ]
   end
 
   @default_max_records 64
@@ -195,6 +214,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
          {:ok, config} <- bind_offer(config, offer),
          input = %{input | server_hello: server_hello},
          {:ok, suite, hash, peer_public_key} <- negotiate(input, offer),
+         :ok <- validate_selected_ticket(input, offer, hash),
          {:ok, secrets} <-
            derive_handshake_secrets(input, suite, hash, peer_public_key, transcript_prefix) do
       {:ok,
@@ -205,7 +225,8 @@ defmodule SSL.Protocol.ServerFlightVerifier do
          config: config,
          phase: :encrypted_extensions,
          transcript: secrets.transcript,
-         server_handshake_state: secrets.server_handshake_state
+         server_handshake_state: secrets.server_handshake_state,
+         verified_peer: if(selected_ticket?(input), do: input.ticket.peer, else: nil)
        }}
     end
   end
@@ -215,11 +236,12 @@ defmodule SSL.Protocol.ServerFlightVerifier do
 
     with {:ok, %EncryptedExtensions{} = message} <-
            decode_message(encoded, EncryptedExtensions, options),
-         :ok <- validate_encrypted_extensions(message, state.offer) do
+         :ok <- validate_encrypted_extensions(message, state.offer),
+         :ok <- resumed_alpn(state.input, selected_alpn(message)) do
       {:ok,
        %{
          state
-         | phase: :certificate_or_request,
+         | phase: if(selected_ticket?(state.input), do: :finished, else: :certificate_or_request),
            negotiated_protocol: selected_alpn(message),
            transcript: Transcript.append(state.transcript, encoded)
        }}
@@ -238,7 +260,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
        %{
          state
          | phase: :certificate,
-           certificate_request_context: request.request_context,
+           certificate_request: request,
            transcript: Transcript.append(state.transcript, encoded)
        }}
     end
@@ -290,16 +312,23 @@ defmodule SSL.Protocol.ServerFlightVerifier do
         {:invalid_server_flight_order, state.phase, message_types([encoded])}
       )
 
+  defp reject_batch_resumption(%Input{server_hello: %ServerHello{extensions: extensions}}) do
+    if List.keymember?(extensions, :pre_shared_key, 0),
+      do: alert(:illegal_parameter, :incremental_resumption_required),
+      else: :ok
+  end
+
   defp verify_flight(%Input{} = input, options) do
     with {:ok, config} <- validate_options(options),
          {:ok, offer, server_hello} <- validate_input(input),
+         :ok <- reject_batch_resumption(%{input | server_hello: server_hello}),
          {:ok, config} <- bind_offer(config, offer),
          input = %{input | server_hello: server_hello},
          {:ok, suite, hash, peer_public_key} <- negotiate(input, offer),
          {:ok, secrets} <- derive_handshake_secrets(input, suite, hash, peer_public_key),
          {:ok, messages, server_handshake_state} <-
            decrypt_records(input.records, secrets.server_handshake_state, config),
-         {:ok, verified_peer, transcript, negotiated_protocol} <-
+         {:ok, verified_peer, transcript, negotiated_protocol, certificate_request} <-
            verify_messages(messages, input, secrets, config, offer),
          {:ok, result} <-
            finish_client_flight(
@@ -307,7 +336,9 @@ defmodule SSL.Protocol.ServerFlightVerifier do
              transcript,
              secrets,
              server_handshake_state,
-             negotiated_protocol
+             negotiated_protocol,
+             certificate_request,
+             input.client_identity
            ) do
       {:ok, result}
     end
@@ -317,7 +348,8 @@ defmodule SSL.Protocol.ServerFlightVerifier do
     do: alert(:decode_error, {:invalid_input, :verifier})
 
   defp validate_input(%Input{} = input) do
-    with {:ok, offer} <- client_offer(input.client_hello),
+    with :ok <- validate_client_identity(input.client_identity),
+         {:ok, offer} <- client_offer(input.client_hello),
          {:ok, server_hello} <- reparse_server_hello(input.server_hello, offer),
          :ok <- compare_server_hello(input.server_hello, server_hello),
          :ok <- validate_server_hello_kind(server_hello),
@@ -327,6 +359,10 @@ defmodule SSL.Protocol.ServerFlightVerifier do
       {:error, {_alert, _reason}} = error -> error
     end
   end
+
+  defp validate_client_identity(nil), do: :ok
+  defp validate_client_identity(%SSL.ClientIdentity{}), do: :ok
+  defp validate_client_identity(_), do: alert(:illegal_parameter, :invalid_client_identity)
 
   defp client_offer(encoded) do
     case ClientOffer.from_client_hello(encoded) do
@@ -445,6 +481,34 @@ defmodule SSL.Protocol.ServerFlightVerifier do
   defp key_pair_result(:ok), do: :ok
   defp key_pair_result({:error, reason}), do: alert(:illegal_parameter, reason)
 
+  defp selected_ticket?(input), do: {:pre_shared_key, 0} in input.server_hello.extensions
+
+  defp validate_selected_ticket(input, offer, hash) do
+    if selected_ticket?(input) do
+      with %SSL.SessionTicket{hash: ^hash} = ticket <- input.ticket,
+           :ok <- SSL.SessionTicket.validate(ticket),
+           true <-
+             input.client_identity == nil and offer.psk_count == 1 and
+               offer.psk_key_exchange_modes == [1],
+           {41, <<size::16, identity::binary-size(size), _::binary>>} <-
+             List.keyfind(offer.extensions, 41, 0),
+           <<length::16, bytes::binary-size(length), _age::32>> <- identity,
+           true <- bytes == ticket.ticket do
+        :ok
+      else
+        _ -> alert(:illegal_parameter, :invalid_resumption_selection)
+      end
+    else
+      :ok
+    end
+  end
+
+  defp resumed_alpn(input, selected) do
+    if selected_ticket?(input) and input.ticket.alpn != selected,
+      do: alert(:illegal_parameter, :resumption_alpn_changed),
+      else: :ok
+  end
+
   defp negotiate(%Input{server_hello: server_hello, client_key_pair: client_key_pair}, _offer) do
     with {:ok, suite, hash} <- cipher_suite(server_hello.cipher_suite),
          {:ok, group, peer_public_key} <- server_key_share(server_hello.extensions),
@@ -453,12 +517,12 @@ defmodule SSL.Protocol.ServerFlightVerifier do
     end
   end
 
-  defp cipher_suite(0x1301), do: {:ok, :tls_aes_128_gcm_sha256, :sha256}
-  defp cipher_suite(0x1302), do: {:ok, :tls_aes_256_gcm_sha384, :sha384}
-  defp cipher_suite(0x1303), do: {:ok, :tls_chacha20_poly1305_sha256, :sha256}
-
-  defp cipher_suite(cipher_suite),
-    do: alert(:illegal_parameter, {:unsupported_cipher_suite, cipher_suite})
+  defp cipher_suite(cipher_suite) do
+    case SSL.Capabilities.resolve(:cipher_suite, cipher_suite) do
+      %{version: 0x0304, name: name, hash: hash} -> {:ok, name, hash}
+      _ -> alert(:illegal_parameter, {:unsupported_cipher_suite, cipher_suite})
+    end
+  end
 
   defp server_key_share(extensions), do: server_key_share(extensions, nil)
 
@@ -468,8 +532,8 @@ defmodule SSL.Protocol.ServerFlightVerifier do
   defp server_key_share([{:supported_versions, 0x0304} | rest], key_share),
     do: server_key_share(rest, key_share)
 
-  defp server_key_share([{:pre_shared_key, _selected_identity} | _rest], _key_share),
-    do: alert(:illegal_parameter, {:unsupported, :pre_shared_key})
+  defp server_key_share([{:pre_shared_key, 0} | rest], key_share),
+    do: server_key_share(rest, key_share)
 
   defp server_key_share(
          [{:key_share, %{group: group, key_exchange: key_exchange}} | rest],
@@ -490,12 +554,12 @@ defmodule SSL.Protocol.ServerFlightVerifier do
   defp server_key_share(_improper_tail, _key_share),
     do: alert(:illegal_parameter, :malformed_server_hello_extensions)
 
-  defp bind_key_share_group(0x001D, :x25519), do: :ok
-  defp bind_key_share_group(0x0017, :secp256r1), do: :ok
-  defp bind_key_share_group(0x0018, :secp384r1), do: :ok
-
-  defp bind_key_share_group(group, client_group),
-    do: alert(:illegal_parameter, {:key_share_group_mismatch, group, client_group})
+  defp bind_key_share_group(group, client_group) do
+    case SSL.Capabilities.resolve(:group, group) do
+      %{name: ^client_group} -> :ok
+      _ -> alert(:illegal_parameter, {:key_share_group_mismatch, group, client_group})
+    end
+  end
 
   defp derive_handshake_secrets(input, suite, hash, peer_public_key, transcript_prefix \\ nil) do
     with {:ok, shared_secret} <-
@@ -503,7 +567,13 @@ defmodule SSL.Protocol.ServerFlightVerifier do
              KeyExchange.shared_secret(input.client_key_pair, peer_public_key),
              :illegal_parameter
            ),
-         {:ok, early_secret} <- crypto_result(KeySchedule.early_secret(hash, nil)),
+         {:ok, early_secret} <-
+           crypto_result(
+             KeySchedule.early_secret(
+               hash,
+               if(selected_ticket?(input), do: input.ticket.psk, else: nil)
+             )
+           ),
          {:ok, handshake_secret} <-
            crypto_result(KeySchedule.handshake_secret(hash, early_secret, shared_secret)),
          transcript =
@@ -646,6 +716,53 @@ defmodule SSL.Protocol.ServerFlightVerifier do
          secrets,
          config,
          offer
+       ),
+       do:
+         verify_messages_with_request(
+           encrypted_extensions,
+           nil,
+           certificate,
+           certificate_verify,
+           finished,
+           input,
+           secrets,
+           config,
+           offer
+         )
+
+  defp verify_messages(
+         [encrypted_extensions, certificate_request, certificate, certificate_verify, finished],
+         input,
+         secrets,
+         config,
+         offer
+       ),
+       do:
+         verify_messages_with_request(
+           encrypted_extensions,
+           certificate_request,
+           certificate,
+           certificate_verify,
+           finished,
+           input,
+           secrets,
+           config,
+           offer
+         )
+
+  defp verify_messages(messages, _input, _secrets, _config, _offer),
+    do: alert(:unexpected_message, {:invalid_server_flight_order, message_types(messages)})
+
+  defp verify_messages_with_request(
+         encrypted_extensions,
+         certificate_request,
+         certificate,
+         certificate_verify,
+         finished,
+         input,
+         secrets,
+         config,
+         offer
        ) do
     options = [{:hash, secrets.hash} | config.server_flight_options]
 
@@ -653,6 +770,8 @@ defmodule SSL.Protocol.ServerFlightVerifier do
            decode_message(encrypted_extensions, EncryptedExtensions, options),
          :ok <- validate_encrypted_extensions(encrypted_extensions, offer),
          transcript = Transcript.append(secrets.transcript, encrypted_extensions.encoded),
+         {:ok, request, transcript} <-
+           maybe_decode_certificate_request(certificate_request, transcript, options),
          {:ok, %Certificate{} = certificate} <-
            decode_message(certificate, Certificate, options),
          :ok <- validate_certificate_extensions(certificate, offer),
@@ -666,12 +785,19 @@ defmodule SSL.Protocol.ServerFlightVerifier do
            decode_message(finished, ServerFinished, options),
          :ok <- verify_server_finished(finished, transcript, secrets),
          transcript = Transcript.append(transcript, finished.encoded) do
-      {:ok, verified_peer, transcript, selected_alpn(encrypted_extensions)}
+      {:ok, verified_peer, transcript, selected_alpn(encrypted_extensions), request}
     end
   end
 
-  defp verify_messages(messages, _input, _secrets, _config, _offer),
-    do: alert(:unexpected_message, {:invalid_server_flight_order, message_types(messages)})
+  defp maybe_decode_certificate_request(nil, transcript, _options),
+    do: {:ok, nil, transcript}
+
+  defp maybe_decode_certificate_request(encoded, transcript, options) do
+    with {:ok, %CertificateRequest{} = request} <-
+           decode_message(encoded, CertificateRequest, options) do
+      {:ok, request, Transcript.append(transcript, encoded)}
+    end
+  end
 
   defp decode_message(encoded, expected_module, options) do
     case ServerFlight.decode(encoded, options) do
@@ -775,7 +901,8 @@ defmodule SSL.Protocol.ServerFlightVerifier do
 
     case PKIX.verify(chain, input.trust_source, input.identity,
            customize_hostname_check: config.hostname_check,
-           depth: config.depth
+           depth: config.depth,
+           certificate_signature_schemes: config.certificate_signature_schemes
          ) do
       {:ok, verified_peer} ->
         {:ok, verified_peer}
@@ -825,10 +952,13 @@ defmodule SSL.Protocol.ServerFlightVerifier do
              KeySchedule.traffic_state(state.secrets.suite, server_application_secret)
            ),
          {:ok, transcript, handshake_state, certificate_records} <-
-           maybe_empty_client_certificate(
-             state.certificate_request_context,
-             server_transcript,
-             state.secrets.client_handshake_state
+           client_auth_result(
+             ClientAuthentication.emit(
+               state.certificate_request,
+               state.input.client_identity,
+               server_transcript,
+               state.secrets.client_handshake_state
+             )
            ),
          {:ok, client_verify_data} <-
            crypto_result(
@@ -852,22 +982,32 @@ defmodule SSL.Protocol.ServerFlightVerifier do
         client_application_state: client_application_state,
         server_application_state: server_application_state,
         negotiated_protocol: state.negotiated_protocol,
-        transcript: Transcript.append(transcript, client_finished)
+        transcript: Transcript.append(transcript, client_finished),
+        resumed: selected_ticket?(state.input)
       }
+
+      result =
+        if state.input.enable_tickets do
+          {:ok, secret} =
+            KeySchedule.resumption_master_secret(
+              state.secrets.hash,
+              state.secrets.master_secret,
+              Transcript.digest(result.transcript)
+            )
+
+          %{result | resumption_master: secret}
+        else
+          result
+        end
 
       {:ok, result, certificate_records ++ [client_finished_record]}
     end
   end
 
-  defp maybe_empty_client_certificate(nil, transcript, state),
-    do: {:ok, transcript, state, []}
+  defp client_auth_result({:ok, transcript, state, records}),
+    do: {:ok, transcript, state, records}
 
-  defp maybe_empty_client_certificate(context, transcript, state) do
-    with {:ok, certificate} <- crypto_result(ServerFlight.encode_empty_certificate(context)),
-         {:ok, record, next_state} <- encrypt_client_finished(state, certificate) do
-      {:ok, Transcript.append(transcript, certificate), next_state, [record]}
-    end
-  end
+  defp client_auth_result({:error, reason}), do: alert(:internal_error, reason)
 
   defp verify_certificate_signature(certificate_verify, verified_peer, transcript) do
     case Signature.verify_server(
@@ -899,7 +1039,9 @@ defmodule SSL.Protocol.ServerFlightVerifier do
          transcript,
          secrets,
          server_handshake_state,
-         negotiated_protocol
+         negotiated_protocol,
+         certificate_request,
+         client_identity
        ) do
     transcript_hash = Transcript.digest(transcript)
 
@@ -923,18 +1065,27 @@ defmodule SSL.Protocol.ServerFlightVerifier do
            crypto_result(KeySchedule.traffic_state(secrets.suite, client_application_secret)),
          {:ok, server_application_state} <-
            crypto_result(KeySchedule.traffic_state(secrets.suite, server_application_secret)),
+         {:ok, transcript, handshake_state, certificate_records} <-
+           client_auth_result(
+             ClientAuthentication.emit(
+               certificate_request,
+               client_identity,
+               transcript,
+               secrets.client_handshake_state
+             )
+           ),
          {:ok, client_verify_data} <-
            crypto_result(
              CryptoFinished.client_verify_data(
                secrets.hash,
                secrets.client_handshake_secret,
-               transcript_hash
+               Transcript.digest(transcript)
              )
            ),
          {:ok, client_finished} <-
            crypto_result(ServerFlight.encode_finished(client_verify_data, hash: secrets.hash)),
          {:ok, client_finished_record, client_handshake_state} <-
-           encrypt_client_finished(secrets.client_handshake_state, client_finished) do
+           encrypt_client_finished(handshake_state, client_finished) do
       {:ok,
        %Result{
          verified_peer: verified_peer,
@@ -944,6 +1095,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
          client_application_state: client_application_state,
          server_application_state: server_application_state,
          negotiated_protocol: negotiated_protocol,
+         client_auth_records: certificate_records,
          transcript: Transcript.append(transcript, client_finished)
        }}
     end
@@ -1060,7 +1212,10 @@ defmodule SSL.Protocol.ServerFlightVerifier do
         |> Keyword.put(:offered_extension_ids, offer.extension_ids)
         |> Keyword.put(:allowed_signature_schemes, allowed_signatures)
 
-      {:ok, %{config | server_flight_options: options}}
+      {:ok,
+       config
+       |> Map.put(:server_flight_options, options)
+       |> Map.put(:certificate_signature_schemes, offer.certificate_signature_schemes)}
     end
   end
 

@@ -1,4 +1,4 @@
-# TLS 1.3 client compatibility
+# TLS client compatibility
 
 `ex_ssl` provides an experimental OTP `:ssl`-compatible client API for the
 implemented subset below. Passing the repository tests is not a security
@@ -8,12 +8,15 @@ certification, and OTP `:ssl` remains the recommended default.
 
 | Surface | Supported behavior |
 | --- | --- |
-| `SSL.connect/2,3,4` | Authenticated TLS 1.3 client connections and passive binary/raw STARTTLS upgrades. Connect succeeds only after CertificateVerify and Finished validation. |
+| `SSL.connect/2,3,4` | Authenticated TLS 1.3 and bounded TLS 1.2 client connections and passive binary/raw STARTTLS upgrades. Connect succeeds only after peer signature and Finished validation. |
 | `SSL.send/2` | Valid iodata of any logical size supported by available caller memory. Data is traversed without flattening the entire write and protected in records of at most 16,384 plaintext bytes. One logical write is admitted at a time; another caller receives `{:error, :busy}`. There is no automatic replay. An unfinished admitted send is settled promptly as `{:error, :closed}` after an authenticated peer closure makes further writes impossible; a send already acknowledged in full remains `:ok`. |
 | `SSL.recv/2,3` | Passive raw binary receive. Length zero returns available plaintext; a positive length waits for exactly that many bytes. One passive receive is admitted, and the maximum requested/buffered plaintext is 1 MiB. |
-| `SSL.setopts/2` | Atomic support for `active: false | :once`, `send_timeout`, and `send_timeout_close: true`. Unknown, duplicate, malformed, or unsupported options reject the whole request. |
+| `SSL.setopts/2` | Validates the whole request for `active: false` or `:once`, send timeouts and the mutable TCP allowlist below. Invalid options reject before changes. Driver failures can partially apply TCP options; TLS state changes only after driver success. |
 | `SSL.controlling_process/2` | Transfers the application owner and monitor. The connection process remains the TCP owner and sole owner of TLS state. Only the current application owner may transfer. |
 | `SSL.negotiated_protocol/1` | Returns authenticated ALPN as `{:ok, binary}` or `{:error, :protocol_not_negotiated}`. |
+| `SSL.connection_information/1,2` | Only `:protocol`, `:selected_cipher_suite`, and `:session_resumption`; explicit ordered key lists reject unknown/duplicate keys. No secret-bearing OTP keys. |
+| `SSL.peercert/1` | Authenticated leaf DER, including the revalidated cached chain for resumption. |
+| `SSL.peername/1`, `SSL.sockname/1` | Live peer/local TCP address and port. |
 | `SSL.close/1` | Idempotent local close. Sends close_notify when no application write is uncertain and wakes admitted calls. |
 
 Closed and invalid handles follow the existing public call mapping. An orderly
@@ -63,24 +66,20 @@ Supported connection options are:
 - `active: false | :once` (default `false`);
 - `verify: :verify_peer`;
 - `cacerts` or `cacertfile`;
+- one initial-handshake client identity through `cert`/`certfile` and `key`/`keyfile` (forms and bounds below);
 - DNS `server_name_indication`;
 - `customize_hostname_check: [match_fun: fun]`;
-- `versions: [:"tlsv1.3"]`;
+- `versions: [:"tlsv1.3"]` (default), `[:"tlsv1.2"]`, or either ordered, non-duplicate mixed list;
+- ordered `ciphers`, `signature_algs`, `signature_algs_cert` and `supported_groups` (forms below);
+- validated TCP options from the allowlist below;
 - non-negative integer `depth` (default `10`);
 - non-negative integer or `:infinity` `send_timeout` (default 5,000 ms);
 - `send_timeout_close: true`;
 - `alpn_advertised_protocols: [nonempty_binary, ...]`;
 - `ex_ssl: [profile: :default | %SSL.ClientHello.WireProfile{}]`.
 
-The TLS 1.3 default capability set includes X25519, P-256 ECDHE, and P-384
-ECDHE when the linked OTP crypto provider exposes them. Server CertificateVerify
-validation includes P-256 ECDSA, P-384 ECDSA, RSA-PSS-RSAE, and Ed25519 when
-their runtime primitives are available. RSA-PSS-PSS certificates remain
-unsupported until certificate SPKI parameters are retained and enforced.
-
-Verification cannot be disabled. TLS 1.2 and mixed TLS 1.3/TLS 1.2 version
-lists are rejected. Packet modes, list mode, active true/active-N, arbitrary TCP
-options, client certificates, and `send_timeout_close: false` remain
+Verification cannot be disabled. Packet modes, list mode, active true/active-N, arbitrary TCP
+options outside the allowlist and `send_timeout_close: false` remain
 unsupported. Unsupported or malformed options return a redacted
 `{:error, {:options, reason}}`; supplied option data is not echoed.
 
@@ -90,6 +89,53 @@ count and the separate certificate count/byte resource limits. Differential
 tests cover direct root-signed and one-intermediate paths at both boundaries.
 
 ## ALPN and WireProfile precedence
+
+Algorithm offers use the internal capability registry, with runtime checks for
+the required hash, AEAD, HMAC, ECDHE/curve, and RSA-PSS padding/MGF/salt controls.
+Generic RSA or ECDSA availability alone is insufficient. The supported subset is X25519/P-256/P-384 ECDHE, P-256/P-384 ECDSA, Ed25519,
+RSA-PSS-RSAE and RSA-PSS-PSS SHA-256/384/512, and the three TLS 1.3 AEAD suites.
+Supplied profile ordering remains authoritative. P-521, Ed448, X448, finite-field
+and post-quantum groups remain unsupported.
+
+ECDSA requires the scheme-specific curve and canonical DER signatures. Ed25519
+uses PureEdDSA with the correct TLS CertificateVerify context. RSA-PSS-PSS
+requires an RSASSA-PSS leaf key, distinct from RSAE; present key restrictions
+must exactly match the scheme hash, MGF1 hash, digest-sized salt and trailer 1.
+Absent PSS key parameters are unrestricted, while the TLS signature still uses
+the scheme-specific parameters. P-384 ECDHE uses fresh 48-byte scalars and
+97-byte uncompressed public points; invalid points fail closed.
+
+Client and server CertificateVerify use distinct role contexts. Initial client
+authentication is supported as described below; post-handshake authentication
+remains unsupported.
+
+Certificate-chain signature policy is separate from the leaf's TLS
+CertificateVerify scheme. An explicit `signature_algs_cert` option or
+`signature_algorithms_cert` profile extension restricts the signatures on the
+validated chain, using the chosen trust anchor and issuer key type/curve/PSS
+parameters. Trust-anchor and self-signed signatures are exempt, but normal PKIX
+trust/path/identity validation still runs. RSA PKCS1 SHA256/384/512 is supported
+for certificate signatures only, with the required runtime padding primitive.
+It is never accepted as a TLS 1.3 CertificateVerify signature.
+
+The default profile and trust behavior remain unchanged when no certificate
+signature policy is supplied. `signature_algs` restricts CertificateVerify;
+use `signature_algs_cert` to impose a chain restriction. This explicit-policy
+boundary is a documented difference from OTP's default option derivation.
+
+| TLS policy option | Supported forms |
+| --- | --- |
+| `ciphers` | Nonempty ordered list of exact OTP TLS1.3 suite maps (`key_exchange: :any`, `cipher`, `mac: :aead`, `prf`) or RFC cipher-name binary/charlist strings |
+| `signature_algs` | Nonempty ordered list of supported OTP signature-scheme atoms |
+| `signature_algs_cert` | Nonempty ordered list of supported certificate signature-scheme atoms, including `rsa_pkcs1_sha256/384/512` |
+| `supported_groups` | Nonempty ordered list of `x25519`, `secp256r1`, `secp384r1` atoms available in the runtime |
+
+Numeric IDs remain a WireProfile representation, not an additional public
+option dialect. Empty, duplicate, unsupported or malformed supplied lists fail;
+no supplied value falls back to a default. Generated profiles preserve requested
+ordering and choose the first supported group for the initial fresh share.
+Explicit profiles require exact ordered policy agreement and are not rewritten.
+Legacy OpenSSL cipher expressions and legacy hash/signature tuples are unsupported.
 
 - The default profile incorporates a top-level ALPN list in its declared order.
 - An explicit profile with no top-level ALPN is emitted unchanged.
@@ -101,6 +147,28 @@ tests cover direct root-signed and one-intermediate paths at both boundaries.
 The server selection is validated as exactly one protocol offered by the
 materialized ClientHello. It is retained only after authenticated handshake
 validation and is never inferred from the first advertisement.
+
+## TCP option allowlist
+
+`nodelay` and `keepalive` accept booleans. `sndbuf` and `recbuf` accept positive
+signed-32-bit integers; the operating system may clamp or round their values.
+`ip` accepts a local IPv4/IPv6 address tuple and `port` accepts 0..65535. Direct
+`SSL.connect` accepts one bare `:inet` or `:inet6` family flag; literal remote or
+local bind addresses infer the family when absent. Conflicting families reject.
+DNS references and IP SAN references remain distinct; inferred IP literals do
+not send SNI. Both textual and tuple IPv6 literals are supported.
+
+Only `nodelay`, `keepalive`, `sndbuf` and `recbuf` are mutable. A complete
+`SSL.setopts` request validates before I/O. Driver errors propagate; no stronger
+rollback guarantee is made for partially applied driver settings. Virtual TLS
+options and buffered delivery remain usable after raw TCP shutdown. STARTTLS
+allows mutable options after ownership handoff but rejects local bind/family
+requests, which cannot change an existing connection.
+
+Raw `buffer`, active/packet ownership controls, arbitrary socket backends and
+unsafe linger are unsupported. Driver buffer tuning cannot change the TLS record,
+handshake or plaintext bounds. The private binary/raw/active-once configuration
+remains controlled by the connection process.
 
 ## Send deadlines, ordering, and cleanup
 
@@ -168,25 +236,158 @@ plaintext bounds remain independently enforced. No traffic secrets, private
 keys, or application payloads are exposed through public metadata or ordinary
 inspection.
 
-## Consumer integration status
-
-The opt-in `http_fetch` integration is implemented in PR #14 at `690258a`.
-It keeps OTP `:ssl` as the default and pins an explicitly selected `:ex_ssl`
-backend through redirects, WebSocket upgrades, and EventSource reconnects.
-The adapter maps the supported TLS options, preserves active-once delivery and
-operation deadlines, and rejects unsupported socket/TLS options explicitly.
-HTTP/3 and WebTransport continue to use their existing QUIC path.
-
-The integration is validated by the consumer's HTTP/1.1, HTTP/2, WSS, and
-EventSource tests. The deterministic cross-record HTTP/2 closure suite passed
-at `690258a`; see the progress ledger for exact commands and remaining Phase 6
-evidence.
-
 ## Remaining limitations
 
-TLS 1.2, server TLS, DTLS, QUIC/HTTP/3, client authentication, resumption,
+Server TLS, DTLS, QUIC/HTTP/3, TLS 1.2/mTLS resumption,
 0-RTT, post-handshake authentication, active true/active-N, packet framing,
 exporters, and full OTP API parity are out of scope. ALPN negotiation alone is
 not evidence of an HTTP/2 request. See
-[HTTP_FETCH_INTEGRATION.md](HTTP_FETCH_INTEGRATION.md) for the separate consumer
-work still required.
+[HTTP_FETCH_INTEGRATION.md](HTTP_FETCH_INTEGRATION.md) for the opt-in consumer
+integration and its remaining acceptance gates.
+
+## Initial-handshake client authentication
+
+`SSL.connect` accepts one client identity and sends it only in response to an
+authenticated initial CertificateRequest. The request must offer a compatible
+CertificateVerify scheme and certificate-chain signature policy. Requested CA
+names constrain selection. Unknown OID filters are ignored as specified by TLS.
+Recognized Key Usage and Extended Key Usage filters currently result in an empty
+Certificate because filter-value matching is not implemented. A present leaf
+Key Usage must permit digital signatures even without a filter. Missing or
+incompatible identities also produce an empty Certificate, as required for
+optional client authentication. No CertificateVerify is sent for an empty chain.
+
+The client Certificate, role-specific CertificateVerify and Finished use exact
+transcript bytes and the existing bounded writer and original connect deadline.
+Large certificates span multiple records. In TLS1.3, connect success means the server was
+authenticated and the client flight was written; the peer may reject the client
+identity afterward. TLS1.2 waits for the server Finished after the client flight. Callers must handle subsequent alerts and HTTP failures.
+Server trust and hostname verification are unchanged.
+
+The loader handles one DER certificate or leaf-first DER chain, typed DER RSA/EC/
+PKCS#8 private keys, and unencrypted PEM through binary or charlist paths. One
+combined certificate/key PEM is supported when `certfile` supplies both. Separate
+sources cannot conflict or hide additional private keys. Passwords, encrypted
+keys, hardware signers and `certs_keys` multiple-identity selection are rejected.
+Chain order and a scheme-specific signing/verification proof bind the key to the
+leaf; the peer remains responsible for client certificate trust and validity.
+
+Bounds: 16 certificates, 256 KiB per DER certificate, 512 KiB aggregate DER,
+1 MiB per PEM file or typed DER key. The chain bound leaves room for TLS record
+and handshake overhead within the existing 1 MiB writer ceiling. Errors contain
+only fixed reason atoms; ordinary identity inspection exposes only scheme IDs.
+CertificateRequest CA-name and OID-filter vectors each allow at most 64 entries
+within the existing bounded extension envelope.
+Restricted PSS private keys and leaf constraints are both checked through the
+shared signature verifier. Unsupported key/parameter combinations fail explicitly.
+
+## Advanced certificate-policy boundary (Phase 3 audit)
+
+The http_fetch production inventory uses CA overrides, depth, inferred DNS/IP
+identity, and the HTTPS hostname matcher. It has no production calls requesting
+`verify_fun`, `partial_chain`, CRL or OCSP policies. Those options therefore do
+not block the restricted backend, but consumers that depend on them cannot use
+this subset unchanged.
+
+| Policy | Candidate support |
+| --- | --- |
+| `cacerts` / `cacertfile` | Explicit trust sources; no silent replacement with system trust |
+| `depth` | Intermediate-CA bound, independent of parser/resource limits |
+| SNI / reference identity | DNS identity or IP SAN verification; SNI is omitted for IP addresses |
+| `customize_hostname_check: [match_fun: fun]` | Supported hostname matching customization; path validation remains required |
+| `verify_fun` | Rejected; supplied callbacks never replace authentication failures |
+| `partial_chain` | Rejected; no user callback can introduce an intermediate trust anchor |
+| `crl_check` / `crl_cache` | Rejected; no revocation freshness or retrieval guarantee is claimed |
+| `stapling` | Rejected; OCSP response validation and availability policy are not implemented |
+| `cert_policy_opts` / `allow_any_ca_purpose` | Rejected; no implicit acceptance of policy overrides |
+
+These names follow the [OTP 29 public option documentation](https://www.erlang.org/docs/29/apps/ssl/ssl.html).
+Each supplied unsupported policy fails before network I/O, with its value
+redacted. Implementing one requires a separate trust-semantics design and
+negative/availability tests; no permissive verification callback is installed.
+
+## Explicit TLS1.2 subset (source candidate)
+
+The default remains TLS1.3-only. Explicit TLS1.2 or mixed lists negotiate on one
+connection; failure never reconnects with weaker options. The independent engine
+uses OTP crypto/public_key primitives and shares the existing socket owner, writer,
+deadlines, bounded queues, active-once and cleanup.
+
+Four suites are supported: `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`,
+`TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`,
+`TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, and
+`TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`. Ordered public suite maps use
+`key_exchange: :ecdhe_rsa | :ecdhe_ecdsa`, `mac: :aead`, the matching cipher and PRF.
+ECDHE groups remain X25519/P256/P384. The bounded handshake signature subset uses
+RSA-PSS and P256/P384 ECDSA; legacy RSA-PKCS1 handshake signatures and EdDSA cipher
+authentication are not offered by the TLS1.2-only generated profile.
+
+Extended Master Secret and a valid initial secure-renegotiation indication are
+mandatory. Missing EMS fails explicitly, including the observed local OTP28
+TLS1.2 server: its ServerHello omitted extension23. This is a documented
+interoperability restriction, not a reason to derive a legacy master secret.
+OpenSSL3.6.3 independently proves the supported full/mTLS paths; OTP28 TLS1.2
+positive interoperability is unavailable under this policy. Other runtime
+matrix evidence remains pending. Static RSA, CBC, RC4, compression, TLS1.0/1.1,
+renegotiation and TLS1.2 session resumption remain unsupported. A nonempty echoed
+session ID rejects as unsupported resumption. Generated TLS1.2-only hellos use an
+empty session ID; mixed offers retain TLS1.3 compatibility behavior.
+
+Explicit profiles must agree with ordered versions and include typed EMS and
+renegotiation extensions for TLS1.2. Only TLS1.3 offers require key shares. Mixed
+negotiation validates downgrade sentinels; the TLS1.3 default wire policy remains
+unchanged. HTTP2 uses the permitted ECDHE/AEAD subset with ALPN and no compression
+or renegotiation; the library supports P256 and ECDHE_RSA_AES128_GCM as required.
+
+TLS1.2 client authentication follows its distinct CertificateRequest and raw
+transcript signature rules. Server certificate/identity and signed ECDHE parameters
+are verified before sending credentials. Unlike TLS1.3, TLS1.2 client certificates
+are transmitted before encryption begins. No requested compatible identity sends
+an empty Certificate. Large chains fragment at16KiB. Server Finished must verify
+before connect succeeds or application bytes can be delivered.
+
+TLS1.2 server and client certificate chains are bounded to16 certificates,
+256KiB each and512KiB aggregate. Exact handshake transcript storage is bounded
+to1MiB, with reserved space for the client flight. AES-GCM records use independent
+directional counters and explicit nonces; exhaustion fails rather than wrapping.
+Tests cover primitive vectors, fragmented/malformed input, EMS/renegotiation,
+signed parameters, downgrade, CCS/Finished/AEAD errors, real suites/mTLS,
+active-once, ownership, truncation and deterministic blocked-flight timeout/cancel.
+See the ledger for exact executed gates and remaining consumer work.
+
+## Opt-in TLS 1.3 resumption and diagnostics
+
+`session_tickets: :disabled | :auto` defaults to `:disabled`. Auto is supported
+only with TLS 1.3-only versions and no configured client certificate/key. Mixed
+versions, TLS 1.2, mTLS auto, manual ticket export/import, PSK-only exchange and
+`early_data` return explicit option errors. Explicit WireProfiles must reserve
+`{:psk_key_exchange_modes, [1]}` and a last `{:pre_shared_key, :deferred}` slot;
+other extension ordering is preserved. A cache miss omits only the PSK slot.
+
+Tickets are authenticated post-handshake messages and consume no application
+active-once credit. Up to eight tickets per connection are processed; each PSK is
+derived from its nonce. Retained entries are limited to 128 partitions, 4 MiB
+aggregate, 256 KiB each, 16 KiB ticket bytes and seven days lifetime. Atomic
+one-use checkout and a single expiry timer bound cache lifetime and concurrency.
+Cache calls fail closed after 25 ms; a cache failure takes the full-handshake
+path. There is no persistent state. Each checkout revalidates the saved chain
+against current time, reference identity, loaded CA content, depth and certificate
+signature policy. Partition digests also cover the concrete endpoint, hostname,
+ALPN and ordered version/cipher/group/signature/profile policies.
+
+Resumption requires fresh ECDHE, a valid binder, selected identity zero with a
+compatible hash, unchanged selected ALPN, and authenticated Finished. HRR uses
+the exact CH1 message-hash rewrite and recomputed CH2 binder; a hash-incompatible
+PSK is removed. Server decline, including ticket-key rotation, follows the normal
+full certificate flight on the same socket. Invalid binders/Finished never cause
+reconnect or replay. Ticket bytes and secrets are excluded from runtime inspection
+and diagnostics; authenticated peer DER is intentionally public through peercert.
+
+Diagnostics return only the three keys listed above; ALPN remains available from
+`negotiated_protocol/1`. Closed diagnostic calls return `{:error, :closed}` under
+the existing public handle mapping. Local OTP28/OTP29 reference scenarios cover the
+implemented return forms, not every OTP information key or full API parity.
+Independent OpenSSL peers prove full/resumed exchanges, P384 HRR resumption,
+server ticket-key restart, disabled mode and authentication-policy rejection.
+The source-package consumer gate proves HTTP/1.1 resumption; HTTP/2/WSS/SSE
+resumption is not separately certified by that gate.

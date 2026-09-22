@@ -1,4 +1,6 @@
 defmodule SSL.Protocol.ServerFlight do
+  alias SSL.Capabilities
+
   @moduledoc """
   Bounded codecs for the encrypted TLS 1.3 server handshake flight.
 
@@ -53,6 +55,7 @@ defmodule SSL.Protocol.ServerFlight do
 
   defmodule CertificateRequest do
     @moduledoc false
+    @type t :: %__MODULE__{request_context: binary(), extensions: list(), encoded: binary()}
     @enforce_keys [:request_context, :extensions, :encoded]
     defstruct @enforce_keys
   end
@@ -85,28 +88,14 @@ defmodule SSL.Protocol.ServerFlight do
 
   @encrypted_extension_ids [0, 1, 10, 16, 19, 20, 28, 42]
   @certificate_extension_ids [5, 18]
-  # RFC 9846 permits these extensions in CertificateRequest.  We only need the
-  # signature algorithms to decide how to respond; the other permitted values
-  # are retained for exact-message diagnostics without assigning semantics.
+  # RFC 9846 permits these extensions in CertificateRequest. Unknown extensions
+  # remain opaque, while the known selection constraints are decoded and bounded.
   @certificate_request_extension_ids [0, 5, 13, 47, 48, 50]
   @recognized_extension_ids Enum.uniq(
                               @encrypted_extension_ids ++
                                 @certificate_extension_ids ++
                                 @certificate_request_extension_ids ++ [41, 43, 51]
                             )
-  @tls13_signature_schemes [
-    0x0403,
-    0x0503,
-    0x0603,
-    0x0804,
-    0x0805,
-    0x0806,
-    0x0807,
-    0x0808,
-    0x0809,
-    0x080A,
-    0x080B
-  ]
 
   @type decoded ::
           EncryptedExtensions.t()
@@ -140,6 +129,40 @@ defmodule SSL.Protocol.ServerFlight do
     do: {:ok, <<11, byte_size(context) + 4::24, byte_size(context), context::binary, 0::24>>}
 
   def encode_empty_certificate(_context), do: {:error, {:invalid_input, :request_context}}
+
+  @spec encode_client_certificate(binary(), [binary()]) :: {:ok, binary()} | {:error, term()}
+  def encode_client_certificate(context, chain)
+      when is_binary(context) and byte_size(context) <= 255 and is_list(chain) do
+    if length(chain) <= @default_max_certificate_count and
+         Enum.all?(
+           chain,
+           &(is_binary(&1) and byte_size(&1) >= 1 and
+               byte_size(&1) <= @default_max_certificate_bytes)
+         ) and
+         Enum.reduce(chain, 0, &(byte_size(&1) + &2)) <= 524_288 do
+      entries = for der <- chain, do: <<byte_size(der)::24, der::binary, 0::16>>
+      list = IO.iodata_to_binary(entries)
+      body = <<byte_size(context), context::binary, byte_size(list)::24, list::binary>>
+      {:ok, <<11, byte_size(body)::24, body::binary>>}
+    else
+      {:error, :invalid_client_certificate_chain}
+    end
+  end
+
+  def encode_client_certificate(_context, _chain),
+    do: {:error, :invalid_client_certificate_chain}
+
+  @spec encode_client_certificate_verify(non_neg_integer(), binary()) ::
+          {:ok, binary()} | {:error, term()}
+  def encode_client_certificate_verify(scheme, signature)
+      when is_integer(scheme) and scheme in 0..0xFFFF and is_binary(signature) and
+             byte_size(signature) in 1..@default_max_signature_bytes do
+    {:ok,
+     <<15, 4 + byte_size(signature)::24, scheme::16, byte_size(signature)::16, signature::binary>>}
+  end
+
+  def encode_client_certificate_verify(_scheme, _signature),
+    do: {:error, :invalid_client_certificate_verify}
 
   @spec encode_key_update(boolean()) :: {:ok, binary()}
   def encode_key_update(request_update) when is_boolean(request_update),
@@ -394,7 +417,7 @@ defmodule SSL.Protocol.ServerFlight do
 
   defp validate_signature_scheme(signature_scheme, allowed_signature_schemes) do
     cond do
-      signature_scheme not in @tls13_signature_schemes ->
+      not Capabilities.tls13_signature_scheme?(signature_scheme) ->
         {:error, {:unsupported_signature_scheme, signature_scheme}}
 
       signature_scheme not in allowed_signature_schemes ->
@@ -532,6 +555,15 @@ defmodule SSL.Protocol.ServerFlight do
   defp decode_extension(:certificate_request, 13, payload, _config),
     do: decode_signature_algorithms(payload)
 
+  defp decode_extension(:certificate_request, 47, payload, _config),
+    do: decode_certificate_authorities(payload)
+
+  defp decode_extension(:certificate_request, 50, payload, _config),
+    do: decode_signature_algorithms_cert(payload)
+
+  defp decode_extension(:certificate_request, 48, payload, _config),
+    do: decode_oid_filters(payload)
+
   defp decode_extension(:certificate_request, extension_id, payload, _config)
        when extension_id in @certificate_request_extension_ids,
        do: {:ok, {:raw, extension_id, payload}}
@@ -628,6 +660,96 @@ defmodule SSL.Protocol.ServerFlight do
   defp decode_signature_algorithms(_payload),
     do: {:error, {:malformed_extension, 13, :signature_algorithms}}
 
+  defp decode_signature_algorithms_cert(<<length::16, values::binary>>)
+       when length > 0 and rem(length, 2) == 0 and byte_size(values) == length do
+    algorithms = for <<algorithm::16 <- values>>, do: algorithm
+
+    if length(algorithms) == length(Enum.uniq(algorithms)),
+      do: {:ok, {:signature_algorithms_cert, algorithms}},
+      else: {:error, {:duplicate_signature_algorithm, :certificate_request}}
+  end
+
+  defp decode_signature_algorithms_cert(_payload),
+    do: {:error, {:malformed_extension, 50, :signature_algorithms_cert}}
+
+  defp decode_certificate_authorities(<<length::16, names::binary>>)
+       when length >= 3 and byte_size(names) == length,
+       do: decode_authority_names(names, [])
+
+  defp decode_certificate_authorities(_payload),
+    do: {:error, {:malformed_extension, 47, :certificate_authorities}}
+
+  defp decode_authority_names(<<>>, names),
+    do: {:ok, {:certificate_authorities, Enum.reverse(names)}}
+
+  defp decode_authority_names(<<length::16, name::binary-size(length), rest::binary>>, names)
+       when length > 0 and length(names) < 64 do
+    case valid_der_name?(name) do
+      true -> decode_authority_names(rest, [name | names])
+      false -> {:error, {:malformed_extension, 47, :distinguished_name}}
+    end
+  end
+
+  defp decode_authority_names(_bytes, _names),
+    do: {:error, {:malformed_extension, 47, :certificate_authorities}}
+
+  defp valid_der_name?(bytes) do
+    case :public_key.der_decode(:Name, bytes) do
+      {:rdnSequence, _} = name -> :public_key.der_encode(:Name, name) == bytes
+      _ -> false
+    end
+  catch
+    _, _ -> false
+  end
+
+  defp decode_oid_filters(<<length::16, filters::binary>>) when byte_size(filters) == length,
+    do: decode_oid_filter_entries(filters, [])
+
+  defp decode_oid_filters(_payload), do: {:error, {:malformed_extension, 48, :oid_filters}}
+
+  defp decode_oid_filter_entries(<<>>, filters),
+    do: {:ok, {:oid_filters, Enum.reverse(filters)}}
+
+  defp decode_oid_filter_entries(
+         <<oid_length, oid::binary-size(oid_length), values_length::16,
+           values::binary-size(values_length), rest::binary>>,
+         filters
+       )
+       when oid_length > 0 and length(filters) < 64 do
+    cond do
+      not valid_der_oid?(oid) ->
+        {:error, {:malformed_extension, 48, :oid}}
+
+      Enum.any?(filters, fn {seen_oid, _} -> seen_oid == oid end) ->
+        {:error, {:duplicate_oid_filter, oid}}
+
+      true ->
+        decode_oid_filter_entries(rest, [{oid, values} | filters])
+    end
+  end
+
+  defp decode_oid_filter_entries(_bytes, _filters),
+    do: {:error, {:malformed_extension, 48, :oid_filters}}
+
+  # A DER OBJECT IDENTIFIER has a canonical definite length and complete
+  # base-128 subidentifiers. The OID values are left opaque until supported.
+  defp valid_der_oid?(<<6, length, body::binary>>)
+       when length > 0 and length < 128 and byte_size(body) == length,
+       do: valid_oid_components(body, true)
+
+  defp valid_der_oid?(<<6, 0x81, length, body::binary>>)
+       when length >= 128 and byte_size(body) == length,
+       do: valid_oid_components(body, true)
+
+  defp valid_der_oid?(_), do: false
+
+  defp valid_oid_components(<<>>, true), do: true
+  defp valid_oid_components(<<>>, false), do: false
+  defp valid_oid_components(<<128, _::binary>>, true), do: false
+
+  defp valid_oid_components(<<byte, rest::binary>>, _start?),
+    do: valid_oid_components(rest, byte < 128)
+
   defp decode_alpn(<<list_length::16, protocol_length, protocol::binary>>)
        when list_length == protocol_length + 1 and protocol_length > 0 and
               byte_size(protocol) == protocol_length,
@@ -686,7 +808,7 @@ defmodule SSL.Protocol.ServerFlight do
       max_signature_bytes: Keyword.get(opts, :max_signature_bytes, @default_max_signature_bytes),
       offered_extension_ids: Keyword.get(opts, :offered_extension_ids, []),
       allowed_signature_schemes:
-        Keyword.get(opts, :allowed_signature_schemes, @tls13_signature_schemes),
+        Keyword.get(opts, :allowed_signature_schemes, Capabilities.tls13_signature_ids()),
       hash: Keyword.get(opts, :hash, :sha256)
     }
 

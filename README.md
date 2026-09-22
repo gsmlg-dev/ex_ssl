@@ -9,9 +9,16 @@ The OTP application is `:ex_ssl`. The public compatibility module is `SSL` (`Eli
 
 > **Status:** experimental TLS 1.3 client runtime with authenticated connections,
 > passive and active-once binary/raw traffic, application ownership transfer,
-> ALPN lookup, bounded streaming writes, and TCP-to-TLS upgrades. See the
+> ALPN lookup, bounded streaming writes, initial-handshake client authentication,
+> and TCP-to-TLS upgrades. See the
 > [compatibility matrix](docs/COMPATIBILITY.md) for exact restrictions. OTP
 > `:ssl` remains the default recommendation.
+
+The source candidate also supports ordered TLS 1.3 algorithm options, explicit
+certificate-chain signature restrictions, one client identity, and a validated
+TCP option allowlist. These additions are not in the published 0.3.0 dependency;
+see [compatibility](docs/COMPATIBILITY.md) and the
+[implementation ledger](docs/EX_SSL_HTTP_FETCH_PROGRESS.md) for executed gates.
 
 ## Installation
 
@@ -87,13 +94,24 @@ The initial compatibility baseline is the Erlang/OTP 29 `:ssl` client API.
 
 Implemented client functions are `connect/2,3,4`, `send/2`, `recv/2,3`,
 `close/1`, `setopts/2`, `controlling_process/2`, and
-`negotiated_protocol/1`. Calls return success only after CertificateVerify and
-Finished verification and transmission of client Finished. The connection runs
+`negotiated_protocol/1`, `connection_information/1,2`, `peercert/1`,
+`peername/1`, and `sockname/1`. Full handshakes verify CertificateVerify and
+Finished; resumed handshakes verify the ticket-bound Finished. Connect succeeds
+after the client Finished is transmitted. The connection runs
 as a temporary supervised `:gen_statem`; a failed session is never restarted.
 
 Defaults are deliberately restricted to binary, passive, raw, verified TLS 1.3.
 They differ from OTP's defaults. Supported options and receive/upgrade ownership
 rules are documented in the [compatibility matrix](docs/COMPATIBILITY.md).
+
+TLS 1.3 resumption is opt-in with `session_tickets: :auto`; the default is
+`:disabled`. Auto requires TLS 1.3-only versions and no configured client identity.
+Tickets remain in a bounded in-memory cache, partitioned by endpoint and loaded
+trust/security policy. Each use revalidates the saved peer certificate chain and
+performs fresh ECDHE. A server declining PSK continues normal full authentication
+on that connection. No early data, automatic reconnect, or request replay occurs.
+See the [resumption policy](docs/ADR_TLS13_RESUMPTION.md) and
+[compatibility details](docs/COMPATIBILITY.md).
 
 The wider roadmap (not implemented API) includes:
 
@@ -101,10 +119,6 @@ The wider roadmap (not implemented API) includes:
 close/2
 shutdown/2
 getopts/2
-peername/1
-sockname/1
-peercert/1
-connection_information/1,2
 getstat/1,2
 update_keys/2
 export_key_materials/4,5
@@ -168,9 +182,14 @@ Initial target groups:
 ```text
 X25519
 secp256r1
+secp384r1
 ```
 
-Runtime support depends on the crypto provider available to OTP.
+Runtime support depends on the crypto provider available to OTP. Implemented
+TLS 1.3 handshake signatures are P-256/P-384 ECDSA, Ed25519, and RSA-PSS-RSAE /
+RSA-PSS-PSS SHA-256/384/512, with strict key and parameter checks. See
+[the compatibility matrix](docs/COMPATIBILITY.md) for the bounded subset; client
+certificates and explicit bounded TLS 1.2 are implemented in this source candidate.
 
 ## Architecture
 
@@ -232,9 +251,14 @@ A matching TLS ClientHello does not guarantee that a remote service will see a c
 
 `ex_ssl` focuses on the TLS layer.
 
-### TLS 1.2 comes later
+### Explicit bounded TLS 1.2
 
-Many real clients advertise both TLS 1.3 and TLS 1.2. A profile must not normally advertise a protocol version that `ex_ssl` cannot negotiate. TLS 1.2 client support is therefore a planned follow-up required for broader faithful profile coverage.
+The source candidate accepts explicit TLS1.2-only or mixed version lists while
+keeping TLS1.3 as the default. TLS1.2 requires ECDHE, AES-GCM, Extended Master
+Secret and secure-renegotiation indication; renegotiation is disabled. Peers
+without EMS, including the observed local OTP28 TLS1.2 server, fail explicitly.
+OpenSSL full/mTLS exchanges validate the bounded subset. See the compatibility
+matrix and progress ledger for evidence and remaining gates.
 
 ### BEAM secret zeroization
 
@@ -261,7 +285,7 @@ The implementation uses OTP `:crypto` and `:public_key` for cryptographic primit
 The authenticated TLS 1.3 client, passive/active-once raw application traffic,
 STARTTLS, ownership transfer, public ALPN, KeyUpdate handling, and bounded
 multi-record writes are implemented. Development continues toward broader OTP
-API/options, active modes, packet modes, exporters/resumption, verified
+API/options, active modes, packet modes, exporters, verified
 real-world profiles, performance work, and independent security review.
 
 See:

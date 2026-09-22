@@ -8,6 +8,7 @@ defmodule SSL.PKIX do
   """
 
   alias SSL.PKIX.Certificate
+  alias SSL.PKIX.CertificateSignaturePolicy
   alias SSL.PKIX.VerifiedPeer
 
   require Record
@@ -37,6 +38,8 @@ defmodule SSL.PKIX do
   @default_max_pem_bytes 8_388_608
   @rsa_encryption_oid {1, 2, 840, 113_549, 1, 1, 1}
   @ec_public_key_oid {1, 2, 840, 10_045, 2, 1}
+  @rsa_pss_oid {1, 2, 840, 113_549, 1, 1, 10}
+  @ed25519_oid {1, 3, 101, 112}
   @subject_alt_name_oid {2, 5, 29, 17}
   @maximum_dns_name_length 253
   @option_keys [
@@ -46,7 +49,8 @@ defmodule SSL.PKIX do
     :max_total_der_bytes,
     :max_pem_bytes,
     :depth,
-    :customize_hostname_check
+    :customize_hostname_check,
+    :certificate_signature_schemes
   ]
 
   @type identity :: {:dns_id, binary()} | {:ip, binary() | :inet.ip_address()}
@@ -58,6 +62,7 @@ defmodule SSL.PKIX do
           | {:max_pem_bytes, pos_integer()}
           | {:depth, non_neg_integer()}
           | {:customize_hostname_check, keyword()}
+          | {:certificate_signature_schemes, [non_neg_integer()] | nil}
   @type error_reason ::
           :empty_certificate_chain
           | :empty_trust_anchors
@@ -71,6 +76,7 @@ defmodule SSL.PKIX do
           | {:certificate_total_der_limit_exceeded, non_neg_integer(), pos_integer()}
           | {:pem_limit_exceeded, non_neg_integer(), pos_integer()}
           | {:path_validation_failed, term()}
+          | {:certificate_signature_scheme_not_allowed, [non_neg_integer()]}
 
   @spec decode_chain(term(), [option()]) ::
           {:ok, [Certificate.t()]} | {:error, error_reason()}
@@ -97,7 +103,12 @@ defmodule SSL.PKIX do
          {:ok, chain} <- decode_chain(chain, options),
          {:ok, trust_anchors} <- normalize_trust(trust_source, options),
          {:ok, public_key} <-
-           validate_path(chain, trust_anchors, Keyword.get(options, :depth, 10)),
+           validate_path(
+             chain,
+             trust_anchors,
+             Keyword.get(options, :depth, 10),
+             Keyword.get(options, :certificate_signature_schemes)
+           ),
          [leaf | _] <- chain,
          :ok <-
            verify_identity(
@@ -109,7 +120,8 @@ defmodule SSL.PKIX do
        %VerifiedPeer{
          leaf_der: leaf.der,
          leaf: leaf.decoded,
-         public_key: public_key
+         public_key: public_key,
+         chain: Enum.map(chain, & &1.der)
        }}
     end
   end
@@ -244,14 +256,32 @@ defmodule SSL.PKIX do
     _kind, _reason -> :error
   end
 
-  defp validate_path(chain, trust_anchors, depth) do
+  defp validate_path(chain, trust_anchors, depth, signature_schemes) do
     Enum.reduce_while(trust_anchors, {:error, {:path_validation_failed, :unknown_ca}}, fn anchor,
-                                                                                          _error ->
+                                                                                          previous_error ->
       path = otp_path(chain, anchor)
 
       case safe_path_validation(anchor.der, path, depth) do
-        {:ok, public_key} -> {:halt, {:ok, public_key}}
-        {:error, reason} -> {:cont, {:error, {:path_validation_failed, reason}}}
+        {:ok, public_key} ->
+          if signature_schemes == nil or
+               CertificateSignaturePolicy.compatible?(
+                 Enum.map(chain, & &1.der),
+                 anchor.der,
+                 signature_schemes
+               ) do
+            {:halt, {:ok, public_key}}
+          else
+            {:cont, {:error, {:certificate_signature_scheme_not_allowed, signature_schemes}}}
+          end
+
+        {:error, reason} ->
+          case previous_error do
+            {:error, {:certificate_signature_scheme_not_allowed, _}} ->
+              {:cont, previous_error}
+
+            _ ->
+              {:cont, {:error, {:path_validation_failed, reason}}}
+          end
       end
     end)
   end
@@ -289,6 +319,14 @@ defmodule SSL.PKIX do
          {@rsa_encryption_oid, {:RSAPublicKey, _modulus, _exponent} = public_key, _parameters}
        ),
        do: public_key
+
+  # Retain the SubjectPublicKeyInfo algorithm and restrictions for TLS
+  # CertificateVerify scheme selection. OTP's bare RSA key omits this policy.
+  defp certificate_verify_key({@rsa_pss_oid, {:RSAPublicKey, _, _}, _} = public_key_info),
+    do: public_key_info
+
+  defp certificate_verify_key({@ed25519_oid, {:ECPoint, _}, _} = public_key_info),
+    do: public_key_info
 
   defp certificate_verify_key(public_key_info), do: public_key_info
 
@@ -533,7 +571,24 @@ defmodule SSL.PKIX do
 
   defp valid_limit?(value), do: is_integer(value) and value > 0
   defp valid_pkix_option?(:depth, value), do: is_integer(value) and value >= 0
+  defp valid_pkix_option?(:certificate_signature_schemes, nil), do: true
+
+  defp valid_pkix_option?(:certificate_signature_schemes, schemes),
+    do: valid_scheme_list?(schemes)
+
   defp valid_pkix_option?(_key, value), do: valid_limit?(value)
+
+  defp valid_scheme_list?([scheme | rest]) when is_integer(scheme) and scheme in 0..0xFFFF,
+    do: valid_scheme_list_tail?(rest)
+
+  defp valid_scheme_list?(_), do: false
+  defp valid_scheme_list_tail?([]), do: true
+
+  defp valid_scheme_list_tail?([scheme | rest])
+       when is_integer(scheme) and scheme in 0..0xFFFF,
+       do: valid_scheme_list_tail?(rest)
+
+  defp valid_scheme_list_tail?(_), do: false
 
   defp valid_hostname_options?([]), do: true
   defp valid_hostname_options?(match_fun: fun) when is_function(fun, 2), do: true

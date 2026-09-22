@@ -316,6 +316,16 @@ defmodule SSL.ClientHello.ProfileTest do
              Profile.validate(profile, @capabilities)
   end
 
+  test "requires separate certificate signature capabilities" do
+    profile = struct(WireProfile, extensions: [{:signature_algorithms_cert, [0x0403]}])
+
+    assert {:error, {:unsupported_certificate_signature_algorithms, [0x0403]}} =
+             Profile.validate(profile, @capabilities)
+
+    capabilities = Map.put(@capabilities, :certificate_signature_algorithms, [0x0403])
+    assert {:ok, ^profile} = Profile.validate(profile, capabilities)
+  end
+
   test "requires key shares to be an ordered subset of unique supported groups" do
     invalid_profiles = [
       {profile(extensions: [{:supported_groups, [:x25519, :x25519]}]),

@@ -43,6 +43,11 @@ defmodule SSL.Crypto.KeyScheduleTest do
                        "7DF235F2031D2A051287D02B0241B0BFDAF86CC856231F2D5ABA46C434EC196C"
                      )
 
+  test "TLS1.2 suites cannot enter the TLS1.3 key schedule" do
+    assert {:error, {:unsupported_cipher_suite, 0xC02F}} =
+             KeySchedule.traffic_state(0xC02F, <<0::256>>)
+  end
+
   test "derives the RFC 8448 early, handshake, and master secrets" do
     assert {:ok, @early_secret} = KeySchedule.early_secret(:sha256, nil)
 

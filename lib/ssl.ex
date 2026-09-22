@@ -2,7 +2,7 @@ defmodule SSL do
   @moduledoc """
   OTP `:ssl`-compatible client facade for the implemented `ex_ssl` feature subset.
 
-  This experimental client supports TLS 1.3, binary raw sockets, passive and
+  This experimental client supports TLS 1.3 and explicit bounded TLS 1.2, binary raw sockets, passive and
   active-once delivery, application ownership transfer, authenticated ALPN,
   bounded streaming writes, and mandatory peer verification. These restricted
   defaults differ from OTP. Unsupported options return explicit
@@ -53,7 +53,7 @@ defmodule SSL do
                send_timeout: options.send_timeout,
                send_timeout_close: options.send_timeout_close,
                buffer: 16_640
-             ],
+             ] ++ options.tcp_options,
              Options.remaining(deadline)
            ) do
       close_on_error(handoff(tcp_socket, options, deadline), tcp_socket)
@@ -73,7 +73,7 @@ defmodule SSL do
          do: call(socket, {:send, token, cursor, size})
   end
 
-  @doc "Atomically changes supported application delivery and send options."
+  @doc "Changes supported delivery, send, and mutable TCP options after validation."
   @spec setopts(Socket.t(), list()) :: :ok | {:error, term()}
   def setopts(socket, options) do
     with {:ok, normalized} <- Options.normalize_setopts(options),
@@ -90,6 +90,30 @@ defmodule SSL do
   @doc "Returns the authenticated ALPN selection, if the server negotiated one."
   @spec negotiated_protocol(Socket.t()) :: {:ok, binary()} | {:error, term()}
   def negotiated_protocol(socket), do: call(socket, :negotiated_protocol)
+
+  @doc "Returns the supported non-secret connection metadata."
+  @spec connection_information(Socket.t()) :: {:ok, keyword()} | {:error, term()}
+  def connection_information(socket), do: connection_information(socket, SSL.Diagnostics.keys())
+
+  @spec connection_information(Socket.t(), term()) :: {:ok, keyword()} | {:error, term()}
+  def connection_information(socket, keys) do
+    with :ok <- SSL.Diagnostics.validate_keys(keys),
+         do: call(socket, {:connection_information, keys})
+  end
+
+  @doc "Returns the authenticated server leaf certificate as DER."
+  @spec peercert(Socket.t()) :: {:ok, binary()} | {:error, term()}
+  def peercert(socket), do: call(socket, :peercert)
+
+  @doc "Returns the live TCP peer address and port."
+  @spec peername(Socket.t()) ::
+          {:ok, {:inet.ip_address(), :inet.port_number()}} | {:error, term()}
+  def peername(socket), do: call(socket, :peername)
+
+  @doc "Returns the live local TCP address and port."
+  @spec sockname(Socket.t()) ::
+          {:ok, {:inet.ip_address(), :inet.port_number()}} | {:error, term()}
+  def sockname(socket), do: call(socket, :sockname)
 
   @doc "Receives available bytes for length 0, or exactly length bytes. Timeout retains buffered data."
   @spec recv(Socket.t(), non_neg_integer(), timeout()) :: {:ok, binary()} | {:error, term()}

@@ -93,6 +93,83 @@ defmodule SSL.Protocol.HandshakeMachineTest do
              HandshakeMachine.feed(machine, record)
   end
 
+  test "authenticated fragmented tickets derive distinct PSKs within an eight-ticket bound" do
+    machine = %{
+      connected_fixture_machine()
+      | enable_tickets: true,
+        resumption_master: :binary.copy(<<7>>, 48)
+    }
+
+    wire = <<4, 15::24, 60::32, 7::32, 1, 9, 1::16, 1, 0::16>>
+    <<first::binary-size(6), last::binary>> = wire
+    {:ok, record, server} = Record.encrypt(machine.read_state, :handshake, first)
+    assert {:ok, machine, [], []} = HandshakeMachine.feed(machine, record)
+    {:ok, record, _} = Record.encrypt(server, :handshake, last)
+
+    assert {:ok, machine, [], [{:session_ticket, material}]} =
+             HandshakeMachine.feed(machine, record)
+
+    assert material.lifetime == 60
+    assert material.ticket == <<1>>
+    assert byte_size(material.psk) == 48
+    assert material.peer == machine.verified_peer
+    assert machine.pending_tickets == []
+
+    final =
+      Enum.reduce(2..8, machine, fn nonce, current ->
+        ticket = <<4, 15::24, 60::32, 7::32, 1, nonce, 1::16, 1, 0::16>>
+        {:ok, record, _} = Record.encrypt(current.read_state, :handshake, ticket)
+
+        assert {:ok, next, [], [{:session_ticket, received}]} =
+                 HandshakeMachine.feed(current, record)
+
+        refute received.psk == material.psk
+        next
+      end)
+
+    assert final.ticket_count == 8
+    assert final.resumption_master == nil
+    {:ok, record, _} = Record.encrypt(final.read_state, :handshake, wire)
+    assert {:ok, _, [], []} = HandshakeMachine.feed(final, record)
+  end
+
+  test "enabled ticket parsing rejects malformed lifetime and unauthenticated records" do
+    machine = %{
+      connected_fixture_machine()
+      | enable_tickets: true,
+        resumption_master: :binary.copy(<<7>>, 48)
+    }
+
+    ticket = <<4, 15::24, 604_801::32, 7::32, 1, 9, 1::16, 1, 0::16>>
+    {:ok, record, _} = Record.encrypt(machine.read_state, :handshake, ticket)
+
+    assert {:error,
+            {:fatal_alert, :unexpected_message, {:invalid_new_session_ticket_lifetime, 604_801}}} =
+             HandshakeMachine.feed(machine, record)
+
+    <<head::binary-size(byte_size(^record) - 1), last>> = record
+    tampered = head <> <<Bitwise.bxor(last, 1)>>
+    assert {:error, {:fatal_alert, :bad_record_mac, _}} = HandshakeMachine.feed(machine, tampered)
+    zero = <<4, 15::24, 0::32, 7::32, 1, 9, 1::16, 1, 0::16>>
+    {:ok, record, _} = Record.encrypt(machine.read_state, :handshake, zero)
+    assert {:ok, unchanged, [], []} = HandshakeMachine.feed(machine, record)
+    assert unchanged.ticket_count == 0
+  end
+
+  test "runtime inspection omits ClientHello ticket bytes and resumption secrets" do
+    machine = %{
+      connected_fixture_machine()
+      | client_hello: "private-ticket-wire",
+        client_ast: %{ticket: "private-ticket-wire"},
+        offer: %{ticket: "private-ticket-wire"},
+        resumption_master: "private-resumption-master"
+    }
+
+    inspected = inspect(machine, limit: :infinity)
+    refute inspected =~ "private-ticket-wire"
+    refute inspected =~ "private-resumption-master"
+  end
+
   for {suite, hash, limit} <- [
         {:tls_aes_128_gcm_sha256, :sha256, 23_726_566},
         {:tls_aes_256_gcm_sha384, :sha384, 23_726_566},
@@ -284,6 +361,52 @@ defmodule SSL.Protocol.HandshakeMachineTest do
     assert {:ok, offer} = ClientOffer.from_client_hello(client_hello2)
     assert [%{group: 0x0017, key_exchange: second_public}] = offer.key_shares
     refute second_public == first_pair.public_key
+    assert retried.client_ast.random == ast.random
+    assert retried.client_ast.session_id == ast.session_id
+    assert retried.client_ast.cipher_suites == ast.cipher_suites
+    assert Enum.at(retried.client_ast.extensions, 0) == groups
+  end
+
+  test "P384 HelloRetryRequest preserves fields and rejects repeated retry" do
+    {:ok, first_pair} = KeyExchange.generate(:x25519)
+    {:ok, groups} = Extension.encode({:supported_groups, [0x001D, 0x0018]})
+    {:ok, versions} = Extension.encode({:supported_versions, [0x0304]})
+    {:ok, shares} = Extension.encode({:key_share, [{0x001D, first_pair.public_key}]})
+
+    ast = %AST{
+      legacy_version: 0x0303,
+      random: <<7::256>>,
+      session_id: <<8, 9>>,
+      cipher_suites: [0x1301],
+      compression_methods: [0],
+      extensions: [groups, versions, shares]
+    }
+
+    materialized = %Materialized{client_hello: ast, key_pairs: [first_pair]}
+
+    assert {:ok, machine, [_]} =
+             HandshakeMachine.init(
+               materialized,
+               [@capture.client_public],
+               {:dns_id, "example.test"}
+             )
+
+    hrr_random =
+      Base.decode16!("CF21AD74E59A6111BE1D8C021E65B891C2A211167ABB8C5E079E09E2C8A8339C")
+
+    hrr =
+      hello(hrr_random, ast.session_id, 0x1301, [
+        extension(43, <<0x0304::16>>),
+        extension(51, <<0x0018::16>>)
+      ])
+
+    assert {:ok, retried, [record], []} = HandshakeMachine.feed(machine, plaintext_record(hrr))
+    <<22, 3, 3, _::16, client_hello2::binary>> = record
+    assert {:ok, offer} = ClientOffer.from_client_hello(client_hello2)
+    assert [%{group: 0x0018, key_exchange: second_public}] = offer.key_shares
+    assert byte_size(second_public) == 97
+    refute second_public == first_pair.public_key
+    assert {:error, _} = HandshakeMachine.feed(retried, plaintext_record(hrr))
     assert retried.client_ast.random == ast.random
     assert retried.client_ast.session_id == ast.session_id
     assert retried.client_ast.cipher_suites == ast.cipher_suites

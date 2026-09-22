@@ -1,5 +1,5 @@
 defmodule SSL.Protocol.HandshakeMachine do
-  @moduledoc "Pure TLS 1.3 client coordinator consuming one complete record at a time."
+  @moduledoc "Pure TLS client coordinator consuming one complete record at a time."
 
   alias SSL.ClientHello.{Extension, Serializer}
   alias SSL.ClientHello.Materializer.Materialized
@@ -13,15 +13,32 @@ defmodule SSL.Protocol.HandshakeMachine do
     ServerFlight,
     ServerFlightVerifier,
     ServerHello,
+    TLS12,
+    TLS12Codec,
     Transcript
   }
 
   alias SSL.Protocol.ServerFlightVerifier.{Incremental, Input}
+  alias SSL.Protocol.Resumption
 
   @max_handshake_length 1_048_576
   @ccs <<20, 3, 3, 0, 1, 1>>
 
-  @derive {Inspect, except: [:key_pair, :read_state, :write_state, :verifier]}
+  @derive {Inspect,
+           except: [
+             :client_hello,
+             :client_ast,
+             :offer,
+             :key_pair,
+             :key_pairs,
+             :read_state,
+             :write_state,
+             :verifier,
+             :client_identity,
+             :ticket,
+             :resumption_master,
+             :pending_tickets
+           ]}
   defstruct [
     :client_hello,
     :client_ast,
@@ -29,43 +46,59 @@ defmodule SSL.Protocol.HandshakeMachine do
     :key_pairs,
     :trust_source,
     :identity,
+    :client_identity,
     :offer,
     :server_hello,
     :read_state,
     :write_state,
     :negotiated_protocol,
+    :verified_peer,
+    :ticket,
+    :resumption_master,
     :phase,
     :framer,
     :verifier,
     :hrr,
     :hrr_transcript,
+    resumed: false,
+    enable_tickets: false,
+    ticket_count: 0,
+    pending_tickets: [],
     options: []
   ]
 
   @type event ::
           {:connected, binary() | nil} | {:application_data, binary()} | :closed
-  @type t :: %__MODULE__{}
+  @type t :: %__MODULE__{} | TLS12.t()
 
   @spec init(Materialized.t(), term(), SSL.PKIX.identity(), keyword()) ::
           {:ok, t(), [binary()]} | {:error, term()}
   def init(materialized, trust_source, identity, opts \\ [])
 
   def init(%Materialized{} = materialized, trust_source, identity, opts) when is_list(opts) do
-    with {:ok, client_hello} <- encoded_client_hello(materialized, opts),
+    {client_identity, verifier_opts} = Keyword.pop(opts, :client_identity)
+    {ticket, verifier_opts} = Keyword.pop(verifier_opts, :ticket)
+    {enable_tickets, verifier_opts} = Keyword.pop(verifier_opts, :enable_tickets, false)
+
+    with {:ok, unsigned} <- encoded_client_hello(materialized, verifier_opts),
+         {:ok, client_hello} <- bind_hello(unsigned, ticket, <<>>),
          {:ok, offer} <- ClientOffer.from_client_hello(client_hello),
          {:ok, key_pairs} <- matching_key_pairs(materialized.key_pairs, offer),
          :ok <- validate_identity(identity) do
       state = %__MODULE__{
         client_hello: client_hello,
         client_ast: materialized.client_hello,
-        key_pair: hd(key_pairs),
+        key_pair: List.first(key_pairs),
         key_pairs: key_pairs,
         trust_source: trust_source,
         identity: identity,
+        client_identity: client_identity,
+        ticket: ticket,
+        enable_tickets: enable_tickets,
         offer: offer,
         phase: :await_server_hello,
         framer: HandshakeFramer.new(),
-        options: opts
+        options: verifier_opts
       }
 
       {:ok, state, plaintext_handshake_records(client_hello)}
@@ -77,9 +110,15 @@ defmodule SSL.Protocol.HandshakeMachine do
   @spec feed(t(), binary()) ::
           {:ok, t(), [binary()], [event()]}
           | {:error, {:fatal_alert, atom(), term()} | {:peer_alert, byte(), byte()}}
+  def feed(%TLS12{} = state, record), do: TLS12.feed(state, record)
+
   def feed(%__MODULE__{phase: phase} = state, @ccs)
       when phase in [:await_server_hello, :await_server_hello_after_retry, :await_server_flight],
-      do: {:ok, state, [], []}
+      do:
+        if(0x0304 in state.offer.offered_versions,
+          do: {:ok, state, [], []},
+          else: fatal(:unexpected_message, :unexpected_tls12_change_cipher_spec)
+        )
 
   def feed(%__MODULE__{phase: phase}, <<20, _::binary>>)
       when phase in [:await_server_hello, :await_server_hello_after_retry, :await_server_flight],
@@ -104,11 +143,31 @@ defmodule SSL.Protocol.HandshakeMachine do
         {[], _buffered} ->
           {:ok, %{state | framer: framer}, [], []}
 
-        {[handshake], 0} ->
-          with {:ok, hello} <- decode_server_hello(handshake, state.offer) do
-            accept_server_hello(%{state | framer: HandshakeFramer.new()}, hello)
-          else
-            {:error, reason} -> fatal(:illegal_parameter, reason)
+        {[handshake | _] = handshakes, _buffered} ->
+          case TLS12Codec.decode(handshake) do
+            {:ok, %{type: :server_hello, cipher_suite: suite}} ->
+              if match?(%{version: 0x0303}, SSL.Capabilities.resolve(:cipher_suite, suite)) do
+                if 0x0303 in state.offer.offered_versions and suite in state.offer.cipher_suites and
+                     state.phase == :await_server_hello do
+                  with {:ok, tls12} <-
+                         TLS12.new(
+                           state.client_hello,
+                           state.offer,
+                           state.trust_source,
+                           state.identity,
+                           [client_identity: state.client_identity] ++ state.options
+                         ) do
+                    TLS12.feed_handshakes(tls12, handshakes, framer)
+                  end
+                else
+                  fatal(:illegal_parameter, :unoffered_tls12_selection)
+                end
+              else
+                accept_initial_tls13(state, handshakes, framer)
+              end
+
+            _ ->
+              accept_initial_tls13(state, handshakes, framer)
           end
 
         _other ->
@@ -144,6 +203,20 @@ defmodule SSL.Protocol.HandshakeMachine do
 
   def feed(_, _), do: fatal(:decode_error, :invalid_record)
 
+  defp accept_initial_tls13(state, [handshake], framer) do
+    if HandshakeFramer.buffered_size(framer) == 0 do
+      with {:ok, hello} <- decode_server_hello(handshake, state.offer) do
+        accept_server_hello(%{state | framer: HandshakeFramer.new()}, hello)
+      else
+        {:error, reason} -> fatal(:illegal_parameter, reason)
+      end
+    else
+      fatal(:unexpected_message, :invalid_server_hello_flight)
+    end
+  end
+
+  defp accept_initial_tls13(_, _, _), do: fatal(:unexpected_message, :invalid_server_hello_flight)
+
   defp feed_server_handshake(state, bytes, read_state) do
     with {:ok, messages, framer} <-
            HandshakeFramer.feed(state.framer, bytes, max_handshake_length: @max_handshake_length),
@@ -159,6 +232,8 @@ defmodule SSL.Protocol.HandshakeMachine do
 
   @spec encrypt(t(), :application_data | :alert, iodata()) ::
           {:ok, binary(), t()} | {:error, term()}
+  def encrypt(%TLS12{} = state, type, data), do: TLS12.encrypt(state, type, data)
+
   def encrypt(%__MODULE__{phase: :connected, write_state: write} = state, :application_data, data) do
     with {:ok, updates, write} <-
            maybe_update_write(write, TrafficState.key_update_required?(write)),
@@ -193,21 +268,29 @@ defmodule SSL.Protocol.HandshakeMachine do
       fatal(:unexpected_message, :second_hello_retry_request)
     else
       with {:ok, ast, key_pair} <- retry_client_hello(state.client_ast, state.key_pair, hrr),
-           {:ok, encoded} <- Serializer.encode(ast),
-           {:ok, offer} <- ClientOffer.from_client_hello(encoded),
-           {:ok, _suite, hash} <- suite(hrr.cipher_suite) do
-        transcript =
-          Transcript.new(hash)
-          |> Transcript.append(state.client_hello)
-          |> Transcript.apply_hello_retry_request_rewrite()
-          |> Transcript.append(hrr.encoded)
-          |> Transcript.append(encoded)
+           {:ok, _suite, hash} <- suite(hrr.cipher_suite),
+           {ast, ticket} = retry_ticket(ast, state.ticket, hash),
+           prefix =
+             Transcript.new(hash)
+             |> Transcript.append(state.client_hello)
+             |> Transcript.apply_hello_retry_request_rewrite()
+             |> Transcript.append(hrr.encoded),
+           {:ok, unsigned} <- Serializer.encode(ast),
+           {:ok, encoded} <-
+             bind_hello(
+               unsigned,
+               ticket,
+               prefix.messages |> Enum.reverse() |> IO.iodata_to_binary()
+             ),
+           {:ok, offer} <- ClientOffer.from_client_hello(encoded) do
+        transcript = Transcript.append(prefix, encoded)
 
         {:ok,
          %{
            state
            | client_ast: ast,
              client_hello: encoded,
+             ticket: ticket,
              key_pair: key_pair,
              key_pairs: retry_key_pairs(state.key_pairs, hrr, key_pair),
              offer: offer,
@@ -230,7 +313,10 @@ defmodule SSL.Protocol.HandshakeMachine do
            client_key_pair: key_pair,
            records: [],
            trust_source: state.trust_source,
-           identity: state.identity
+           identity: state.identity,
+           client_identity: state.client_identity,
+           ticket: state.ticket,
+           enable_tickets: state.enable_tickets
          },
          {:ok, %Incremental{} = verifier} <-
            start_verifier(input, verifier_options(state.options), state.hrr_transcript) do
@@ -262,10 +348,20 @@ defmodule SSL.Protocol.HandshakeMachine do
               | phase: :connected,
                 verifier: nil,
                 key_pair: nil,
+                key_pairs: [],
+                client_hello: nil,
+                client_ast: nil,
+                offer: nil,
+                client_identity: nil,
+                ticket: nil,
+                trust_source: nil,
+                resumption_master: result.resumption_master,
+                resumed: result.resumed,
                 hrr_transcript: nil,
                 read_state: result.server_application_state,
                 write_state: result.client_application_state,
-                negotiated_protocol: result.negotiated_protocol
+                negotiated_protocol: result.negotiated_protocol,
+                verified_peer: result.verified_peer
             }
 
             {:cont,
@@ -315,7 +411,8 @@ defmodule SSL.Protocol.HandshakeMachine do
                  %{state | read_state: read, framer: framer},
                  messages
                ) do
-          {:ok, next, records, []}
+          events = Enum.map(Enum.reverse(next.pending_tickets), &{:session_ticket, &1})
+          {:ok, %{next | pending_tickets: []}, records, events}
         else
           {:error, {:fatal_alert, _, _}} = error -> error
           {:error, reason} -> fatal(:decode_error, reason)
@@ -333,11 +430,21 @@ defmodule SSL.Protocol.HandshakeMachine do
     Enum.reduce_while(messages, {:ok, state, []}, fn
       # RFC 9846 §4.7.1: no resumption support means no ticket semantic decoding.
       # HandshakeFramer has already checked completeness and the global size bound.
-      <<4, _length::24, _body::binary>>, result ->
+      <<4, _length::24, _body::binary>>, {:ok, %{enable_tickets: false}, _} = result ->
+        {:cont, result}
+
+      <<4, _length::24, _body::binary>>, {:ok, %{ticket_count: count}, _} = result
+      when count >= 8 ->
         {:cont, result}
 
       message, {:ok, current, out} ->
         case ServerFlight.decode(message, hash: hash_for(current.write_state)) do
+          {:ok, %ServerFlight.NewSessionTicket{} = ticket, <<>>} ->
+            case receive_ticket(current, ticket) do
+              {:ok, next} -> {:cont, {:ok, next, out}}
+              {:error, _} = error -> {:halt, error}
+            end
+
           {:ok, %ServerFlight.KeyUpdate{request_update: request?}, <<>>} ->
             case apply_key_update(current, request?) do
               {:ok, next, records} -> {:cont, {:ok, next, out ++ records}}
@@ -352,6 +459,45 @@ defmodule SSL.Protocol.HandshakeMachine do
         end
     end)
   end
+
+  defp receive_ticket(state, %{ticket_lifetime: 0}), do: {:ok, state}
+
+  defp receive_ticket(state, ticket) do
+    hash = hash_for(state.write_state)
+
+    with {:ok, psk} <-
+           KeySchedule.resumption_secret(hash, state.resumption_master, ticket.ticket_nonce) do
+      material = %{
+        ticket: ticket.ticket,
+        psk: psk,
+        hash: hash,
+        age_add: ticket.ticket_age_add,
+        lifetime: ticket.ticket_lifetime,
+        peer: state.verified_peer,
+        alpn: state.negotiated_protocol
+      }
+
+      count = state.ticket_count + 1
+
+      {:ok,
+       %{
+         state
+         | pending_tickets: [material | state.pending_tickets],
+           ticket_count: count,
+           resumption_master: if(count == 8, do: nil, else: state.resumption_master)
+       }}
+    else
+      {:error, reason} -> fatal(:internal_error, reason)
+    end
+  end
+
+  defp bind_hello(encoded, nil, _prefix), do: {:ok, encoded}
+  defp bind_hello(encoded, ticket, prefix), do: Resumption.bind(encoded, ticket, prefix)
+  defp retry_ticket(ast, nil, _hash), do: {ast, nil}
+  defp retry_ticket(ast, %{hash: hash} = ticket, hash), do: {ast, ticket}
+
+  defp retry_ticket(ast, _ticket, _hash),
+    do: {%{ast | extensions: Enum.reject(ast.extensions, &(elem(&1, 0) == 41))}, nil}
 
   defp validate_post_handshake_epoch(messages, framer) do
     key_update_index = Enum.find_index(messages, &match?(<<24, _::binary>>, &1))
@@ -416,10 +562,13 @@ defmodule SSL.Protocol.HandshakeMachine do
   end
 
   defp retry_key_pair(nil, pair), do: {:ok, pair}
-  defp retry_key_pair(0x001D, _pair), do: KeyExchange.generate(:x25519)
-  defp retry_key_pair(0x0017, _pair), do: KeyExchange.generate(:secp256r1)
-  defp retry_key_pair(0x0018, _pair), do: KeyExchange.generate(:secp384r1)
-  defp retry_key_pair(group, _pair), do: {:error, {:unsupported_selected_group, group}}
+
+  defp retry_key_pair(group, _pair) do
+    case SSL.Capabilities.resolve(:group, group) do
+      %{name: name} -> KeyExchange.generate(name)
+      nil -> {:error, {:unsupported_selected_group, group}}
+    end
+  end
 
   defp retry_key_pairs(key_pairs, hrr, pair) do
     if Enum.any?(hrr.extensions, &match?({:selected_group, _}, &1)),
@@ -482,6 +631,10 @@ defmodule SSL.Protocol.HandshakeMachine do
       end)
 
     cond do
+      matching == [] and offer.key_shares == [] and 0x0303 in offer.offered_versions and
+        0x0304 not in offer.offered_versions and key_pairs == [] ->
+        {:ok, []}
+
       matching == [] ->
         {:error, :no_matching_client_key_share}
 
@@ -625,15 +778,16 @@ defmodule SSL.Protocol.HandshakeMachine do
   defp start_verifier(input, options, transcript),
     do: ServerFlightVerifier.start_incremental(input, options, transcript)
 
-  defp suite(0x1301), do: {:ok, :tls_aes_128_gcm_sha256, :sha256}
-  defp suite(0x1302), do: {:ok, :tls_aes_256_gcm_sha384, :sha384}
-  defp suite(0x1303), do: {:ok, :tls_chacha20_poly1305_sha256, :sha256}
-  defp suite(value), do: {:error, {:unsupported_cipher_suite, value}}
-  defp hash_for(%{cipher_suite: :tls_aes_256_gcm_sha384}), do: :sha384
-  defp hash_for(_), do: :sha256
-  defp group_id(:x25519), do: 0x001D
-  defp group_id(:secp256r1), do: 0x0017
-  defp group_id(:secp384r1), do: 0x0018
+  defp suite(value) do
+    case SSL.Capabilities.resolve(:cipher_suite, value) do
+      %{version: 0x0304, name: name, hash: hash} -> {:ok, name, hash}
+      _ -> {:error, {:unsupported_cipher_suite, value}}
+    end
+  end
+
+  defp hash_for(%{cipher_suite: suite}), do: SSL.Capabilities.resolve(:cipher_suite, suite).hash
+  defp group_id(group), do: SSL.Capabilities.resolve(:group, group).id
+
   defp validate_identity({:dns_id, name}) when is_binary(name), do: :ok
   defp validate_identity({:ip, _}), do: :ok
   defp validate_identity(_), do: {:error, :invalid_identity}

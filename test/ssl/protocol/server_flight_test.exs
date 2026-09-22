@@ -12,6 +12,19 @@ defmodule SSL.Protocol.ServerFlightTest do
     hash: :sha256
   ]
 
+  test "recognizing a TLS signature identifier does not make its algorithm implemented" do
+    encoded = handshake(15, <<0x0808::16, 1::16, 1>>)
+    options = Keyword.put(@decode_options, :allowed_signature_schemes, [0x0808])
+
+    assert {:ok, %CertificateVerify{signature_scheme: 0x0808}, <<>>} =
+             ServerFlight.decode(encoded, options)
+
+    refute 0x0808 in SSL.Capabilities.identifiers(:signature_algorithm)
+
+    assert {:error, {:unsupported_signature_scheme, 0x0808}} =
+             SSL.Crypto.Signature.verify_server(0x0808, nil, :sha256, <<0::256>>, <<1>>)
+  end
+
   test "decodes ordered EncryptedExtensions and preserves exact bytes and remainder" do
     trailing = <<20, 0, 0>>
     encoded = encrypted_extensions()

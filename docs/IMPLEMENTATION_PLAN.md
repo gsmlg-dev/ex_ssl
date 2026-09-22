@@ -1,5 +1,10 @@
 # ex_ssl Implementation Plan
 
+The cross-repository TCP TLS expansion follows
+[ex_ssl-http_fetch-implementation-plan.md](ex_ssl-http_fetch-implementation-plan.md),
+with current evidence in [EX_SSL_HTTP_FETCH_PROGRESS.md](EX_SSL_HTTP_FETCH_PROGRESS.md).
+The historical roadmap below is retained.
+
 ## 1. Delivery strategy
 
 The current implementation cycle targets the restricted Manifold client subset

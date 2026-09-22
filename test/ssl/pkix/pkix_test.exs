@@ -56,6 +56,35 @@ defmodule SSL.PKIXTest do
     assert leaf == :public_key.pkix_decode_cert(@leaf_der, :otp)
   end
 
+  test "certificate-chain policy constrains issuer signature independently of leaf key" do
+    # The leaf has an EC key for CertificateVerify but its RSA issuer used
+    # sha256WithRSAEncryption to sign the certificate.
+    assert {:ok, %VerifiedPeer{}} =
+             PKIX.verify([@leaf_der, @root_der], [@root_der], {:dns_id, "example.test"},
+               certificate_signature_schemes: [0x0401]
+             )
+
+    assert {:error, {:certificate_signature_scheme_not_allowed, [0x0804]}} =
+             PKIX.verify([@leaf_der], [@root_der], {:dns_id, "example.test"},
+               certificate_signature_schemes: [0x0804]
+             )
+
+    assert {:error, {:certificate_signature_scheme_not_allowed, [0x0804]}} =
+             PKIX.verify([@leaf_der], [@root_der, @wrong_root_der], {:dns_id, "example.test"},
+               certificate_signature_schemes: [0x0804]
+             )
+
+    assert {:error, {:path_validation_failed, _}} =
+             PKIX.verify([@leaf_der], [@wrong_root_der], {:dns_id, "example.test"},
+               certificate_signature_schemes: [0x0401]
+             )
+
+    assert {:error, {:invalid_input, :options}} =
+             PKIX.verify([@leaf_der], [@root_der], {:dns_id, "example.test"},
+               certificate_signature_schemes: [0x0401 | :bad]
+             )
+  end
+
   test "applies depth to PKIX path validation rather than certificate-message framing" do
     assert {:ok, %VerifiedPeer{leaf_der: @leaf_der}} =
              PKIX.verify([@leaf_der], @root_pem, {:dns_id, "example.test"}, depth: 0)

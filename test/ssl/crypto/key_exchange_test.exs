@@ -69,28 +69,7 @@ defmodule SSL.Crypto.KeyExchangeTest do
     end
   end
 
-  test "generates fresh secp384r1 key pairs that agree" do
-    if KeyExchange.supported?(:secp384r1) do
-      assert {:ok, left} = KeyExchange.generate(:secp384r1)
-      assert {:ok, right} = KeyExchange.generate(:secp384r1)
-      assert byte_size(left.public_key) == 97
-      assert byte_size(right.public_key) == 97
-      assert byte_size(left.private_key) == 48
-      assert byte_size(right.private_key) == 48
-      refute left.public_key == right.public_key
-      refute left.private_key == right.private_key
-
-      assert {:ok, left_secret} = KeyExchange.shared_secret(left, right.public_key)
-      assert {:ok, right_secret} = KeyExchange.shared_secret(right, left.public_key)
-      assert left_secret == right_secret
-      assert byte_size(left_secret) == 48
-    else
-      assert {:error, {:unsupported_capability, :secp384r1}} =
-               KeyExchange.generate(:secp384r1)
-    end
-  end
-
-  test "reports only the two supported groups" do
+  test "reports only implemented groups" do
     curves = :crypto.supports(:curves)
     public_keys = :crypto.supports(:public_keys)
     runtime_has_ecdh = :ecdh in public_keys

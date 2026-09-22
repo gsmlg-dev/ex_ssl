@@ -18,6 +18,8 @@ defmodule SSL.ClientHello.WireProfile do
           {:server_name, :from_connection}
           | {:supported_groups, [group()]}
           | {:ec_point_formats, [0..0xFF]}
+          | {:extended_master_secret, binary()}
+          | {:renegotiation_info, binary()}
           | {:signature_algorithms, [term()]}
           | {:signature_algorithms_cert, [term()]}
           | {:alpn, [binary() | grease_slot()]}

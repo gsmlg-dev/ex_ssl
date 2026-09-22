@@ -850,3 +850,10 @@ The first architecture milestone is complete when:
 8. at least one golden custom profile proves exact controllable ordering/GREASE placement;
 9. JA3 and JA4 are derived from that same ClientHello;
 10. no native TLS implementation (`:ssl`) is used to perform the `ex_ssl` handshake itself.
+
+## Bounded dual-version client decision
+
+The TLS1.2 extension follows [ADR_TLS12_CLIENT.md](ADR_TLS12_CLIENT.md). It keeps
+the socket/runtime contract and separates version-specific pure handshake, key
+schedule and record logic. See the progress ledger for implementation status;
+this decision alone does not claim TLS1.2 support.
