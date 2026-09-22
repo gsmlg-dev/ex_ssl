@@ -1,5 +1,5 @@
 defmodule SSL.Protocol.HandshakeMachine do
-  @moduledoc "Pure TLS 1.3 client coordinator consuming one complete record at a time."
+  @moduledoc "Pure TLS client coordinator consuming one complete record at a time."
 
   alias SSL.ClientHello.{Extension, Serializer}
   alias SSL.ClientHello.Materializer.Materialized
@@ -13,6 +13,8 @@ defmodule SSL.Protocol.HandshakeMachine do
     ServerFlight,
     ServerFlightVerifier,
     ServerHello,
+    TLS12,
+    TLS12Codec,
     Transcript
   }
 
@@ -45,7 +47,7 @@ defmodule SSL.Protocol.HandshakeMachine do
 
   @type event ::
           {:connected, binary() | nil} | {:application_data, binary()} | :closed
-  @type t :: %__MODULE__{}
+  @type t :: %__MODULE__{} | TLS12.t()
 
   @spec init(Materialized.t(), term(), SSL.PKIX.identity(), keyword()) ::
           {:ok, t(), [binary()]} | {:error, term()}
@@ -61,7 +63,7 @@ defmodule SSL.Protocol.HandshakeMachine do
       state = %__MODULE__{
         client_hello: client_hello,
         client_ast: materialized.client_hello,
-        key_pair: hd(key_pairs),
+        key_pair: List.first(key_pairs),
         key_pairs: key_pairs,
         trust_source: trust_source,
         identity: identity,
@@ -81,9 +83,15 @@ defmodule SSL.Protocol.HandshakeMachine do
   @spec feed(t(), binary()) ::
           {:ok, t(), [binary()], [event()]}
           | {:error, {:fatal_alert, atom(), term()} | {:peer_alert, byte(), byte()}}
+  def feed(%TLS12{} = state, record), do: TLS12.feed(state, record)
+
   def feed(%__MODULE__{phase: phase} = state, @ccs)
       when phase in [:await_server_hello, :await_server_hello_after_retry, :await_server_flight],
-      do: {:ok, state, [], []}
+      do:
+        if(0x0304 in state.offer.offered_versions,
+          do: {:ok, state, [], []},
+          else: fatal(:unexpected_message, :unexpected_tls12_change_cipher_spec)
+        )
 
   def feed(%__MODULE__{phase: phase}, <<20, _::binary>>)
       when phase in [:await_server_hello, :await_server_hello_after_retry, :await_server_flight],
@@ -108,11 +116,31 @@ defmodule SSL.Protocol.HandshakeMachine do
         {[], _buffered} ->
           {:ok, %{state | framer: framer}, [], []}
 
-        {[handshake], 0} ->
-          with {:ok, hello} <- decode_server_hello(handshake, state.offer) do
-            accept_server_hello(%{state | framer: HandshakeFramer.new()}, hello)
-          else
-            {:error, reason} -> fatal(:illegal_parameter, reason)
+        {[handshake | _] = handshakes, _buffered} ->
+          case TLS12Codec.decode(handshake) do
+            {:ok, %{type: :server_hello, cipher_suite: suite}} ->
+              if match?(%{version: 0x0303}, SSL.Capabilities.resolve(:cipher_suite, suite)) do
+                if 0x0303 in state.offer.offered_versions and suite in state.offer.cipher_suites and
+                     state.phase == :await_server_hello do
+                  with {:ok, tls12} <-
+                         TLS12.new(
+                           state.client_hello,
+                           state.offer,
+                           state.trust_source,
+                           state.identity,
+                           [client_identity: state.client_identity] ++ state.options
+                         ) do
+                    TLS12.feed_handshakes(tls12, handshakes, framer)
+                  end
+                else
+                  fatal(:illegal_parameter, :unoffered_tls12_selection)
+                end
+              else
+                accept_initial_tls13(state, handshakes, framer)
+              end
+
+            _ ->
+              accept_initial_tls13(state, handshakes, framer)
           end
 
         _other ->
@@ -148,6 +176,20 @@ defmodule SSL.Protocol.HandshakeMachine do
 
   def feed(_, _), do: fatal(:decode_error, :invalid_record)
 
+  defp accept_initial_tls13(state, [handshake], framer) do
+    if HandshakeFramer.buffered_size(framer) == 0 do
+      with {:ok, hello} <- decode_server_hello(handshake, state.offer) do
+        accept_server_hello(%{state | framer: HandshakeFramer.new()}, hello)
+      else
+        {:error, reason} -> fatal(:illegal_parameter, reason)
+      end
+    else
+      fatal(:unexpected_message, :invalid_server_hello_flight)
+    end
+  end
+
+  defp accept_initial_tls13(_, _, _), do: fatal(:unexpected_message, :invalid_server_hello_flight)
+
   defp feed_server_handshake(state, bytes, read_state) do
     with {:ok, messages, framer} <-
            HandshakeFramer.feed(state.framer, bytes, max_handshake_length: @max_handshake_length),
@@ -163,6 +205,8 @@ defmodule SSL.Protocol.HandshakeMachine do
 
   @spec encrypt(t(), :application_data | :alert, iodata()) ::
           {:ok, binary(), t()} | {:error, term()}
+  def encrypt(%TLS12{} = state, type, data), do: TLS12.encrypt(state, type, data)
+
   def encrypt(%__MODULE__{phase: :connected, write_state: write} = state, :application_data, data) do
     with {:ok, updates, write} <-
            maybe_update_write(write, TrafficState.key_update_required?(write)),
@@ -491,6 +535,10 @@ defmodule SSL.Protocol.HandshakeMachine do
       end)
 
     cond do
+      matching == [] and offer.key_shares == [] and 0x0303 in offer.offered_versions and
+        0x0304 not in offer.offered_versions and key_pairs == [] ->
+        {:ok, []}
+
       matching == [] ->
         {:error, :no_matching_client_key_share}
 
@@ -636,8 +684,8 @@ defmodule SSL.Protocol.HandshakeMachine do
 
   defp suite(value) do
     case SSL.Capabilities.resolve(:cipher_suite, value) do
-      %{name: name, hash: hash} -> {:ok, name, hash}
-      nil -> {:error, {:unsupported_cipher_suite, value}}
+      %{version: 0x0304, name: name, hash: hash} -> {:ok, name, hash}
+      _ -> {:error, {:unsupported_cipher_suite, value}}
     end
   end
 

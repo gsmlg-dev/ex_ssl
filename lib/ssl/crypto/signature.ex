@@ -1,6 +1,6 @@
 defmodule SSL.Crypto.Signature do
   @moduledoc """
-  TLS 1.3 CertificateVerify signed-content construction and verification.
+  TLS 1.3 CertificateVerify and raw TLS 1.2 handshake signatures.
 
   This module verifies handshake signatures only. Certificate path and service
   identity validation remain separate PKIX responsibilities.
@@ -122,6 +122,35 @@ defmodule SSL.Crypto.Signature do
       end
     end
   end
+
+  @doc "Verifies exact TLS 1.2 handshake bytes without a TLS 1.3 CertificateVerify context."
+  @spec verify_message(term(), term(), term(), term()) :: :ok | {:error, term()}
+  def verify_message(signature_scheme, public_key, data, signature) do
+    with {:ok, scheme} <- signature_scheme(signature_scheme),
+         :ok <- validate_message(data),
+         :ok <- validate_signature(signature),
+         {:ok, verification_key} <- validate_public_key(scheme, public_key),
+         :ok <- validate_signature_encoding(scheme, signature) do
+      verify(data, scheme.hash, signature, verification_key, scheme.verify_options)
+    end
+  end
+
+  @doc "Signs exact TLS 1.2 handshake bytes without a TLS 1.3 CertificateVerify context."
+  @spec sign_message(term(), term(), term()) :: {:ok, binary()} | {:error, term()}
+  def sign_message(signature_scheme, private_key, data) do
+    with {:ok, scheme} <- signature_scheme(signature_scheme),
+         :ok <- validate_message(data),
+         {:ok, signing_key} <- validate_private_key(scheme, private_key) do
+      try do
+        {:ok, :public_key.sign(data, scheme.hash, signing_key, scheme.verify_options)}
+      catch
+        :error, _reason -> {:error, :signature_verification_failed}
+      end
+    end
+  end
+
+  defp validate_message(data) when is_binary(data) and byte_size(data) <= 1_048_576, do: :ok
+  defp validate_message(_), do: {:error, {:invalid_input, :message}}
 
   defp signature_scheme(value) do
     case Capabilities.signature(value) do

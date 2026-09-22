@@ -1,4 +1,4 @@
-# TLS 1.3 client compatibility
+# TLS client compatibility
 
 `ex_ssl` provides an experimental OTP `:ssl`-compatible client API for the
 implemented subset below. Passing the repository tests is not a security
@@ -8,7 +8,7 @@ certification, and OTP `:ssl` remains the recommended default.
 
 | Surface | Supported behavior |
 | --- | --- |
-| `SSL.connect/2,3,4` | Authenticated TLS 1.3 client connections and passive binary/raw STARTTLS upgrades. Connect succeeds only after CertificateVerify and Finished validation. |
+| `SSL.connect/2,3,4` | Authenticated TLS 1.3 and bounded TLS 1.2 client connections and passive binary/raw STARTTLS upgrades. Connect succeeds only after peer signature and Finished validation. |
 | `SSL.send/2` | Valid iodata of any logical size supported by available caller memory. Data is traversed without flattening the entire write and protected in records of at most 16,384 plaintext bytes. One logical write is admitted at a time; another caller receives `{:error, :busy}`. There is no automatic replay. An unfinished admitted send is settled promptly as `{:error, :closed}` after an authenticated peer closure makes further writes impossible; a send already acknowledged in full remains `:ok`. |
 | `SSL.recv/2,3` | Passive raw binary receive. Length zero returns available plaintext; a positive length waits for exactly that many bytes. One passive receive is admitted, and the maximum requested/buffered plaintext is 1 MiB. |
 | `SSL.setopts/2` | Validates the whole request for `active: false` or `:once`, send timeouts and the mutable TCP allowlist below. Invalid options reject before changes. Driver failures can partially apply TCP options; TLS state changes only after driver success. |
@@ -66,7 +66,7 @@ Supported connection options are:
 - one initial-handshake client identity through `cert`/`certfile` and `key`/`keyfile` (forms and bounds below);
 - DNS `server_name_indication`;
 - `customize_hostname_check: [match_fun: fun]`;
-- `versions: [:"tlsv1.3"]`;
+- `versions: [:"tlsv1.3"]` (default), `[:"tlsv1.2"]`, or either ordered, non-duplicate mixed list;
 - ordered `ciphers`, `signature_algs`, `signature_algs_cert` and `supported_groups` (forms below);
 - validated TCP options from the allowlist below;
 - non-negative integer `depth` (default `10`);
@@ -75,8 +75,7 @@ Supported connection options are:
 - `alpn_advertised_protocols: [nonempty_binary, ...]`;
 - `ex_ssl: [profile: :default | %SSL.ClientHello.WireProfile{}]`.
 
-Verification cannot be disabled. TLS 1.2 and mixed TLS 1.3/TLS 1.2 version
-lists are rejected. Packet modes, list mode, active true/active-N, arbitrary TCP
+Verification cannot be disabled. Packet modes, list mode, active true/active-N, arbitrary TCP
 options outside the allowlist and `send_timeout_close: false` remain
 unsupported. Unsupported or malformed options return a redacted
 `{:error, {:options, reason}}`; supplied option data is not echoed.
@@ -236,7 +235,7 @@ inspection.
 
 ## Remaining limitations
 
-TLS 1.2, server TLS, DTLS, QUIC/HTTP/3, resumption,
+Server TLS, DTLS, QUIC/HTTP/3, resumption,
 0-RTT, post-handshake authentication, active true/active-N, packet framing,
 exporters, and full OTP API parity are out of scope. ALPN negotiation alone is
 not evidence of an HTTP/2 request. See
@@ -257,9 +256,9 @@ optional client authentication. No CertificateVerify is sent for an empty chain.
 
 The client Certificate, role-specific CertificateVerify and Finished use exact
 transcript bytes and the existing bounded writer and original connect deadline.
-Large certificates span multiple records. Connect success means the server was
+Large certificates span multiple records. In TLS1.3, connect success means the server was
 authenticated and the client flight was written; the peer may reject the client
-identity afterward. Callers must handle subsequent alerts and HTTP failures.
+identity afterward. TLS1.2 waits for the server Finished after the client flight. Callers must handle subsequent alerts and HTTP failures.
 Server trust and hostname verification are unchanged.
 
 The loader handles one DER certificate or leaf-first DER chain, typed DER RSA/EC/
@@ -303,3 +302,52 @@ These names follow the [OTP 29 public option documentation](https://www.erlang.o
 Each supplied unsupported policy fails before network I/O, with its value
 redacted. Implementing one requires a separate trust-semantics design and
 negative/availability tests; no permissive verification callback is installed.
+
+## Explicit TLS1.2 subset (source candidate)
+
+The default remains TLS1.3-only. Explicit TLS1.2 or mixed lists negotiate on one
+connection; failure never reconnects with weaker options. The independent engine
+uses OTP crypto/public_key primitives and shares the existing socket owner, writer,
+deadlines, bounded queues, active-once and cleanup.
+
+Four suites are supported: `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`,
+`TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`,
+`TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, and
+`TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`. Ordered public suite maps use
+`key_exchange: :ecdhe_rsa | :ecdhe_ecdsa`, `mac: :aead`, the matching cipher and PRF.
+ECDHE groups remain X25519/P256/P384. The bounded handshake signature subset uses
+RSA-PSS and P256/P384 ECDSA; legacy RSA-PKCS1 handshake signatures and EdDSA cipher
+authentication are not offered by the TLS1.2-only generated profile.
+
+Extended Master Secret and a valid initial secure-renegotiation indication are
+mandatory. Missing EMS fails explicitly, including the observed local OTP28
+TLS1.2 server: its ServerHello omitted extension23. This is a documented
+interoperability restriction, not a reason to derive a legacy master secret.
+OpenSSL3.6.3 independently proves the supported full/mTLS paths; OTP28 TLS1.2
+positive interoperability is unavailable under this policy. Other runtime
+matrix evidence remains pending. Static RSA, CBC, RC4, compression, TLS1.0/1.1,
+renegotiation and TLS1.2 session resumption remain unsupported. A nonempty echoed
+session ID rejects as unsupported resumption. Generated TLS1.2-only hellos use an
+empty session ID; mixed offers retain TLS1.3 compatibility behavior.
+
+Explicit profiles must agree with ordered versions and include typed EMS and
+renegotiation extensions for TLS1.2. Only TLS1.3 offers require key shares. Mixed
+negotiation validates downgrade sentinels; the TLS1.3 default wire policy remains
+unchanged. HTTP2 uses the permitted ECDHE/AEAD subset with ALPN and no compression
+or renegotiation; the library supports P256 and ECDHE_RSA_AES128_GCM as required.
+
+TLS1.2 client authentication follows its distinct CertificateRequest and raw
+transcript signature rules. Server certificate/identity and signed ECDHE parameters
+are verified before sending credentials. Unlike TLS1.3, TLS1.2 client certificates
+are transmitted before encryption begins. No requested compatible identity sends
+an empty Certificate. Large chains fragment at16KiB. Server Finished must verify
+before connect succeeds or application bytes can be delivered.
+
+TLS1.2 server and client certificate chains are bounded to16 certificates,
+256KiB each and512KiB aggregate. Exact handshake transcript storage is bounded
+to1MiB, with reserved space for the client flight. AES-GCM records use independent
+directional counters and explicit nonces; exhaustion fails rather than wrapping.
+Tests cover primitive vectors, fragmented/malformed input, EMS/renegotiation,
+signed parameters, downgrade, CCS/Finished/AEAD errors, real suites/mTLS,
+active-once, ownership, truncation and deterministic blocked-flight timeout/cancel.
+See the ledger for exact executed gates and remaining consumer work.

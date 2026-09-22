@@ -2,7 +2,7 @@ defmodule SSL do
   @moduledoc """
   OTP `:ssl`-compatible client facade for the implemented `ex_ssl` feature subset.
 
-  This experimental client supports TLS 1.3, binary raw sockets, passive and
+  This experimental client supports TLS 1.3 and explicit bounded TLS 1.2, binary raw sockets, passive and
   active-once delivery, application ownership transfer, authenticated ALPN,
   bounded streaming writes, and mandatory peer verification. These restricted
   defaults differ from OTP. Unsupported options return explicit

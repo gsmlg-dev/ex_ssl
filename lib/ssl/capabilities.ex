@@ -6,6 +6,7 @@ defmodule SSL.Capabilities do
   @ciphers [
     %{
       id: 0x1301,
+      version: 0x0304,
       name: :tls_aes_128_gcm_sha256,
       cipher: :aes_128_gcm,
       hash: :sha256,
@@ -14,6 +15,7 @@ defmodule SSL.Capabilities do
     },
     %{
       id: 0x1302,
+      version: 0x0304,
       name: :tls_aes_256_gcm_sha384,
       cipher: :aes_256_gcm,
       hash: :sha384,
@@ -22,11 +24,52 @@ defmodule SSL.Capabilities do
     },
     %{
       id: 0x1303,
+      version: 0x0304,
       name: :tls_chacha20_poly1305_sha256,
       cipher: :chacha20_poly1305,
       hash: :sha256,
       key_length: 32,
       needs: [ciphers: :chacha20_poly1305, hashs: :sha256]
+    },
+    %{
+      id: 0xC02F,
+      name: :tls_ecdhe_rsa_with_aes_128_gcm_sha256,
+      version: 0x0303,
+      key_exchange: :ecdhe_rsa,
+      cipher: :aes_128_gcm,
+      hash: :sha256,
+      key_length: 16,
+      needs: [ciphers: :aes_128_gcm, hashs: :sha256, public_keys: :rsa, public_keys: :ecdh]
+    },
+    %{
+      id: 0xC030,
+      name: :tls_ecdhe_rsa_with_aes_256_gcm_sha384,
+      version: 0x0303,
+      key_exchange: :ecdhe_rsa,
+      cipher: :aes_256_gcm,
+      hash: :sha384,
+      key_length: 32,
+      needs: [ciphers: :aes_256_gcm, hashs: :sha384, public_keys: :rsa, public_keys: :ecdh]
+    },
+    %{
+      id: 0xC02B,
+      name: :tls_ecdhe_ecdsa_with_aes_128_gcm_sha256,
+      version: 0x0303,
+      key_exchange: :ecdhe_ecdsa,
+      cipher: :aes_128_gcm,
+      hash: :sha256,
+      key_length: 16,
+      needs: [ciphers: :aes_128_gcm, hashs: :sha256, public_keys: :ecdsa, public_keys: :ecdh]
+    },
+    %{
+      id: 0xC02C,
+      name: :tls_ecdhe_ecdsa_with_aes_256_gcm_sha384,
+      version: 0x0303,
+      key_exchange: :ecdhe_ecdsa,
+      cipher: :aes_256_gcm,
+      hash: :sha384,
+      key_length: 32,
+      needs: [ciphers: :aes_256_gcm, hashs: :sha384, public_keys: :ecdsa, public_keys: :ecdh]
     }
   ]
   @groups [
@@ -248,6 +291,13 @@ defmodule SSL.Capabilities do
   @spec signature(term()) :: map() | nil
   def signature(value), do: resolve(:signature_algorithm, value)
 
+  @spec cipher_ids(0x0303 | 0x0304, map()) :: [non_neg_integer()]
+  def cipher_ids(version, runtime \\ runtime()) do
+    @ciphers
+    |> Enum.filter(&(&1.version == version and available?(&1, runtime)))
+    |> Enum.map(& &1.id)
+  end
+
   @spec certificate_chain_policy() :: :enforced
   def certificate_chain_policy, do: :enforced
 
@@ -275,8 +325,15 @@ defmodule SSL.Capabilities do
   defp matches?(entry, :cipher_suite, value) when is_binary(value),
     do: value == entry.name |> Atom.to_string() |> String.upcase()
 
-  defp matches?(entry, :cipher_suite, %{key_exchange: :any, cipher: cipher, mac: :aead, prf: hash}),
-       do: entry.cipher == cipher and entry.hash == hash
+  defp matches?(entry, :cipher_suite, %{
+         key_exchange: exchange,
+         cipher: cipher,
+         mac: :aead,
+         prf: hash
+       }),
+       do:
+         Map.get(entry, :key_exchange, :any) == exchange and entry.cipher == cipher and
+           entry.hash == hash
 
   defp matches?(_entry, _kind, _value), do: false
 

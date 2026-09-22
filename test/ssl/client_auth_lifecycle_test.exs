@@ -1,7 +1,7 @@
 defmodule SSL.ClientAuthLifecycleTest do
   use ExUnit.Case, async: false
 
-  alias ExSSL.TestSupport.{ClientAuthFixtures, LocalTLSPeer}
+  alias ExSSL.TestSupport.{ClientAuthFixtures, LocalTLSPeer, OpenSSLPeer}
 
   @moduletag :integration
   @timeout 5_000
@@ -17,53 +17,63 @@ defmodule SSL.ClientAuthLifecycleTest do
     {:ok, fixtures: ClientAuthFixtures.create(directory)}
   end
 
-  test "the original handshake deadline tears down a blocked large client certificate flight", %{
-    fixtures: fixtures
-  } do
-    pending = pending_client_auth(fixtures, @timeout)
+  for version <- [:"tlsv1.3", :"tlsv1.2"] do
+    test "#{version} original handshake deadline tears down a blocked large client certificate flight",
+         %{fixtures: fixtures} do
+      pending = pending_client_auth(fixtures, @timeout, unquote(version))
 
-    try do
-      assert {:error, :timeout} = Task.await(pending.connect, @timeout + 1_000)
-      assert_connection_cleanup(pending)
-      refute_receive :client_authenticated, 0
-    after
-      cleanup(pending)
+      try do
+        assert {:error, :timeout} = Task.await(pending.connect, @timeout + 1_000)
+        assert_connection_cleanup(pending)
+        refute_receive :client_authenticated, 0
+      after
+        cleanup(pending)
+      end
+    end
+
+    test "#{version} owner cancellation tears down a blocked large client certificate flight", %{
+      fixtures: fixtures
+    } do
+      pending = pending_client_auth(fixtures, @timeout, unquote(version))
+
+      try do
+        assert Task.shutdown(pending.connect, :brutal_kill) == nil
+        assert_connection_cleanup(pending)
+        refute_receive :client_authenticated, 0
+      after
+        cleanup(pending)
+      end
     end
   end
 
-  test "owner cancellation tears down a blocked large client certificate flight", %{
-    fixtures: fixtures
-  } do
-    pending = pending_client_auth(fixtures, @timeout)
-
-    try do
-      assert Task.shutdown(pending.connect, :brutal_kill) == nil
-      assert_connection_cleanup(pending)
-      refute_receive :client_authenticated, 0
-    after
-      cleanup(pending)
-    end
-  end
-
-  defp pending_client_auth(fixtures, timeout) do
+  defp pending_client_auth(fixtures, timeout, version) do
     assert byte_size(fixtures.large.der) > 16_384
     parent = self()
     before = connection_children()
 
     {:ok, peer} =
-      LocalTLSPeer.start(
-        fn _socket ->
-          send(parent, :client_authenticated)
-          :unexpected_client_authentication
-        end,
-        ssl_options: [
-          certfile: String.to_charlist(fixtures.server.certificate),
-          keyfile: String.to_charlist(fixtures.server.key),
-          cacerts: [fixtures.ca.der],
-          verify: :verify_peer,
-          fail_if_no_peer_cert: true
-        ]
-      )
+      if version == :"tlsv1.2" do
+        OpenSSLPeer.start(
+          certfile: fixtures.server.certificate,
+          keyfile: fixtures.server.key,
+          cafile: fixtures.ca.certificate,
+          verify: :required
+        )
+      else
+        LocalTLSPeer.start(
+          fn _socket ->
+            send(parent, :client_authenticated)
+            :unexpected_client_authentication
+          end,
+          ssl_options: [
+            certfile: String.to_charlist(fixtures.server.certificate),
+            keyfile: String.to_charlist(fixtures.server.key),
+            cacerts: [fixtures.ca.der],
+            verify: :verify_peer,
+            fail_if_no_peer_cert: true
+          ]
+        )
+      end
 
     on_exit(fn -> emergency_stop_peer(peer) end)
 
@@ -75,7 +85,7 @@ defmodule SSL.ClientAuthLifecycleTest do
 
     connect =
       Task.async(fn ->
-        SSL.connect(~c"127.0.0.1", proxy.port, client_options(fixtures), timeout)
+        SSL.connect(~c"127.0.0.1", proxy.port, client_options(fixtures, version), timeout)
       end)
 
     assert_receive {:tls_record_proxy, ^proxy_ref, :queued, 1}, 1_000
@@ -88,7 +98,8 @@ defmodule SSL.ClientAuthLifecycleTest do
     assert :ok = LocalTLSPeer.release_server_record(proxy)
     output_size = await_client_auth_output(connection, proxy, proxy_ref)
     {:handshaking, state} = :sys.get_state(connection)
-    assert %{kind: :client_finished, size: size, timer: timer} = state.output
+    assert %{size: size, timer: timer} = state.output
+    assert state.output.kind == if(version == :"tlsv1.2", do: :handshake, else: :client_finished)
     assert size == output_size
     assert size > byte_size(fixtures.large.der)
     assert state.deadline == initial.deadline
@@ -134,6 +145,13 @@ defmodule SSL.ClientAuthLifecycleTest do
   defp await_client_auth_output(connection, proxy, proxy_ref, attempts) do
     case :sys.get_state(connection) do
       {:handshaking, %{output: %{kind: :client_finished} = output}} ->
+        output.size
+
+      {:handshaking,
+       %{
+         output: %{kind: :handshake} = output,
+         machine: %SSL.Protocol.TLS12{phase: :await_server_ccs}
+       }} ->
         output.size
 
       _ ->
@@ -186,6 +204,8 @@ defmodule SSL.ClientAuthLifecycleTest do
     :ok
   end
 
+  defp stop_peer(%{handle: _} = peer), do: OpenSSLPeer.stop(peer)
+
   defp stop_peer(peer) do
     _ = :ssl.close(peer.listener)
 
@@ -202,19 +222,21 @@ defmodule SSL.ClientAuthLifecycleTest do
     if Process.alive?(proxy.task.pid), do: Process.exit(proxy.task.pid, :kill)
   end
 
+  defp emergency_stop_peer(%{handle: _} = peer), do: OpenSSLPeer.stop(peer)
+
   defp emergency_stop_peer(peer) do
     _ = :ssl.close(peer.listener)
     if Process.alive?(peer.task.pid), do: Process.exit(peer.task.pid, :kill)
   end
 
-  defp client_options(fixtures) do
+  defp client_options(fixtures, version) do
     [
       cacerts: [fixtures.ca.der],
       server_name_indication: ~c"exssl.test",
       active: false,
       mode: :binary,
       verify: :verify_peer,
-      versions: [:"tlsv1.3"],
+      versions: [version],
       certfile: fixtures.large.certificate,
       keyfile: fixtures.large.key
     ]

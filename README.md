@@ -182,7 +182,7 @@ Runtime support depends on the crypto provider available to OTP. Implemented
 TLS 1.3 handshake signatures are P-256/P-384 ECDSA, Ed25519, and RSA-PSS-RSAE /
 RSA-PSS-PSS SHA-256/384/512, with strict key and parameter checks. See
 [the compatibility matrix](docs/COMPATIBILITY.md) for the bounded subset; client
-certificates and TLS 1.2 remain future phases.
+certificates and explicit bounded TLS 1.2 are implemented in this source candidate.
 
 ## Architecture
 
@@ -244,9 +244,14 @@ A matching TLS ClientHello does not guarantee that a remote service will see a c
 
 `ex_ssl` focuses on the TLS layer.
 
-### TLS 1.2 comes later
+### Explicit bounded TLS 1.2
 
-Many real clients advertise both TLS 1.3 and TLS 1.2. A profile must not normally advertise a protocol version that `ex_ssl` cannot negotiate. TLS 1.2 client support is therefore a planned follow-up required for broader faithful profile coverage.
+The source candidate accepts explicit TLS1.2-only or mixed version lists while
+keeping TLS1.3 as the default. TLS1.2 requires ECDHE, AES-GCM, Extended Master
+Secret and secure-renegotiation indication; renegotiation is disabled. Peers
+without EMS, including the observed local OTP28 TLS1.2 server, fail explicitly.
+OpenSSL full/mTLS exchanges validate the bounded subset. See the compatibility
+matrix and progress ledger for evidence and remaining gates.
 
 ### BEAM secret zeroization
 

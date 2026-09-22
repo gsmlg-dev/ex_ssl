@@ -7,6 +7,8 @@ defmodule SSL.ClientHello.Extension do
     server_name: 0,
     supported_groups: 10,
     ec_point_formats: 11,
+    extended_master_secret: 23,
+    renegotiation_info: 0xFF01,
     signature_algorithms: 13,
     alpn: 16,
     padding: 21,
@@ -36,6 +38,9 @@ defmodule SSL.ClientHello.Extension do
 
   def encode({:ec_point_formats, formats}),
     do: uint8_vector(:ec_point_formats, @ids.ec_point_formats, formats)
+
+  def encode({:extended_master_secret, <<>>}), do: {:ok, {@ids.extended_master_secret, <<>>}}
+  def encode({:renegotiation_info, <<0>>}), do: {:ok, {@ids.renegotiation_info, <<0>>}}
 
   def encode({:signature_algorithms, algorithms}),
     do: uint16_vector(:signature_algorithms, @ids.signature_algorithms, algorithms)

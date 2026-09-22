@@ -37,11 +37,11 @@ have not been executed locally.
 | P2.2 client authentication | ex_ssl `fc1319d` | verified | Public identity options, authenticated request selection, fragmented client flight and original-deadline/cancellation cleanup. Seed53:240 tests+11 properties, zero failures. |
 | P2.3 HTTP mTLS | ex_ssl `fc1319d`, http_fetch `cbbc2f6` | verified | 30 source-candidate tests;442 root consumer tests+20 doctests,zero failures. Exact identities, required/optional negatives, redirect scope, WSS and deterministic SSE reconnect. |
 | P3.1 policy/profile options | ex_ssl `509f002` | verified | Explicit ordered policies, exact profile conflicts and enforced issuer-signature policy. Full local library seed61:438tests+15properties pass. 39 packaged candidate tests pass. |
-| P3.2 TCP allowlist | ex_ssl `509f002`, http_fetch P3 adapter commit | verified | Full library438tests+15properties;39 packaged candidate tests;442 root consumer tests+20doctests,zero failures. |
+| P3.2 TCP allowlist | ex_ssl `509f002`, http_fetch `f482322` | verified | Full library438tests+15properties;39 packaged candidate tests;442 root consumer tests+20doctests,zero failures. |
 | P3.3 advanced certificate policy | both | verified | Production audit has no advanced-policy consumers. Unsupported callback/trust/CRL/OCSP policies explicitly reject; one test exercises nine pre-I/O rejections, seed55. |
-| P4.1 TLS 1.2 architecture | ex_ssl | in_progress | ADR_TLS12_CLIENT.md records the boundary before code; independent pure engine pending. |
-| P4.2 modern TLS 1.2 subset | ex_ssl | not_started | Independent ECDHE/AEAD/EMS implementation. |
-| P4.3 dual-version integration | both | not_started | Full negative and consumer evidence. |
+| P4.1 TLS 1.2 architecture | ex_ssl `031dcea` ADR + P4 protocol commit | verified | Pure engine dispatch retains runtime; PRF/EMS/AEAD/codecs/signatures independently tested. |
+| P4.2 modern TLS 1.2 subset | ex_ssl P4 protocol commit | verified | Four ECDHE-GCM suites, required EMS/reneg indication, bounded full/mTLS and version negotiation. Local OTP28 omits EMS and is deliberately rejected. |
+| P4.3 dual-version integration | both | in_progress | Library492tests+16properties pass; packaged HTTP1/2/WSS/SSE gate in progress. OTP positiveTLS12 unavailable under EMS policy; other runtime matrix pending. |
 | P5 resumption/diagnostics | ex_ssl | not_started | Ticket isolation, real resumption, benchmarks. |
 | P6 packaging/readiness | http_fetch `b4414db`, ex_ssl `2942433` | in_progress | Consumer package smoke and58 E2E tests pass; Credo and Dialyzer pass. Other runtime matrix, later features, benchmarks/resource campaigns and human security review remain. |
 
@@ -377,3 +377,47 @@ format and diff checks passed. Both compatibility documents updated.
 
 Next incomplete task: P4.1 pure TLS1.2 engine under the recorded ADR; public TLS1.2
 version acceptance remains disabled until end-to-end proof.
+
+### P4 library implementation and gates
+
+ADR `031dcea` preceded code. Separate pure TLS12 codecs, key schedule and records
+implement ECDHE/EMS/AES-GCM; raw signature entry points retain key/curve/PSS checks.
+The existing HandshakeMachine dispatch retains exact ClientHello and initial
+fragmented/coalesced flight; Connection/writer/deadline/delivery code is unchanged.
+Version-aware registry/policy prevents TLS12 suites entering TLS13 crypto. Explicit
+profiles retain ordered version/policy validation. Default remainsTLS13-only.
+
+- Pure key schedule/record/raw signature seed60:11tests,zero failures. Existing+
+  new signatures seed61:10tests,zero failures. Independent Python HMAC/OpenSSL
+  GMAC vectors; one corrected expected AES128 key-block length.
+- Codec seed63:9tests+1property,zero failures. Two initial faulty test expectations
+  fixed in one repair round. Policy/profile/dispatcher seed66:79tests+1property,
+  zero failures, after two repair rounds; TLS12-only earlyCCS explicitly rejected.
+- Pure machine red seed63:1test failed missing implementation. Initial OTP28
+  positive seed64 failed because ServerHello omitted EMS23; no legacy master-secret
+  workaround added. It is retained as an explicit negative test; positive TLS12
+  interop uses OpenSSL3.6.3. This runtime cannot satisfy an OTP-positive EMS gate.
+- Pure machine+negatives seed67:9tests,zero failures (OpenSSLHTTP, OTPmissingEMS,
+  fragmentedSH, signedECDHE, CCS, Finished/AEAD, downgrade and record classifications).
+  Review added aggregate/local-flight bounds, echoed-session-ID rejection and
+  correct EMS/reneg/unsolicited-extension fatal alerts, covered by final fullgate.
+- TLS13 registry-boundary red seed68:9tests,1failure; narrow allTLS13 suite consumers
+  and centralizeTLS12 metadata. Green seed69:28tests+1property,zero failures.
+- Public OpenSSL peer worker initial13tests/12failures (test public numericciphers),
+  next13/7 (fixture abruptclose/childshutdown), next13/4 (JSONnull assertion).
+  Two repair rounds exhausted; parent took over. Parent fixes JSONnull to`:null`,
+  requires TLS12client-auth failure before connect success, and adds ownership plus
+  truncation cleanup. Seed75:15tests/1failure because test expectedclosed instead
+  of contractually correcteconnreset. Corrected seed76:**15tests,zero failures**.
+- Both-version deterministic blocked large client-flight timeout and owner-cancel
+  plus protocol negatives seed73:**12tests,zero failures**. Same explicit record
+  gate/writer suspension proves unchanged deadline and connection/writer/port/timer
+  cleanup; no timing collision creates the test condition.
+- Early fullseed70 caught in-progress peerfixture:486tests+16properties,6failures.
+  Final `MIX_ENV=test mix test --include integration --seed 77`: **492tests and
+  16properties,zero failures,no exclusions**, log `/tmp/ex-ssl-tls-plan-p4-final.log`.
+  Dev/test strictcompile, fullformat and diff checks pass. Remote matrix notrun.
+
+Compatibility docs and mandatory interoperability workflow updated. These are
+source-candidate features, not changes to published0.3.0. Next incomplete task:
+P4.3 packaged dual-version HTTP1/2, WSS and EventSource evidence.

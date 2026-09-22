@@ -49,7 +49,7 @@ defmodule SSL.Options do
   @spec capabilities() :: map()
   def capabilities do
     %{
-      versions: [0x0304, :tlsv1_3],
+      versions: [0x0304, :tlsv1_3, 0x0303, :tlsv1_2],
       ciphers: Capabilities.identifiers(:cipher_suite),
       groups: Capabilities.identifiers(:group),
       signature_algorithms: Capabilities.identifiers(:signature_algorithm),
@@ -165,7 +165,9 @@ defmodule SSL.Options do
 
   defp valid_option?(:send_timeout_close, value), do: value == true
   defp valid_option?(:verify, value), do: value == :verify_peer
-  defp valid_option?(:versions, value), do: value == [:"tlsv1.3"]
+
+  defp valid_option?(:versions, value),
+    do: value in [[:"tlsv1.3"], [:"tlsv1.2"], [:"tlsv1.3", :"tlsv1.2"], [:"tlsv1.2", :"tlsv1.3"]]
 
   defp valid_option?(key, value)
        when key in [:ciphers, :signature_algs, :signature_algs_cert, :supported_groups],
@@ -291,15 +293,17 @@ defmodule SSL.Options do
 
   defp profile(options, context) do
     advertised_protocols = Keyword.get(options, :alpn_advertised_protocols)
+    versions = Enum.map(Keyword.get(options, :versions, [:"tlsv1.3"]), &version_id/1)
     explicit_profile? = Keyword.has_key?(options, :ex_ssl)
     profile = get_in(options, [:ex_ssl, :profile]) || :default
 
-    with {:ok, policy} <- policy_lists(options),
+    with {:ok, policy} <- policy_lists(options, versions),
          {:ok, profile} <-
            if(profile == :default,
-             do: {:ok, default_profile(context, advertised_protocols, policy)},
+             do: {:ok, default_profile(context, advertised_protocols, policy, versions)},
              else: resolve_explicit_profile(profile, advertised_protocols, explicit_profile?)
            ),
+         :ok <- require_version_match(profile, versions),
          :ok <- require_policy_match(profile, policy) do
       validate_profile(profile)
     end
@@ -322,13 +326,13 @@ defmodule SSL.Options do
     end
   end
 
-  defp default_profile(context, alpn_protocols, policy) do
+  defp default_profile(context, alpn_protocols, policy, versions) do
     capabilities = capabilities()
     groups = policy.supported_groups || Enum.filter(capabilities.groups, &is_integer/1)
-    ciphers = policy.ciphers || Enum.filter(capabilities.ciphers, &is_integer/1)
+    ciphers = policy.ciphers || Enum.flat_map(versions, &Capabilities.cipher_ids/1)
 
     signatures =
-      policy.signature_algs || Enum.filter(capabilities.signature_algorithms, &is_integer/1)
+      policy.signature_algs || default_signatures(versions, capabilities.signature_algorithms)
 
     certificate_signatures =
       if policy.signature_algs_cert,
@@ -337,26 +341,36 @@ defmodule SSL.Options do
 
     %WireProfile{
       name: :default,
+      session_id: if(versions == [0x0303], do: :empty, else: :random_32),
       cipher_suites: ciphers,
       extensions:
         if(Map.has_key?(context, :server_name), do: [{:server_name, :from_connection}], else: []) ++
           [
-            {:supported_versions, [0x0304]},
+            {:supported_versions, versions},
             {:supported_groups, groups},
-            {:signature_algorithms, signatures},
-            {:key_share, Enum.take(groups, 1)}
-          ] ++ certificate_signatures ++ alpn_extension(alpn_protocols)
+            {:signature_algorithms, signatures}
+          ] ++
+          if(0x0304 in versions, do: [{:key_share, Enum.take(groups, 1)}], else: []) ++
+          if(0x0303 in versions,
+            do: [
+              {:ec_point_formats, [0]},
+              {:extended_master_secret, <<>>},
+              {:renegotiation_info, <<0>>}
+            ],
+            else: []
+          ) ++ certificate_signatures ++ alpn_extension(alpn_protocols)
     }
   end
 
-  defp policy_lists(options) do
-    with {:ok, ciphers} <- policy_list(options, :ciphers, :cipher_suite),
+  defp policy_lists(options, versions) do
+    with {:ok, ciphers} <- policy_list(options, :ciphers, :cipher_suite, versions),
          {:ok, signatures} <- policy_list(options, :signature_algs, :signature_algorithm),
          {:ok, cert_signatures} <-
            policy_list(options, :signature_algs_cert, :certificate_signature_algorithm),
          {:ok, groups} <- policy_list(options, :supported_groups, :group) do
       {:ok,
        %{
+         versions: versions,
          ciphers: ciphers,
          signature_algs: signatures,
          signature_algs_cert: cert_signatures,
@@ -365,13 +379,16 @@ defmodule SSL.Options do
     end
   end
 
-  defp policy_list(options, key, kind) do
+  defp policy_list(options, key, kind, versions \\ nil) do
     case Keyword.fetch(options, key) do
       :error ->
         {:ok, nil}
 
       {:ok, values} ->
-        allowed = Map.fetch!(capabilities(), capability_key(kind))
+        allowed =
+          if kind == :cipher_suite,
+            do: Enum.flat_map(versions, &Capabilities.cipher_ids/1),
+            else: Map.fetch!(capabilities(), capability_key(kind))
 
         result =
           Enum.reduce_while(values, {:ok, [], MapSet.new()}, fn value, {:ok, ids, seen} ->
@@ -385,17 +402,27 @@ defmodule SSL.Options do
           end)
 
         case result do
-          {:ok, ids, _seen} when ids != [] -> {:ok, Enum.reverse(ids)}
-          _ -> option_error({key, :unsupported_or_invalid})
+          {:ok, ids, _seen} when ids != [] ->
+            ids = Enum.reverse(ids)
+
+            if kind != :cipher_suite or
+                 Enum.all?(versions, fn version ->
+                   Enum.any?(ids, &(Capabilities.resolve(:cipher_suite, &1).version == version))
+                 end),
+               do: {:ok, ids},
+               else: option_error({key, :unsupported_or_invalid})
+
+          _ ->
+            option_error({key, :unsupported_or_invalid})
         end
     end
   end
 
   defp documented_identifier(
          :cipher_suite,
-         %{key_exchange: :any, cipher: _, mac: :aead, prf: _} = suite
+         %{key_exchange: exchange, cipher: _, mac: :aead, prf: _} = suite
        )
-       when map_size(suite) == 4,
+       when map_size(suite) == 4 and exchange in [:any, :ecdhe_rsa, :ecdhe_ecdsa],
        do: {:ok, suite}
 
   defp documented_identifier(:cipher_suite, name) when is_binary(name), do: {:ok, name}
@@ -452,6 +479,81 @@ defmodule SSL.Options do
   defp policy_kind(:signature_algs_cert), do: :certificate_signature_algorithm
   defp policy_kind(:supported_groups), do: :group
 
+  defp version_id(:"tlsv1.3"), do: 0x0304
+  defp version_id(:"tlsv1.2"), do: 0x0303
+
+  defp default_signatures(versions, available) do
+    ids = Enum.filter(available, &is_integer/1)
+
+    if versions == [0x0303], do: Enum.reject(ids, &(&1 == 0x0807)), else: ids
+  end
+
+  defp tls12_signature_available?(profile) do
+    Enum.any?(profile_extension(profile, :signature_algorithms) || [], fn scheme ->
+      case Capabilities.signature(scheme) do
+        %{key: key} -> key in [:rsa, :rsa_pss, :ecdsa]
+        _ -> false
+      end
+    end)
+  end
+
+  defp require_version_match(profile, versions) do
+    actual =
+      profile_extension(profile, :supported_versions)
+      |> case do
+        nil ->
+          nil
+
+        values ->
+          values
+          |> Enum.reject(&match?({:grease, _}, &1))
+          |> Enum.map(fn
+            :tlsv1_3 -> 0x0304
+            :tlsv1_2 -> 0x0303
+            value -> value
+          end)
+      end
+
+    cond do
+      actual != versions ->
+        option_error({:versions, :profile_conflict})
+
+      0x0303 in versions and not tls12_signature_available?(profile) ->
+        option_error({:signature_algs, :unsupported_or_invalid})
+
+      versions == [0x0303] and profile_extension(profile, :key_share) != nil ->
+        option_error({:versions, :profile_conflict})
+
+      versions == [0x0304] and
+          Enum.any?(
+            [:extended_master_secret, :renegotiation_info],
+            &(profile_extension(profile, &1) != nil)
+          ) ->
+        option_error({:versions, :profile_conflict})
+
+      not Enum.all?(versions, fn version ->
+        Enum.any?(profile.cipher_suites, fn cipher ->
+          case Capabilities.resolve(:cipher_suite, cipher) do
+            %{version: ^version} -> true
+            _ -> false
+          end
+        end)
+      end) ->
+        option_error({:ciphers, :profile_conflict})
+
+      Enum.any?(profile.cipher_suites, fn cipher ->
+        case Capabilities.resolve(:cipher_suite, cipher) do
+          %{version: version} -> version not in versions
+          _ -> not match?({:grease, _}, cipher)
+        end
+      end) ->
+        option_error({:ciphers, :profile_conflict})
+
+      true ->
+        :ok
+    end
+  end
+
   defp profile_extension(profile, name) do
     case List.keyfind(profile.extensions, name, 0) do
       {^name, values} -> values
@@ -490,11 +592,20 @@ defmodule SSL.Options do
   defp valid_alpn_protocols?(_protocols), do: false
 
   defp require_runtime_extensions(profile) do
-    required = [:supported_versions, :supported_groups, :signature_algorithms, :key_share]
+    versions = profile_extension(profile, :supported_versions) || []
+
+    required =
+      [:supported_versions, :supported_groups, :signature_algorithms] ++
+        if(Enum.any?(versions, &(&1 in [0x0304, :tlsv1_3])), do: [:key_share], else: []) ++
+        if(Enum.any?(versions, &(&1 in [0x0303, :tlsv1_2])),
+          do: [:ec_point_formats, :extended_master_secret, :renegotiation_info],
+          else: []
+        )
 
     if Enum.all?(required, fn name ->
          Enum.any?(profile.extensions, fn
            {^name, [_ | _]} -> true
+           {^name, _} when name in [:extended_master_secret, :renegotiation_info] -> true
            _ -> false
          end)
        end),

@@ -471,8 +471,8 @@ defmodule SSL.Protocol.ServerFlightVerifier do
 
   defp cipher_suite(cipher_suite) do
     case SSL.Capabilities.resolve(:cipher_suite, cipher_suite) do
-      %{name: name, hash: hash} -> {:ok, name, hash}
-      nil -> alert(:illegal_parameter, {:unsupported_cipher_suite, cipher_suite})
+      %{version: 0x0304, name: name, hash: hash} -> {:ok, name, hash}
+      _ -> alert(:illegal_parameter, {:unsupported_cipher_suite, cipher_suite})
     end
   end
 

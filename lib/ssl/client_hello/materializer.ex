@@ -294,6 +294,12 @@ defmodule SSL.ClientHello.Materializer do
   defp materialize_extension({:ec_point_formats, formats}, _context, _opts, _grease),
     do: Extension.encode({:ec_point_formats, formats}) |> with_no_key_pairs()
 
+  defp materialize_extension({:extended_master_secret, <<>>}, _context, _opts, _grease),
+    do: Extension.encode({:extended_master_secret, <<>>}) |> with_no_key_pairs()
+
+  defp materialize_extension({:renegotiation_info, <<0>>}, _context, _opts, _grease),
+    do: Extension.encode({:renegotiation_info, <<0>>}) |> with_no_key_pairs()
+
   defp materialize_extension({:padding, {:fixed, size}}, _context, _opts, _grease),
     do: Extension.encode({:padding, size}) |> with_no_key_pairs()
 

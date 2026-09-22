@@ -174,8 +174,8 @@ defmodule SSL.Crypto.KeySchedule do
 
   defp cipher_suite_spec(cipher_suite) do
     case SSL.Capabilities.resolve(:cipher_suite, cipher_suite) do
-      %{hash: hash, key_length: length} -> {:ok, hash, length}
-      nil -> {:error, {:unsupported_cipher_suite, cipher_suite}}
+      %{version: 0x0304, hash: hash, key_length: length} -> {:ok, hash, length}
+      _ -> {:error, {:unsupported_cipher_suite, cipher_suite}}
     end
   end
 

@@ -353,7 +353,7 @@ defmodule SSL.Protocol.ServerHello do
       cipher_suite not in offered_ciphers ->
         {:error, {:cipher_not_offered, cipher_suite}}
 
-      cipher_suite not in SSL.Capabilities.identifiers(:cipher_suite) ->
+      cipher_suite not in SSL.Capabilities.cipher_ids(0x0304) ->
         {:error, {:unsupported_selected_cipher, cipher_suite}}
 
       true ->

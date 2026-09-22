@@ -61,9 +61,9 @@ Keep protocol choice in http_fetch: `h2` selects HTTP/2; an absent or
 `http/1.1` selection follows the requested HTTP mode. ex_ssl does not implement
 HTTP framing.
 
-Use the exact TLS version list `versions: [:"tlsv1.3"]`. The current OTP adapter
-defaults to `[:"tlsv1.3", :"tlsv1.2"]`, which ex_ssl correctly rejects rather
-than silently advertising unsupported TLS 1.2. Preserve `depth: 4`, peer
+Keep `versions: [:"tlsv1.3"]` as the ex_ssl adapter default. The source candidate
+also accepts caller-selected TLS1.2-only or mixed lists under its mandatory EMS
+policy; the released0.3.0 dependency still rejects them. Preserve `depth: 4`, peer
 verification, CA overrides, SNI, and hostname checking.
 
 The consumer currently places `send_timeout` and `send_timeout_close` in its

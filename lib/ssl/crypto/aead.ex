@@ -83,8 +83,8 @@ defmodule SSL.Crypto.AEAD do
 
   defp cipher_spec(cipher_suite) do
     case SSL.Capabilities.resolve(:cipher_suite, cipher_suite) do
-      %{cipher: cipher, key_length: length} -> {:ok, cipher, length}
-      nil -> {:error, {:unsupported_cipher_suite, cipher_suite}}
+      %{version: 0x0304, cipher: cipher, key_length: length} -> {:ok, cipher, length}
+      _ -> {:error, {:unsupported_cipher_suite, cipher_suite}}
     end
   end
 

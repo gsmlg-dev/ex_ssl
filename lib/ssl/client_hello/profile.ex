@@ -13,6 +13,8 @@ defmodule SSL.ClientHello.Profile do
     server_name: 0,
     supported_groups: 10,
     ec_point_formats: 11,
+    extended_master_secret: 23,
+    renegotiation_info: 0xFF01,
     signature_algorithms: 13,
     alpn: 16,
     padding: 21,
@@ -181,6 +183,8 @@ defmodule SSL.ClientHello.Profile do
   defp valid_extension?({:server_name, :from_connection}), do: true
   defp valid_extension?({:supported_groups, groups}), do: uint16_vector?(groups)
   defp valid_extension?({:ec_point_formats, formats}), do: uint8_integer_vector?(formats)
+  defp valid_extension?({:extended_master_secret, <<>>}), do: true
+  defp valid_extension?({:renegotiation_info, <<0>>}), do: true
   defp valid_extension?({:signature_algorithms, algorithms}), do: uint16_vector?(algorithms)
   defp valid_extension?({:signature_algorithms_cert, algorithms}), do: uint16_vector?(algorithms)
   defp valid_extension?({:alpn, protocols}), do: is_list(protocols)
@@ -446,6 +450,12 @@ defmodule SSL.ClientHello.Profile do
     supported_groups = Enum.find(extensions, &match?({:supported_groups, _groups}, &1))
     key_shares = Enum.find(extensions, &match?({:key_share, _groups}, &1))
 
+    versions =
+      Enum.find_value(extensions, [], fn
+        {:supported_versions, values} -> values
+        _ -> nil
+      end)
+
     with :ok <- reject_supported_group_duplicates(supported_groups) do
       case {supported_groups, key_shares} do
         {nil, nil} ->
@@ -455,7 +465,9 @@ defmodule SSL.ClientHello.Profile do
           {:error, :key_share_requires_supported_groups}
 
         {{:supported_groups, _groups}, nil} ->
-          {:error, :supported_groups_requires_key_share}
+          if versions != [] and Enum.all?(versions, &(&1 in [0x0303, :tlsv1_2])),
+            do: :ok,
+            else: {:error, :supported_groups_requires_key_share}
 
         {{:supported_groups, supported_groups}, {:key_share, key_shares}} ->
           require_ordered_subset(key_shares, supported_groups)
@@ -532,6 +544,9 @@ defmodule SSL.ClientHello.Profile do
 
   defp extension_payload_length({:ec_point_formats, formats}, _capabilities),
     do: 1 + length(formats)
+
+  defp extension_payload_length({:extended_master_secret, <<>>}, _capabilities), do: 0
+  defp extension_payload_length({:renegotiation_info, <<0>>}, _capabilities), do: 1
 
   defp extension_payload_length({:signature_algorithms, algorithms}, _capabilities),
     do: 2 + 2 * length(algorithms)

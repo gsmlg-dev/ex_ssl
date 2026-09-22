@@ -1,6 +1,14 @@
 defmodule SSL.OptionsTest do
   use ExUnit.Case, async: true
 
+  test "TLS12 rejects an effective signature list with no supported cipher authentication" do
+    assert {:error, {:options, {:signature_algs, :unsupported_or_invalid}}} =
+             SSL.Options.normalize("example.com",
+               versions: [:"tlsv1.2"],
+               signature_algs: [:ed25519]
+             )
+  end
+
   test "consumer binary/passive/raw options retain DNS identity independently of IP routing" do
     opts = [
       :binary,
@@ -24,11 +32,103 @@ defmodule SSL.OptionsTest do
           packet: :line,
           mode: :list,
           verify: :verify_none,
-          versions: [:"tlsv1.2"],
           customize_hostname_check: [fail_callback: fn _ -> true end]
         ] do
       assert {:error, {:options, _}} = SSL.Options.normalize(~c"mail.example", [option])
     end
+  end
+
+  test "TLS 1.2-only and mixed versions generate bounded ordered ClientHello offers" do
+    for {versions, expected} <- [
+          {[:"tlsv1.2"], [0x0303]},
+          {[:"tlsv1.3", :"tlsv1.2"], [0x0304, 0x0303]},
+          {[:"tlsv1.2", :"tlsv1.3"], [0x0303, 0x0304]}
+        ] do
+      assert {:ok, %{profile: profile}} =
+               SSL.Options.normalize("mail.example", versions: versions)
+
+      assert {:supported_versions, ^expected} =
+               List.keyfind(profile.extensions, :supported_versions, 0)
+
+      assert {:extended_master_secret, <<>>} in profile.extensions
+      assert {:renegotiation_info, <<0>>} in profile.extensions
+      assert {:ec_point_formats, [0]} in profile.extensions
+
+      assert Enum.all?(expected, fn version ->
+               Enum.any?(profile.cipher_suites, fn id ->
+                 SSL.Capabilities.resolve(:cipher_suite, id).version == version
+               end)
+             end)
+
+      assert 0x0304 in expected == (List.keyfind(profile.extensions, :key_share, 0) != nil)
+
+      assert {:ok, materialized} =
+               SSL.ClientHello.Materializer.materialize(profile, SSL.Options.capabilities(), %{
+                 server_name: "mail.example"
+               })
+
+      assert {:ok, encoded} = SSL.ClientHello.Serializer.encode(materialized.client_hello)
+      assert {:ok, offer} = SSL.Protocol.ClientOffer.from_client_hello(encoded)
+      assert offer.offered_versions == expected
+      assert materialized.key_pairs == [] == (expected == [0x0303])
+      assert 23 in offer.extension_ids
+      assert 0xFF01 in offer.extension_ids
+    end
+  end
+
+  test "TLS version and cipher/profile conflicts reject without fallback" do
+    for versions <- [[], [:"tlsv1.2", :"tlsv1.2"], [:"tlsv1.3", :"tlsv1.3"], [:"tlsv1.1"]] do
+      assert {:error, {:options, _}} = SSL.Options.normalize("mail.example", versions: versions)
+    end
+
+    assert {:error, {:options, {:ciphers, :unsupported_or_invalid}}} =
+             SSL.Options.normalize("mail.example",
+               versions: [:"tlsv1.2"],
+               ciphers: ["TLS_AES_128_GCM_SHA256"]
+             )
+
+    assert {:error, {:options, {:ciphers, :unsupported_or_invalid}}} =
+             SSL.Options.normalize("mail.example",
+               versions: [:"tlsv1.3", :"tlsv1.2"],
+               ciphers: ["TLS_AES_128_GCM_SHA256"]
+             )
+
+    assert {:ok, %{profile: tls13}} = SSL.Options.normalize("mail.example", [])
+
+    assert {:error, {:options, {:versions, :profile_conflict}}} =
+             SSL.Options.normalize("mail.example",
+               versions: [:"tlsv1.2"],
+               ex_ssl: [profile: tls13]
+             )
+
+    assert {:ok, %{profile: tls12}} =
+             SSL.Options.normalize("mail.example", versions: [:"tlsv1.2"])
+
+    assert {:error, {:options, {:versions, :profile_conflict}}} =
+             SSL.Options.normalize("mail.example",
+               versions: [:"tlsv1.2"],
+               ex_ssl: [
+                 profile: %{tls12 | extensions: tls12.extensions ++ [{:key_share, [0x001D]}]}
+               ]
+             )
+
+    invalid_ems =
+      %{
+        tls12
+        | extensions:
+            List.keyreplace(
+              tls12.extensions,
+              :extended_master_secret,
+              0,
+              {:extended_master_secret, <<1>>}
+            )
+      }
+
+    assert {:error, {:options, {:ex_ssl, :unsupported_profile}}} =
+             SSL.Options.normalize("mail.example",
+               versions: [:"tlsv1.2"],
+               ex_ssl: [profile: invalid_ems]
+             )
   end
 
   test "normalizes active-once, depth, and send policy without accepting weaker variants" do

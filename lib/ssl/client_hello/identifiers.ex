@@ -3,7 +3,7 @@ defmodule SSL.ClientHello.Identifiers do
   alias SSL.Capabilities
 
   @uint16 %{
-    version: %{tlsv1_3: 0x0304}
+    version: %{tlsv1_3: 0x0304, tlsv1_2: 0x0303}
   }
 
   @uint8 %{psk_mode: %{psk_ke: 0, psk_dhe_ke: 1}}
