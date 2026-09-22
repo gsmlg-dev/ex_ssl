@@ -385,8 +385,8 @@ and diagnostics; authenticated peer DER is intentionally public through peercert
 
 Diagnostics return only the three keys listed above; ALPN remains available from
 `negotiated_protocol/1`. Closed diagnostic calls return `{:error, :closed}` under
-the existing public handle mapping. Local OTP28 reference scenarios cover the
-implemented return forms, not all OTP29 information keys or full API parity.
+the existing public handle mapping. Local OTP28/OTP29 reference scenarios cover the
+implemented return forms, not every OTP information key or full API parity.
 Independent OpenSSL peers prove full/resumed exchanges, P384 HRR resumption,
 server ticket-key restart, disabled mode and authentication-policy rejection.
 The source-package consumer gate proves HTTP/1.1 resumption; HTTP/2/WSS/SSE

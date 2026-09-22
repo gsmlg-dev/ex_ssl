@@ -20,8 +20,9 @@ Implementation worktrees: `.trees/tls-backend-plan` in each repository, branch
 worktrees `ex-ssl-http-fetch` and `http-fetch-ex-ssl-integration` are preserved;
 their edits and historical ledger results are not evidence for this execution.
 
-Runtime: Elixir 1.18.5, OTP 28 / ERTS 16.4.0.5. Other supported matrix tuples
-have not been executed locally.
+Runtimes verified locally: Elixir 1.18.5 and 1.19.6 with OTP 28 / ERTS 16.4.0.5,
+and Elixir 1.20.4 with OTP 29.0.5 / ERTS 17.0.5. Separate build and temporary
+roots isolate the concurrent matrix runs.
 
 ## Task status
 
@@ -32,7 +33,7 @@ have not been executed locally.
 | P0.3 consumer boundary | both bases above | verified | Root-scoped baseline: 422 tests + 20 doctests, zero failures. ex_ssl transport contract: 31 integration tests; interoperability: 15 integration tests, zero failures. |
 | P1.1 capability registry | ex_ssl `0175097` | verified | Runtime-filtered registry, separate certificate-chain policy, registry-backed group/cipher negotiation and AEAD. Seed30: 292 tests +13 properties, zero failures. |
 | P1.2 algorithm expansion | ex_ssl `5463ad9` | verified | P-384 ECDHE/ECDSA, Ed25519, RSA-PSS-PSS; independent vectors, negatives and constrained peers. |
-| P1.3 negotiation evidence | ex_ssl `5463ad9`, http_fetch `93efee0` | verified | 327 library tests+15 properties; 12 external-candidate tests cover10 HTTP exchanges+5 identity negatives, zero failures. Other CI runtime tuples pending. |
+| P1.3 negotiation evidence | ex_ssl `5463ad9`, http_fetch `93efee0` | verified | 327 library tests+15 properties; 12 external-candidate tests cover10 HTTP exchanges+5 identity negatives, zero failures. Final three-runtime matrix verified below. |
 | P2.1 identity loading | ex_ssl `a9c5713` | verified | Internal loader, role-aware key matching, bounded DER/PEM and redaction. 78 tests+5 properties pass; public options remain unsupported until P2.2. |
 | P2.2 client authentication | ex_ssl `fc1319d` | verified | Public identity options, authenticated request selection, fragmented client flight and original-deadline/cancellation cleanup. Seed53:240 tests+11 properties, zero failures. |
 | P2.3 HTTP mTLS | ex_ssl `fc1319d`, http_fetch `cbbc2f6` | verified | 30 source-candidate tests;442 root consumer tests+20 doctests,zero failures. Exact identities, required/optional negatives, redirect scope, WSS and deterministic SSE reconnect. |
@@ -41,9 +42,10 @@ have not been executed locally.
 | P3.3 advanced certificate policy | both | verified | Production audit has no advanced-policy consumers. Unsupported callback/trust/CRL/OCSP policies explicitly reject; one test exercises nine pre-I/O rejections, seed55. |
 | P4.1 TLS 1.2 architecture | ex_ssl `031dcea` ADR + `844d4a6` | verified | Pure engine dispatch retains runtime; PRF/EMS/AEAD/codecs/signatures independently tested. |
 | P4.2 modern TLS 1.2 subset | ex_ssl `844d4a6` | verified | Four ECDHE-GCM suites, required EMS/reneg indication, bounded full/mTLS and version negotiation. Local OTP28 omits EMS and is deliberately rejected. |
-| P4.3 dual-version integration | ex_ssl `844d4a6`, http_fetch candidate after `f482322` | verified | Library492tests+16properties pass; packaged46tests pass; cross-window H2 refinement7tests pass. OTP positiveTLS12 unavailable under EMS policy; other runtime matrix pending. |
-| P5 resumption/diagnostics | ex_ssl ADR `a156a7c` + candidate | in_progress | Independent OpenSSL full/resumed/HRR/restart and policy negatives7tests pass; cache12tests, context6tests, verifier43tests+3properties pass. Final regression/benchmark in progress. |
-| P6 packaging/readiness | http_fetch `b4414db`, ex_ssl `2942433` | in_progress | Consumer package smoke and58 E2E tests pass; Credo and Dialyzer pass. Other runtime matrix, later features, benchmarks/resource campaigns and human security review remain. |
+| P4.3 dual-version integration | ex_ssl `844d4a6`, http_fetch `381f198` | verified | Library492tests+16properties pass; packaged46tests pass; cross-window H2 refinement7tests pass. Tested OTP28/29 TLS12 peers omit EMS; positive evidence uses OpenSSL. Final runtime matrix verified below. |
+| P5 resumption/diagnostics | ex_ssl ADR `a156a7c`, primitives `2330ab6`, runtime `c2d1d0c`; http_fetch `381f198` | verified | Local three-runtime full gate534tests+19properties each; actual resumption/HRR/restart, isolated bounded cache, diagnostics, packaged HTTP1 and measured benchmark. Final HRR/burst regressions included; exact refresh below. |
+| P6 packaging/readiness | both source candidates | verified | Local configured runtime matrix, packages47tests plus released-dependency smoke,58 consumerE2E,1CaddyE2E, strictcompile/staticchecks, boundedfuzz/resourcecampaign and readiness report complete. Remote CI not dispatched; human review remains separate. |
+| HUMAN-SECURITY-REVIEW | both candidates | not_started | Independent human security review before any promotion/publication decision. No default change or release authorized. |
 
 ## Executed commands
 
@@ -451,3 +453,94 @@ P6 resource seed94:1test,zero failures over17connections (12success including
 11resumed,3bad identities,2owner deaths). Parent strengthened aggregate binary/
 monitor sampling to execute inside sensitive processes instead of observing
 redacted external Process.info. Revalidation and final gates still pending.
+
+P5 review found subbinary backing-store retention could exceed cache serialized
+accounting. Commit `2330ab6` owns ticket/PSK/ALPN/DER bytes, discards cached decoded
+PKIX fields, and adds a backing-binary regression. Focused seed89:19tests,zero
+failures. Cache format_status initially redacted gen_statem's data field instead
+of GenServer state; default Inspect truncation hid this on Elixir1.18. The first
+Elixir1.19 matrix run exposed it. Root fixed state/message redaction and made the
+status assertion untruncated. Sensitive writer lacks sys callbacks; attempted
+inside-process measurement timed out. Final resource test measures connection
+internally, writer aggregate memory externally, and proves writer death; live
+writer binary/monitor aggregates remain unobservable. Seed90:29tests,zero failures.
+
+Benchmark now complete: OTP/ex_ssl, full/resumed, identical pinned TLS13 crypto,
+CA/ALPN/TCP nodelay, one warmup+five measurements each, exact1MiB echo. All independent
+resumption evidence asserted. Results and reproduction in RESUMPTION_BENCHMARK.md;
+no speed/default claim. Other runtime tuples became available through isolated
+Nix shells: Elixir1.19.6/OTP28 and Elixir1.20.4/OTP29.0.5. Initial matrix seed88
+529tests+16properties had two failures (status test and writer sys measurement),
+both corrected above. Full final matrix now running with separate build paths.
+
+### P6 final consumer, workflow and matrix evidence
+
+- Final source-package smoke seed36:47tests,zero failures; all five artifacts built.
+  Released-dependency `bash scripts/external_consumer_smoke.sh` passed with fresh
+  resolution, no umbrella lockfile or direct ex_ssl dependency/override. Logs
+  `/tmp/http-fetch-plan-p6-{source,published}-smoke.log`.
+- Configured Credo initially failed on the assignment inside the new P3validator's
+  if-condition (`f482322`). Worker stopped its read-only check; parent recognized
+  this as in-scope newly introduced code and moved the aggregate predicate before
+  if. Commit `4aa8855`; finalCredo54checks/116files:zero issues. No suppression.
+  `mix dialyzer --format github` passed:Total errors4,Skipped4,Unnecessary Skips0.
+  Existing ignore file unchanged. Fetch regression seed99:174tests+20doctests,
+  zero failures; packaged option refresh seed36:9tests,zero failures.
+- Both consumer environments strictcompile,fullformat,diffchecks passed.
+  Current consumer head `381f198` contains TLS12/resumption fixtures/docs;
+  backend production remains P0/P2/P3 plus the predicate style correction.
+- Owned Go peer ephemeral35605: root-scoped workflow suites fetch50,WS3,SSE2,WT3
+  allzero failures; peer stopped,post-closecurl exit7. No http_core E2E exists.
+  Logs `/tmp/http-fetch-p6-e2e-{http_fetch,http_web_socket,http_event_source,
+  http_web_transport}.log` and `/tmp/http-fetch-p6-dialyzer.log`.
+- Pinned Caddy Docker build, e2e deps/strictcompile and
+  `EX_SSL_E2E_PORT=32768 mix test --trace`:1test,zero failures,authenticatedJA3/JA4.
+  Uniquecontainer stopped,othercontainers untouched. Logs
+  `/tmp/ex-ssl-plan-caddy-{build,deps,compile,test,server}.log`.
+- Bounded fuzz seed95:3properties at200runs each+2tests,zero failures. Initial
+  property declaration syntax failed before sampling; corrected check-all option.
+  Exactfragment/remainder/AEAD/binder properties retain valid-input comparisons.
+- Expanded resource seed103:2tests,zero failures,17sequential connections plus
+  one warmup and24connections in three barrier-released groups of8. Every owned
+  connection/writer/rawport released; cache and supervisor bounds checked.
+- Hash-incompatible HRR focused seed14231:1test,zero failures; CH2 dropsPSK,
+  retainsmode1/freshP384 and matches explicit SHA384 message_hash rewrite.
+- Three-runtime full gates seeds100/101/102 each532tests+19properties,zero failures.
+  Elixir1.20 strictcompile had exposed external-bitstring-variable warnings and
+  unreachable clauses introduced inP3/P4/P5; these were corrected,not suppressed.
+  Subsequent dev/test strictcompile passed; tests also emitted no compiler warnings.
+  `mix xref graph --format stats`:52modules,zero cycles. No new analyzer dependency.
+
+Readiness and compatibility limits: [EX_SSL_HTTP_FETCH_READINESS.md](EX_SSL_HTTP_FETCH_READINESS.md).
+The next incomplete gate is independent human security review. No unsupported
+feature, skipped matrix test, remote CI run, release or default switch is claimed.
+
+### Final implementation revisions and isolated matrix refresh
+
+P5 runtime/diagnostics and compatibility: ex_ssl `c2d1d0c`; P5 cache/binder
+primitives: `2330ab6`. Consumer implementation/tests: `381f198` (validator style
+repair `4aa8855`). P6 fuzz/resource/benchmark evidence is committed as `18b4f85`. The final
+evidence-only documentation commit contains this ledger and the readiness/manifest.
+
+The final added HRR and concurrent-burst tests bring the library total to
+**534 tests and 19 properties**. The first concurrent refresh using a shared
+system temporary root returned 13 fixture failures on Elixir 1.18 and 8 on 1.19;
+1.20 passed. Failures were peer-startup/mismatched-certificate failures in the
+TLS12 fixture, which uses VM-local unique IDs. Running the identical seeds with
+separate `TMPDIR` roots restored all three gates without changing test assertions
+or protocol code:
+
+- Elixir 1.18.5 / OTP28, seed104: **534 tests +19 properties, zero failures**.
+- Elixir 1.19.6 / OTP28, seed105: **534 tests +19 properties, zero failures**.
+- Elixir 1.20.4 / OTP29.0.5, seed106: **534 tests +19 properties, zero failures**.
+
+All tests included integration and had no exclusions. Test commands returned zero;
+the wrapper's subsequent `rmdir` returned one because Mix metadata and generated
+reference-server fixture files remained. After inspection, exactly those owned
+files were removed with guarded per-file deletion and empty-directory removal.
+No test failure was hidden by cleanup. Final logs:
+`/tmp/ex-ssl-plan-isolated-{default,otp28-elixir19,otp29-elixir20}.log`.
+Dev/test warnings-as-errors compilation passed on all three tuples; the final
+OTP29 run contained no compiler warnings. Benchmark, source/published package,
+static and E2E results above remain valid; later changes were compiler-checked
+syntax, focused test additions and documentation only.
