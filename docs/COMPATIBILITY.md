@@ -198,3 +198,25 @@ exporters, and full OTP API parity are out of scope. ALPN negotiation alone is
 not evidence of an HTTP/2 request. See
 [HTTP_FETCH_INTEGRATION.md](HTTP_FETCH_INTEGRATION.md) for the opt-in consumer
 integration and its remaining acceptance gates.
+
+## Client identity preparation (internal)
+
+The bounded `SSL.ClientIdentity` loader is implemented as a prerequisite for
+initial-handshake client authentication. Public `SSL.connect` still rejects
+client identity options until the client-authentication flight is integrated.
+No configured identity is silently accepted and omitted from a handshake.
+
+The loader handles one DER certificate or leaf-first DER chain, typed DER RSA/EC/
+PKCS#8 private keys, and unencrypted PEM through binary or charlist paths. One
+combined certificate/key PEM is supported when `certfile` supplies both. Separate
+sources cannot conflict or hide additional private keys. Passwords, encrypted
+keys, hardware signers and `certs_keys` multiple-identity selection are rejected.
+Chain order and a scheme-specific signing/verification proof bind the key to the
+leaf; the peer remains responsible for client certificate trust and validity.
+
+Bounds: 16 certificates, 256 KiB per DER certificate, 512 KiB aggregate DER,
+1 MiB per PEM file or typed DER key. The chain bound leaves room for TLS record
+and handshake overhead within the existing 1 MiB writer ceiling. Errors contain
+only fixed reason atoms; ordinary identity inspection exposes only scheme IDs.
+Restricted PSS private keys and leaf constraints are both checked through the
+shared signature verifier. Unsupported key/parameter combinations fail explicitly.

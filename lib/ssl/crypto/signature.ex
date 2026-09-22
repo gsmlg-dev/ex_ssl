@@ -63,9 +63,45 @@ defmodule SSL.Crypto.Signature do
         transcript_digest,
         signature
       ) do
+    verify_role(
+      :server,
+      signature_scheme,
+      public_key,
+      transcript_hash_algorithm,
+      transcript_digest,
+      signature
+    )
+  end
+
+  @spec verify_client(term(), term(), atom(), term(), term()) :: :ok | {:error, error_reason()}
+  def verify_client(
+        signature_scheme,
+        public_key,
+        transcript_hash_algorithm,
+        transcript_digest,
+        signature
+      ) do
+    verify_role(
+      :client,
+      signature_scheme,
+      public_key,
+      transcript_hash_algorithm,
+      transcript_digest,
+      signature
+    )
+  end
+
+  defp verify_role(
+         role,
+         signature_scheme,
+         public_key,
+         transcript_hash_algorithm,
+         transcript_digest,
+         signature
+       ) do
     with {:ok, scheme} <- signature_scheme(signature_scheme),
          {:ok, signed_content} <-
-           server_signed_content(transcript_hash_algorithm, transcript_digest),
+           signed_content(role, transcript_hash_algorithm, transcript_digest),
          :ok <- validate_signature(signature),
          {:ok, verification_key} <- validate_public_key(scheme, public_key),
          :ok <- validate_signature_encoding(scheme, signature) do

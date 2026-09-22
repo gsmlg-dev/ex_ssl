@@ -98,6 +98,42 @@ defmodule SSL.Crypto.SignatureExpansionTest do
              )
   end
 
+  test "client verification enforces PSS leaf restrictions even with an unrestricted matching key",
+       context do
+    fixture = Map.fetch!(context.fixtures, 0x0809)
+    {:ok, verified} = PKIX.verify([fixture.der], [fixture.der], {:dns_id, "exssl.test"})
+    [entry] = fixture.key |> File.read!() |> :public_key.pem_decode()
+    {rsa_private, _restricted_params} = :public_key.pem_entry_decode(entry)
+    digest = :crypto.hash(:sha256, "client policy transcript")
+
+    assert {:ok, signature} =
+             Signature.sign_client(0x080A, {rsa_private, :asn1_NOVALUE}, :sha256, digest)
+
+    assert {:error, :invalid_rsa_pss_parameters} =
+             Signature.verify_client(0x080A, verified.public_key, :sha256, digest, signature)
+
+    assert {:ok, allowed_signature} =
+             Signature.sign_client(0x0809, {rsa_private, :asn1_NOVALUE}, :sha256, digest)
+
+    assert :ok =
+             Signature.verify_client(
+               0x0809,
+               verified.public_key,
+               :sha256,
+               digest,
+               allowed_signature
+             )
+
+    assert {:error, :invalid_certificate_verify} =
+             Signature.verify_server(
+               0x0809,
+               verified.public_key,
+               :sha256,
+               digest,
+               allowed_signature
+             )
+  end
+
   test "Ed25519 and P-384 reject wrong key identity, curve, and signature encoding", context do
     p384 = Map.fetch!(context.fixtures, 0x0503)
     ed = Map.fetch!(context.fixtures, 0x0807)

@@ -31,9 +31,9 @@ have not been executed locally.
 | P0.2 deterministic closure | http_fetch `b4414db7d9061c8892483e3bd632aa384a03ac70` | verified | Existing closure and early-response fixes preserved; missing Content-Length, exact-once completion, frame/header bounds fixed. Final seed25:442 tests+20 doctests, zero failures; independent review approved. |
 | P0.3 consumer boundary | both bases above | verified | Root-scoped baseline: 422 tests + 20 doctests, zero failures. ex_ssl transport contract: 31 integration tests; interoperability: 15 integration tests, zero failures. |
 | P1.1 capability registry | ex_ssl `0175097` | verified | Runtime-filtered registry, separate certificate-chain policy, registry-backed group/cipher negotiation and AEAD. Seed30: 292 tests +13 properties, zero failures. |
-| P1.2 algorithm expansion | ex_ssl (expansion commit following `0175097`) | verified | P-384 ECDHE/ECDSA, Ed25519, RSA-PSS-PSS; independent vectors, negatives and constrained peers. |
-| P1.3 negotiation evidence | ex_ssl expansion, http_fetch `93efee0` | verified | 327 library tests+15 properties; 12 external-candidate tests cover10 HTTP exchanges+5 identity negatives, zero failures. Other CI runtime tuples pending. |
-| P2.1 identity loading | ex_ssl | not_started | Bounded and redacted client credentials. |
+| P1.2 algorithm expansion | ex_ssl `5463ad9` | verified | P-384 ECDHE/ECDSA, Ed25519, RSA-PSS-PSS; independent vectors, negatives and constrained peers. |
+| P1.3 negotiation evidence | ex_ssl `5463ad9`, http_fetch `93efee0` | verified | 327 library tests+15 properties; 12 external-candidate tests cover10 HTTP exchanges+5 identity negatives, zero failures. Other CI runtime tuples pending. |
+| P2.1 identity loading | ex_ssl (identity commit following `5463ad9`) | verified | Internal loader, role-aware key matching, bounded DER/PEM and redaction. 78 tests+5 properties pass; public options remain unsupported until P2.2. |
 | P2.2 client authentication | ex_ssl | not_started | Client Certificate/CertificateVerify flight. |
 | P2.3 HTTP mTLS | both | not_started | Origin scope and required/optional auth. |
 | P3.1 policy/profile options | both | not_started | Ordered registry-backed configuration. |
@@ -190,3 +190,35 @@ unimplemented. Independent review approved the group and signature changes.
 
 Next incomplete task: P2.1 bounded client identity loading. Phases2–5 are not
 implemented; local gates do not imply full OTP parity or runtime-matrix coverage.
+
+- P6 supporting evidence at ex_ssl `5463ad9`: exact configured interoperability
+  workflow file list, with explicit `--include integration --seed 38`, passed
+  **112 tests, zero failures, no exclusions** on local OTP28/Elixir1.18.5.
+  Covers lifecycle, OTP reference, OTP/OpenSSL interop, new algorithms, depth,
+  input ordering, output/backpressure and consumer transport contract.
+  Log `/tmp/ex-ssl-tls-plan-interop.log`. Remote matrix remains unexecuted.
+
+### P2.1 bounded identity preparation
+
+Internal ClientIdentity loader supports documented DER/typed-key and unencrypted
+PEM forms, binary/charlist paths and one combined PEM. It rejects conflicts,
+multiple identities/keys, encrypted/hardware forms, malformed/oversized input,
+unordered or duplicate chains, and mismatched keys. Bounds are documented in
+COMPATIBILITY.md. Expiration/trust remain the peer's decision; the local loader
+checks key matching and ordered chain signatures without trusting the identity.
+
+- Initial missing-module regression run failed; first implementation's eight
+  loader tests passed. Parent review found key matching stripped PSS leaf
+  restrictions; shared `Signature.verify_client/5` now enforces the same key and
+  encoding policy as server verification with the distinct client context.
+- Final `MIX_ENV=test mix test test/ssl/client_identity_test.exs
+  test/ssl/crypto/signature_test.exs test/ssl/crypto/signature_expansion_test.exs
+  test/ssl/pkix test/ssl/protocol/server_flight_verifier_test.exs
+  --include integration --seed 44` — **78 tests +5 properties, zero failures**.
+- Dev/test warnings-as-errors compilation, formatting and diff checks passed.
+  Independent review approved. Different path spellings for the same combined
+  PEM may reject; use a single certfile path or the identical path for both.
+- Public Options/Connection are intentionally not connected to this loader yet:
+  accepting an identity before implementing its flight would silently omit it.
+
+Next incomplete task: P2.2 initial-handshake client authentication.
