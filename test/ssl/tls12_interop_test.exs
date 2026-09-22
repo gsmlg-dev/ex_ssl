@@ -16,12 +16,13 @@ defmodule SSL.TLS12InteropTest do
       Path.join(System.tmp_dir!(), "exssl-tls12-peer-#{System.unique_integer([:positive])}")
 
     on_exit(fn -> File.rm_rf!(directory) end)
-    {:ok, fixtures: ClientAuthFixtures.create(directory)}
+    {:ok, fixtures: ClientAuthFixtures.create(directory), peer_version: python_ssl_version()}
   end
 
   for {key, suite, cipher} <- @suites do
     test "OpenSSL TLS 1.2 #{cipher} authenticates and exchanges bounded bytes", %{
-      fixtures: fixtures
+      fixtures: fixtures,
+      peer_version: peer_version
     } do
       server = if unquote(key) == :rsa, do: fixtures.server, else: fixtures.ec_server
       peer = start_peer(fixtures, server, cipher: unquote(cipher), alpn: ["http/1.1"])
@@ -33,6 +34,7 @@ defmodule SSL.TLS12InteropTest do
         assert handshake["cipher"] == unquote(cipher)
         assert handshake["alpn"] == "http/1.1"
         assert handshake["client_der_b64"] == :null
+        report_handshake(handshake, peer_version, "verified TLS 1.2 echo")
         assert {:ok, "http/1.1"} = SSL.negotiated_protocol(socket)
         assert_echo(socket, "tls12-#{unquote(suite)}")
         assert {:ok, %{"bytes" => _}} = OpenSSLPeer.event(peer, "exchange", 5_000)
@@ -45,7 +47,8 @@ defmodule SSL.TLS12InteropTest do
 
   for identity_key <- [:rsa, :ec, :large] do
     test "OpenSSL TLS 1.2 required mTLS authenticates exact #{identity_key} DER", %{
-      fixtures: fixtures
+      fixtures: fixtures,
+      peer_version: peer_version
     } do
       identity = fixtures[unquote(identity_key)]
       peer = start_peer(fixtures, fixtures.server, verify: :required)
@@ -59,6 +62,7 @@ defmodule SSL.TLS12InteropTest do
         assert {:ok, handshake} = OpenSSLPeer.event(peer, "handshake", 5_000)
         assert handshake["version"] == "TLSv1.2"
         assert Base.decode64!(handshake["client_der_b64"]) == identity.der
+        report_handshake(handshake, peer_version, "verified TLS 1.2 mTLS echo")
         if unquote(identity_key) == :large, do: assert(byte_size(identity.der) > 16_384)
         assert_echo(socket, "authenticated")
         assert {:ok, %{"bytes" => 13}} = OpenSSLPeer.event(peer, "exchange", 5_000)
@@ -284,4 +288,16 @@ defmodule SSL.TLS12InteropTest do
 
   defp cipher_option(0xC02C),
     do: %{key_exchange: :ecdhe_ecdsa, cipher: :aes_256_gcm, mac: :aead, prf: :sha384}
+
+  defp python_ssl_version do
+    {version, 0} = System.cmd("python3", ["-c", "import ssl; print(ssl.OPENSSL_VERSION)"])
+    String.trim(version)
+  end
+
+  defp report_handshake(handshake, peer_version, expected) do
+    IO.puts(
+      "TLS 1.2 interop peer=Python ssl/#{peer_version} protocol=#{handshake["version"]} " <>
+        "suite=#{handshake["cipher"]} expected=#{expected}"
+    )
+  end
 end

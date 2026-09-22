@@ -156,6 +156,49 @@ defmodule SSL.Protocol.HandshakeMachineTest do
     assert unchanged.ticket_count == 0
   end
 
+  test "delayed tickets between application records preserve data and ticket event order" do
+    machine = %{
+      connected_fixture_machine()
+      | enable_tickets: true,
+        resumption_master: :binary.copy(<<7>>, 48)
+    }
+
+    # The independent captured handshake has completed. Deliberately deliver
+    # application data before releasing the first NST; no clock or sleep is needed.
+    {:ok, before_ticket, server} = Record.encrypt(machine.read_state, :application_data, "before")
+
+    assert {:ok, machine, [], [{:application_data, "before"}]} =
+             HandshakeMachine.feed(machine, before_ticket)
+
+    assert machine.ticket_count == 0
+    ticket = <<4, 15::24, 60::32, 7::32, 1, 9, 1::16, 1, 0::16>>
+    {:ok, first_ticket, server} = Record.encrypt(server, :handshake, ticket)
+    {:ok, between, server} = Record.encrypt(server, :application_data, "between")
+    second_ticket = <<4, 15::24, 60::32, 7::32, 1, 10, 1::16, 2, 0::16>>
+    {:ok, second_ticket, server} = Record.encrypt(server, :handshake, second_ticket)
+    {:ok, after_ticket, _server} = Record.encrypt(server, :application_data, "after")
+
+    {machine, events} =
+      Enum.reduce([first_ticket, between, second_ticket, after_ticket], {machine, []}, fn
+        record, {current, events} ->
+          assert {:ok, next, [], emitted} = HandshakeMachine.feed(current, record)
+          {next, events ++ emitted}
+      end)
+
+    assert [
+             {:session_ticket, first},
+             {:application_data, "between"},
+             {:session_ticket, second},
+             {:application_data, "after"}
+           ] = events
+
+    assert first.ticket == <<1>>
+    assert second.ticket == <<2>>
+    refute first.psk == second.psk
+    assert machine.ticket_count == 2
+    assert machine.pending_tickets == []
+  end
+
   test "runtime inspection omits ClientHello ticket bytes and resumption secrets" do
     machine = %{
       connected_fixture_machine()
@@ -546,7 +589,12 @@ defmodule SSL.Protocol.HandshakeMachineTest do
   end
 
   test "rejects application data interleaved with a fragmented post-handshake message" do
-    machine = connected_fixture_machine()
+    machine = %{
+      connected_fixture_machine()
+      | enable_tickets: true,
+        resumption_master: :binary.copy(<<7>>, 48)
+    }
+
     {:ok, partial, server_write} = Record.encrypt(machine.read_state, :handshake, <<4, 0>>)
     assert {:ok, machine, [], []} = HandshakeMachine.feed(machine, partial)
 

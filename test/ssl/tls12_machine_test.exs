@@ -3,7 +3,7 @@ defmodule SSL.TLS12MachineTest do
   alias SSL.Protocol.{ClientOffer, TLS12}
 
   @tag :integration
-  test "OTP28 peer without EMS is rejected explicitly" do
+  test "configured OTP TLS 1.2 reference peer without EMS is rejected explicitly" do
     dir = Path.join(System.tmp_dir!(), "tls12-machine-#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf!(dir) end)
     fixtures = ExSSL.TestSupport.ClientAuthFixtures.create(dir)

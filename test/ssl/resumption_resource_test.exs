@@ -42,7 +42,7 @@ defmodule SSL.ResumptionResourceTest do
       end
 
       for _ <- 1..2 do
-        owner_death(peer, fixtures, baseline_children)
+        owner_death(peer, fixtures, true, baseline_children)
       end
 
       assert %{count: count, bytes: bytes} = TicketCache.stats()
@@ -160,6 +160,8 @@ defmodule SSL.ResumptionResourceTest do
   end
 
   defp failed_identity(peer, fixtures, baseline_children) do
+    before = connection_children()
+
     assert {:error, _} =
              SSL.connect(
                @host,
@@ -169,10 +171,20 @@ defmodule SSL.ResumptionResourceTest do
              )
 
     assert {:error, %{"kind" => "failure"}} = OpenSSLPeer.event(peer, "handshake", 5_000)
+
+    # A connect error is replied before the connection's termination callback
+    # has necessarily completed. Monitor any still-owned child rather than
+    # treating the public reply as a process-exit barrier.
+    for pid <- MapSet.difference(connection_children(), before) do
+      monitor = Process.monitor(pid)
+      assert_receive {:DOWN, ^monitor, :process, ^pid, reason}, 1_000
+      assert reason in [:normal, :noproc]
+    end
+
     assert active_connections() == baseline_children
   end
 
-  defp owner_death(peer, fixtures, baseline_children) do
+  defp owner_death(peer, fixtures, resumed, baseline_children) do
     parent = self()
 
     owner =
@@ -187,7 +199,10 @@ defmodule SSL.ResumptionResourceTest do
 
     owner_monitor = Process.monitor(owner)
     assert_receive {:owner_connected, ^owner, {:ok, socket}}, 5_000
-    assert {:ok, %{"kind" => "handshake"}} = OpenSSLPeer.event(peer, "handshake", 5_000)
+
+    assert {:ok, %{"kind" => "handshake", "resumed" => ^resumed}} =
+             OpenSSLPeer.event(peer, "handshake", 5_000)
+
     state = connection_state(socket)
     assert_live_resources(state)
     connection_monitor = Process.monitor(socket.pid)
@@ -263,6 +278,13 @@ defmodule SSL.ResumptionResourceTest do
 
   defp active_connections do
     DynamicSupervisor.count_children(SSL.ConnectionSupervisor).active
+  end
+
+  defp connection_children do
+    SSL.ConnectionSupervisor
+    |> DynamicSupervisor.which_children()
+    |> Enum.map(fn {_, pid, _, _} -> pid end)
+    |> MapSet.new()
   end
 
   defp options(fixtures) do

@@ -4,6 +4,7 @@ defmodule SSL.OTPReferenceTest do
   alias ExSSL.TestSupport.LocalTLSPeer
 
   @moduletag :otp_reference
+  @moduletag :integration
 
   test "OTP ssl recv with a positive length preserves the surplus" do
     {:ok, peer} = LocalTLSPeer.start(fn socket -> :ok = :ssl.send(socket, "abcdef") end)

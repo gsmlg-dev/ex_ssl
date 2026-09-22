@@ -4,6 +4,7 @@
 import argparse
 import base64
 import json
+import select
 import socket
 import ssl
 import sys
@@ -100,6 +101,7 @@ def main():
     parser.add_argument("--delay-ms", type=int, default=0)
     parser.add_argument("--group")
     parser.add_argument("--restart-context", default="false", choices=["false", "true"])
+    parser.add_argument("--abrupt-close", default="false", choices=["false", "true"])
     args = parser.parse_args()
 
     if args.max_connections not in range(1, 33) or args.delay_ms not in range(0, 1001):
@@ -140,6 +142,17 @@ def main():
                     client_der_b64=base64.b64encode(der).decode("ascii") if der else None,
                 )
                 exchange(connection, args.mode, args.delay_ms)
+                if args.abrupt_close == "true":
+                    # The test first acknowledges the plaintext, then releases
+                    # this barrier to test TCP truncation independently of timing.
+                    announce("close_ready")
+                    ready, _, _ = select.select([sys.stdin], [], [], 10)
+                    if not ready or sys.stdin.readline().strip() != "close":
+                        raise ValueError("missing close barrier")
+                    # Close TCP after acknowledged application output without
+                    # generating close_notify. This is deliberate truncation.
+                    socket.socket(fileno=connection.detach()).close()
+                    continue
                 # Send close_notify so buffered application records remain usable
                 # after the transport closes. The client closes after its reply.
                 try:

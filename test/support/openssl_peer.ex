@@ -97,7 +97,8 @@ defmodule ExSSL.TestSupport.OpenSSLPeer do
       :max_connections,
       :delay_ms,
       :group,
-      :restart_context
+      :restart_context,
+      :abrupt_close
     ]
 
     if Keyword.keyword?(options) and Enum.all?(Keyword.keys(options), &(&1 in allowed)) and
@@ -123,7 +124,9 @@ defmodule ExSSL.TestSupport.OpenSSLPeer do
          "--delay-ms",
          Integer.to_string(Keyword.get(options, :delay_ms, 0)),
          "--restart-context",
-         to_string(Keyword.get(options, :restart_context, false))
+         to_string(Keyword.get(options, :restart_context, false)),
+         "--abrupt-close",
+         to_string(Keyword.get(options, :abrupt_close, false))
        ] ++
          optional("--group", options[:group]) ++
          optional("--cafile", options[:cafile]) ++ optional("--alpn", alpn(options[:alpn]))}

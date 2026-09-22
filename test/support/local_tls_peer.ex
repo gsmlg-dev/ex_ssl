@@ -255,9 +255,10 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
   def start_backpressure_proxy(upstream_port, observer, options \\ [])
       when is_integer(upstream_port) and is_pid(observer) do
     hold_upstream_close = Keyword.get(options, :hold_upstream_close, false)
+    listen_port = Keyword.get(options, :port, 0)
 
     {:ok, listener} =
-      :gen_tcp.listen(0, [
+      :gen_tcp.listen(listen_port, [
         :binary,
         active: false,
         packet: :raw,
