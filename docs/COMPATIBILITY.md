@@ -168,5 +168,5 @@ TLS 1.2, server TLS, DTLS, QUIC/HTTP/3, client authentication, resumption,
 0-RTT, post-handshake authentication, active true/active-N, packet framing,
 exporters, and full OTP API parity are out of scope. ALPN negotiation alone is
 not evidence of an HTTP/2 request. See
-[HTTP_FETCH_INTEGRATION.md](HTTP_FETCH_INTEGRATION.md) for the separate consumer
-work still required.
+[HTTP_FETCH_INTEGRATION.md](HTTP_FETCH_INTEGRATION.md) for the opt-in consumer
+integration and its remaining acceptance gates.

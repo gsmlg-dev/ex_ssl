@@ -1,9 +1,11 @@
 # http_fetch opt-in transport integration
 
-This guide records the library contract audited against `gsmlg-dev/http_fetch`
-revision `540225cec69cd2c1e41eb80b956fd6f1a8df7b70`. The ex_ssl fixture proves
-the transport lifecycle below; it does not claim that `HTTP.fetch` already uses
-ex_ssl.
+The opt-in integration exists in `gsmlg-dev/http_fetch` PR #14 at
+`690258ac38e50b0d1a968d9d5e510c560f45f5d4` (open, unmerged on 2026-09-22).
+Its adapter serves HTTPS fetch, WSS, and EventSource while OTP remains the
+default. The library fixture proves the transport lifecycle; consumer tests
+prove real HTTP exchanges. Current execution evidence and remaining gates are
+recorded in [EX_SSL_HTTP_FETCH_PROGRESS.md](EX_SSL_HTTP_FETCH_PROGRESS.md).
 
 ## Audited consumer contract
 
@@ -132,19 +134,25 @@ The existing Manifold passive direct-TLS and STARTTLS subset remains supported.
 This work does not weaken its verification, plaintext-boundary, close, or
 receive-timeout behavior.
 
-## Consumer changes still required
+## Implemented consumer integration
 
-1. Add explicit backend selection and a new transport module implementing the
-   existing callbacks with `SSL`; keep OTP as the initial default.
-2. Build TLS-1.3-specific ex_ssl options instead of copying the OTP adapter's
-   mixed version defaults.
-3. Dispatch negotiated-protocol lookup through the selected transport rather
-   than pattern-matching specifically on `HTTP.Transport.SSL`.
-4. Dispatch passive receive through the transport for the shared WebSocket HTTP
-   Upgrade path; it currently calls `:ssl.recv` directly for SSL.
-5. Broaden concrete socket types that currently assume OTP `:ssl.sslsocket()`.
-6. Add adapter-level error mapping for `:busy`, ownership failures, ALPN absence,
-   send timeout, graceful closure, and abrupt failure.
+PR #14 implements explicit backend selection, TLS-1.3-specific ex_ssl options,
+transport-neutral ALPN and passive WebSocket receive, socket ownership handoff,
+and adapter error propagation. It preserves backend selection through redirects
+and EventSource reconnects. HTTP/3 and WebTransport retain the QUIC path and
+reject an explicit TCP TLS backend.
+
+The existing HTTP/2 close fix permits drainage only after an ex_ssl optional
+control write returns `:closed`. Response completion still requires END_STREAM
+and complete header blocks. A completed early response stops unsent upload DATA;
+an unfinished upload alone does not invalidate the response. Truncation, actual
+required-write failures, other transport errors, cancellation, and the original
+operation deadline remain errors. No request bytes are replayed.
+
+The Phase 0 continuation adds HTTP/2 Content-Length validation, bounded
+frame/header accumulation, and exact-once completion checks. Its core and real
+TLS regressions are recorded in the progress ledger alongside the preserved
+closure/early-response evidence.
 
 ## Consumer acceptance checklist
 
@@ -165,7 +173,6 @@ HTTP/2:
   behavior through the existing HTTP/2 implementation;
 - cancellation and connection teardown with no replay or leaked task/socket.
 
-Only those consumer tests can establish actual HTTP integration. The ex_ssl
-fixture establishes that the underlying transport contract is available; this
-library-only lifecycle behavior does not complete the separate http_fetch
-adapter migration.
+Consumer tests establish the tested HTTP integration subset. The ex_ssl
+fixture separately establishes the transport lifecycle contract. Neither suite
+establishes full OTP parity, release readiness, or all server/runtime combinations.
