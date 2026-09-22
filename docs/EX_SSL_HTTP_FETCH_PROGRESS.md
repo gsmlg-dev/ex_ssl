@@ -544,3 +544,24 @@ Dev/test warnings-as-errors compilation passed on all three tuples; the final
 OTP29 run contained no compiler warnings. Benchmark, source/published package,
 static and E2E results above remain valid; later changes were compiler-checked
 syntax, focused test additions and documentation only.
+
+## Authorized worktree integration and minor release
+
+The user subsequently authorized merging all worktrees, committing, pushing and
+releasing the next minor versions. This supersedes the earlier no-merge/no-release
+scope. Targets are ex_ssl 0.4.0 and http_fetch 0.12.0. Human security review remains
+unperformed; publication does not change the experimental compatibility claim.
+
+ex_ssl worktrees were merged alphabetically. The earlier partial implementation
+was committed as `62b05c0`; its capabilities are superseded by the validated
+registry/crypto implementation. Unique regression tests were retained; the earlier
+ledger is archived under docs/archive. Integration merge `4ba6294` has production
+code identical to `060cfd0`. A preserved Ed25519 regression initially failed using
+the obsolete key tuple; it now uses the same SPKI representation as verified PKIX.
+Release validation and GitHub workflow execution follow this reconciliation.
+
+Release integration validation: `MIX_ENV=test mix test --include integration
+--seed 108` passed 538 tests and 19 properties, zero failures/no exclusions.
+Formatting and dev/test strict compilation passed; OTP29/Elixir1.20 strict
+compilation plus preserved crypto regressions seed109 passed three tests.
+Both ex_ssl worktrees and merged branches were removed after ancestry checks.

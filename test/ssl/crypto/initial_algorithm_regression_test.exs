@@ -46,7 +46,7 @@ defmodule SSL.Crypto.InitialAlgorithmRegressionTest do
 
   test "verifies Ed25519 with the TLS 1.3 scheme" do
     {public_key, private_key} = :crypto.generate_key(:eddsa, :ed25519)
-    public_key = {:ed_pub, :ed25519, public_key}
+    public_key = {{1, 3, 101, 112}, {:ECPoint, public_key}, {:namedCurve, {1, 3, 101, 112}}}
     transcript_digest = :crypto.hash(:sha256, "ed25519 transcript")
 
     signed_content =

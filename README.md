@@ -14,20 +14,20 @@ The OTP application is `:ex_ssl`. The public compatibility module is `SSL` (`Eli
 > [compatibility matrix](docs/COMPATIBILITY.md) for exact restrictions. OTP
 > `:ssl` remains the default recommendation.
 
-The source candidate also supports ordered TLS 1.3 algorithm options, explicit
+Version 0.4 also supports ordered TLS 1.3 algorithm options, explicit
 certificate-chain signature restrictions, one client identity, and a validated
-TCP option allowlist. These additions are not in the published 0.3.0 dependency;
+TCP option allowlist. These additions require ex_ssl 0.4 or newer;
 see [compatibility](docs/COMPATIBILITY.md) and the
 [implementation ledger](docs/EX_SSL_HTTP_FETCH_PROGRESS.md) for executed gates.
 
 ## Installation
 
-Once published, add the `ex_ssl` package to your dependencies:
+Add the `ex_ssl` package to your dependencies:
 
 ```elixir
 def deps do
   [
-    {:ex_ssl, "~> 0.2.0"}
+    {:ex_ssl, "~> 0.4.0"}
   ]
 end
 ```
@@ -189,7 +189,7 @@ Runtime support depends on the crypto provider available to OTP. Implemented
 TLS 1.3 handshake signatures are P-256/P-384 ECDSA, Ed25519, and RSA-PSS-RSAE /
 RSA-PSS-PSS SHA-256/384/512, with strict key and parameter checks. See
 [the compatibility matrix](docs/COMPATIBILITY.md) for the bounded subset; client
-certificates and explicit bounded TLS 1.2 are implemented in this source candidate.
+certificates and explicit bounded TLS 1.2 are implemented in version 0.4.
 
 ## Architecture
 
@@ -253,7 +253,7 @@ A matching TLS ClientHello does not guarantee that a remote service will see a c
 
 ### Explicit bounded TLS 1.2
 
-The source candidate accepts explicit TLS1.2-only or mixed version lists while
+Version 0.4 accepts explicit TLS1.2-only or mixed version lists while
 keeping TLS1.3 as the default. TLS1.2 requires ECDHE, AES-GCM, Extended Master
 Secret and secure-renegotiation indication; renegotiation is disabled. Peers
 without EMS, including the observed local OTP28 TLS1.2 server, fail explicitly.

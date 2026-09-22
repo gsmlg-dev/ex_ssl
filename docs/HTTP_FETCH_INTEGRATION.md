@@ -1,5 +1,11 @@
 # http_fetch opt-in transport integration
 
+Release note: the Phase 1–5 capabilities below ship in ex_ssl 0.4.0. Consumers
+must depend on `~> 0.4.0` to use them. References to the 0.3.0 dependency and
+source-candidate gates record the historical validation boundary; they are not
+the current installation requirement. OTP remains the default consumer backend.
+
+
 The opt-in integration exists in `gsmlg-dev/http_fetch` PR #14 at
 `690258ac38e50b0d1a968d9d5e510c560f45f5d4` (open, unmerged on 2026-09-22).
 Its adapter serves HTTPS fetch, WSS, and EventSource while OTP remains the

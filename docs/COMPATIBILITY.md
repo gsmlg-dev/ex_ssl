@@ -306,7 +306,7 @@ Each supplied unsupported policy fails before network I/O, with its value
 redacted. Implementing one requires a separate trust-semantics design and
 negative/availability tests; no permissive verification callback is installed.
 
-## Explicit TLS1.2 subset (source candidate)
+## Explicit TLS1.2 subset (since 0.4)
 
 The default remains TLS1.3-only. Explicit TLS1.2 or mixed lists negotiate on one
 connection; failure never reconnects with weaker options. The independent engine
