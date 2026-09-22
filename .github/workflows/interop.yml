@@ -45,6 +45,9 @@ jobs:
           test/ssl/connection_lifecycle_test.exs
           test/ssl/otp_reference_test.exs
           test/ssl/connection_interop_test.exs
+          test/ssl/resumption_interop_test.exs
+          test/ssl/resumption_resource_test.exs
+          test/ssl/diagnostics_test.exs
           test/ssl/tls12_interop_test.exs
           test/ssl/tls12_machine_test.exs
           test/ssl/p384_interop_test.exs
