@@ -492,6 +492,7 @@ defmodule SSL.Protocol.ServerFlightVerifier do
 
   defp bind_key_share_group(0x001D, :x25519), do: :ok
   defp bind_key_share_group(0x0017, :secp256r1), do: :ok
+  defp bind_key_share_group(0x0018, :secp384r1), do: :ok
 
   defp bind_key_share_group(group, client_group),
     do: alert(:illegal_parameter, {:key_share_group_mismatch, group, client_group})

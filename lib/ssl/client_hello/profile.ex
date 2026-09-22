@@ -23,7 +23,7 @@ defmodule SSL.ClientHello.Profile do
   }
 
   @typed_extension_ids Map.values(@extension_ids)
-  @known_key_share_sizes %{x25519: 32, secp256r1: 65}
+  @known_key_share_sizes %{x25519: 32, secp256r1: 65, secp384r1: 97}
 
   @typedoc "Capabilities the current TLS engine can safely advertise."
   @type capabilities :: %{

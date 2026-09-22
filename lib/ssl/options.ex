@@ -21,11 +21,11 @@ defmodule SSL.Options do
   @capabilities %{
     versions: [0x0304],
     ciphers: [0x1301, 0x1302, 0x1303],
-    groups: [0x001D, 0x0017],
-    signature_algorithms: [0x0403, 0x0804, 0x0805, 0x0806],
+    groups: [0x001D, 0x0017, 0x0018],
+    signature_algorithms: [0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0807],
     psk_key_exchange_modes: [],
     raw_extensions: [],
-    key_share_sizes: %{0x001D => 32, 0x0017 => 65}
+    key_share_sizes: %{0x001D => 32, 0x0017 => 65, 0x0018 => 97}
   }
   @keys [
     :mode,
@@ -58,7 +58,11 @@ defmodule SSL.Options do
 
     groups =
       available_identifiers(
-        [{0x001D, :x25519, :x25519}, {0x0017, :secp256r1, :secp256r1}],
+        [
+          {0x001D, :x25519, :x25519},
+          {0x0017, :secp256r1, :secp256r1},
+          {0x0018, :secp384r1, :secp384r1}
+        ],
         :curves
       )
 
@@ -66,9 +70,11 @@ defmodule SSL.Options do
       available_identifiers(
         [
           {0x0403, :ecdsa_secp256r1_sha256, :ecdsa},
+          {0x0503, :ecdsa_secp384r1_sha384, :ecdsa},
           {0x0804, :rsa_pss_rsae_sha256, :rsa},
           {0x0805, :rsa_pss_rsae_sha384, :rsa},
-          {0x0806, :rsa_pss_rsae_sha512, :rsa}
+          {0x0806, :rsa_pss_rsae_sha512, :rsa},
+          {0x0807, :ed25519, :eddsa}
         ],
         :public_keys
       )

@@ -76,6 +76,48 @@ defmodule SSL.Crypto.SignatureTest do
              )
   end
 
+  test "verifies ECDSA P-384 with the TLS 1.3 P-384 scheme" do
+    private_key = :public_key.generate_key({:namedCurve, {1, 3, 132, 0, 34}})
+    public_key = {{:ECPoint, elem(private_key, 4)}, elem(private_key, 3)}
+    transcript_digest = :crypto.hash(:sha384, "p384 transcript")
+
+    signed_content =
+      :binary.copy(<<0x20>>, 64) <>
+        "TLS 1.3, server CertificateVerify" <> <<0>> <> transcript_digest
+
+    signature = :public_key.sign(signed_content, :sha384, private_key)
+
+    assert :ok =
+             Signature.verify_server(
+               0x0503,
+               public_key,
+               :sha384,
+               transcript_digest,
+               signature
+             )
+  end
+
+  test "verifies Ed25519 with the TLS 1.3 scheme" do
+    {public_key, private_key} = :crypto.generate_key(:eddsa, :ed25519)
+    public_key = {:ed_pub, :ed25519, public_key}
+    transcript_digest = :crypto.hash(:sha256, "ed25519 transcript")
+
+    signed_content =
+      :binary.copy(<<0x20>>, 64) <>
+        "TLS 1.3, server CertificateVerify" <> <<0>> <> transcript_digest
+
+    signature = :crypto.sign(:eddsa, :none, signed_content, [private_key, :ed25519])
+
+    assert :ok =
+             Signature.verify_server(
+               0x0807,
+               public_key,
+               :sha256,
+               transcript_digest,
+               signature
+             )
+  end
+
   test "verifies RSA-PSS SHA-256 with SHA-384 and RSA-PSS SHA-384 with SHA-256 transcripts" do
     private_key = :public_key.generate_key({:rsa, 2048, 65_537})
     public_key = {:RSAPublicKey, elem(private_key, 2), elem(private_key, 3)}
@@ -160,7 +202,7 @@ defmodule SSL.Crypto.SignatureTest do
                hex(Map.fetch!(@rsa_signatures, 0x0804))
              )
 
-    assert {:error, {:unsupported_ec_curve, :secp384r1}} =
+    assert {:error, {:unsupported_ec_curve, {1, 3, 132, 0, 34}}} =
              Signature.verify_server(
                0x0403,
                wrong_curve,
@@ -173,7 +215,7 @@ defmodule SSL.Crypto.SignatureTest do
   test "rejects unsupported schemes and malformed arbitrary terms" do
     ec_key = public_key(@ec_public_pem)
 
-    assert {:error, {:unsupported_signature_scheme, 0x0807}} =
+    assert {:error, :invalid_public_key} =
              Signature.verify_server(0x0807, ec_key, :sha256, sequence(32), <<1>>)
 
     assert {:error, {:unsupported_signature_scheme, nil}} =

@@ -418,6 +418,7 @@ defmodule SSL.Protocol.HandshakeMachine do
   defp retry_key_pair(nil, pair), do: {:ok, pair}
   defp retry_key_pair(0x001D, _pair), do: KeyExchange.generate(:x25519)
   defp retry_key_pair(0x0017, _pair), do: KeyExchange.generate(:secp256r1)
+  defp retry_key_pair(0x0018, _pair), do: KeyExchange.generate(:secp384r1)
   defp retry_key_pair(group, _pair), do: {:error, {:unsupported_selected_group, group}}
 
   defp retry_key_pairs(key_pairs, hrr, pair) do
@@ -632,6 +633,7 @@ defmodule SSL.Protocol.HandshakeMachine do
   defp hash_for(_), do: :sha256
   defp group_id(:x25519), do: 0x001D
   defp group_id(:secp256r1), do: 0x0017
+  defp group_id(:secp384r1), do: 0x0018
   defp validate_identity({:dns_id, name}) when is_binary(name), do: :ok
   defp validate_identity({:ip, _}), do: :ok
   defp validate_identity(_), do: {:error, :invalid_identity}
