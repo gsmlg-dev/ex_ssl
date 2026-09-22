@@ -247,6 +247,36 @@ defmodule SSL.ConnectionInteropTest do
     assert :ok = LocalTLSPeer.stop(peer)
   end
 
+  test "public API exchanges application data with a P-384 ECDHE peer" do
+    profile = %WireProfile{
+      name: :secp384r1,
+      extensions: [
+        {:supported_versions, [0x0304]},
+        {:server_name, :from_connection},
+        {:supported_groups, [:secp384r1]},
+        {:signature_algorithms, [:ecdsa_secp256r1_sha256, :rsa_pss_rsae_sha256]},
+        {:key_share, [:secp384r1]}
+      ]
+    }
+
+    {:ok, peer} =
+      LocalTLSPeer.start(
+        fn socket ->
+          assert {:ok, "p384"} = :ssl.recv(socket, 4, 5_000)
+          assert :ok = :ssl.send(socket, "ok")
+        end,
+        ssl_options: [supported_groups: [:secp384r1]]
+      )
+
+    options = Keyword.put(LocalTLSPeer.client_options(), :ex_ssl, profile: profile)
+
+    assert {:ok, socket} = SSL.connect(~c"127.0.0.1", peer.port, options, 5_000)
+    assert :ok = SSL.send(socket, "p384")
+    assert {:ok, "ok"} = SSL.recv(socket, 2, 5_000)
+    assert :ok = SSL.close(socket)
+    assert :ok = LocalTLSPeer.stop(peer)
+  end
+
   test "public API handles a peer KeyUpdate before later application data" do
     {:ok, peer} =
       LocalTLSPeer.start(fn socket ->

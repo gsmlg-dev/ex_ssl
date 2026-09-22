@@ -364,7 +364,7 @@ defmodule SSL.Protocol.ServerHello do
   defp require_compression(0), do: :ok
   defp require_compression(method), do: {:error, {:invalid_compression_method, method}}
 
-  defp require_implemented_group(group) when group in [0x001D, 0x0017], do: :ok
+  defp require_implemented_group(group) when group in [0x001D, 0x0017, 0x0018], do: :ok
 
   defp require_implemented_group(group) do
     if grease?(group) do
@@ -385,6 +385,7 @@ defmodule SSL.Protocol.ServerHello do
   defp validate_key_exchange(0x001D, key_exchange) when byte_size(key_exchange) == 32, do: :ok
 
   defp validate_key_exchange(0x0017, <<4, _coordinates::binary-size(64)>>), do: :ok
+  defp validate_key_exchange(0x0018, <<4, _coordinates::binary-size(96)>>), do: :ok
 
   defp validate_key_exchange(group, key_exchange),
     do: {:error, {:invalid_key_exchange, group, byte_size(key_exchange)}}

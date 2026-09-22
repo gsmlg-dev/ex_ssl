@@ -11,7 +11,7 @@ defmodule SSL.Crypto.Signature do
   @secp256r1_oid {1, 2, 840, 10_045, 3, 1, 7}
   @secp384r1_oid {1, 3, 132, 0, 34}
 
-  @type signature_scheme :: 0x0403 | 0x0804 | 0x0805 | 0x0806
+  @type signature_scheme :: 0x0403 | 0x0503 | 0x0804 | 0x0805 | 0x0806 | 0x0807
   @type error_reason ::
           :unsupported_hash
           | :invalid_certificate_verify
@@ -21,7 +21,7 @@ defmodule SSL.Crypto.Signature do
           | {:unsupported_signature_scheme, term()}
           | {:invalid_input, :transcript_hash | :signature}
           | {:invalid_transcript_hash_length, pos_integer()}
-          | {:key_type_mismatch, :ecdsa | :rsa}
+          | {:key_type_mismatch, :ecdsa | :eddsa | :rsa}
           | {:unsupported_ec_curve, atom() | tuple()}
 
   @spec server_signed_content(atom(), term()) ::
@@ -51,6 +51,7 @@ defmodule SSL.Crypto.Signature do
   end
 
   defp signature_scheme(0x0403), do: {:ok, :ecdsa, :sha256, []}
+  defp signature_scheme(0x0503), do: {:ok, :ecdsa, :sha384, []}
 
   defp signature_scheme(0x0804),
     do: {:ok, :rsa, :sha256, rsa_pss_options(:sha256, 32)}
@@ -60,6 +61,8 @@ defmodule SSL.Crypto.Signature do
 
   defp signature_scheme(0x0806),
     do: {:ok, :rsa, :sha512, rsa_pss_options(:sha512, 64)}
+
+  defp signature_scheme(0x0807), do: {:ok, :eddsa, :none, []}
 
   defp signature_scheme(signature_scheme),
     do: {:error, {:unsupported_signature_scheme, signature_scheme}}
@@ -78,8 +81,11 @@ defmodule SSL.Crypto.Signature do
        ),
        do: :ok
 
-  defp validate_public_key(:ecdsa, {{:ECPoint, _point}, {:namedCurve, @secp384r1_oid}}),
-    do: {:error, {:unsupported_ec_curve, :secp384r1}}
+  defp validate_public_key(
+         :ecdsa,
+         {{:ECPoint, <<4, _coordinates::binary-size(96)>>}, {:namedCurve, @secp384r1_oid}}
+       ),
+       do: :ok
 
   defp validate_public_key(:ecdsa, {{:ECPoint, _point}, {:namedCurve, oid}}),
     do: {:error, {:unsupported_ec_curve, oid}}
@@ -87,6 +93,12 @@ defmodule SSL.Crypto.Signature do
   defp validate_public_key(:ecdsa, {:RSAPublicKey, modulus, exponent})
        when is_integer(modulus) and is_integer(exponent),
        do: {:error, {:key_type_mismatch, :ecdsa}}
+
+  defp validate_public_key(:eddsa, {:ed_pub, :ed25519, public_key})
+       when is_binary(public_key) and byte_size(public_key) == 32,
+       do: :ok
+
+  defp validate_public_key(:eddsa, _public_key), do: {:error, :invalid_public_key}
 
   defp validate_public_key(:rsa, {:RSAPublicKey, modulus, exponent})
        when is_integer(modulus) and modulus > 0 and is_integer(exponent) and exponent > 0,
@@ -118,6 +130,14 @@ defmodule SSL.Crypto.Signature do
   defp hash_length(:sha384), do: {:ok, 48}
   defp hash_length(:sha512), do: {:ok, 64}
   defp hash_length(_hash), do: {:error, :unsupported_hash}
+
+  defp verify(signed_content, :none, signature, public_key, options) do
+    if :public_key.verify(signed_content, :none, signature, public_key, options) do
+      :ok
+    else
+      {:error, :invalid_certificate_verify}
+    end
+  end
 
   defp verify(signed_content, hash, signature, public_key, options) do
     if :public_key.verify(signed_content, hash, signature, public_key, options) do

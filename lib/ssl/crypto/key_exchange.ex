@@ -12,7 +12,7 @@ defmodule SSL.Crypto.KeyExchange do
     Inspection intentionally excludes the private key.
     """
 
-    @type group :: :x25519 | :secp256r1
+    @type group :: :x25519 | :secp256r1 | :secp384r1
     @type t :: %__MODULE__{group: group(), public_key: binary(), private_key: binary()}
 
     @derive {Inspect, except: [:private_key]}
@@ -33,14 +33,14 @@ defmodule SSL.Crypto.KeyExchange do
           | :invalid_key_pair
 
   @spec supported?(term()) :: boolean()
-  def supported?(group) when group in [:x25519, :secp256r1] do
+  def supported?(group) when group in [:x25519, :secp256r1, :secp384r1] do
     group in :crypto.supports(:curves) and :ecdh in :crypto.supports(:public_keys)
   end
 
   def supported?(_group), do: false
 
   @spec generate(term()) :: {:ok, KeyPair.t()} | {:error, error_reason()}
-  def generate(group) when group in [:x25519, :secp256r1] do
+  def generate(group) when group in [:x25519, :secp256r1, :secp384r1] do
     if supported?(group) do
       generate_supported(group)
     else
@@ -52,7 +52,7 @@ defmodule SSL.Crypto.KeyExchange do
 
   @spec shared_secret(KeyPair.t(), term()) :: {:ok, binary()} | {:error, error_reason()}
   def shared_secret(%KeyPair{group: group}, _peer_public_key)
-      when group not in [:x25519, :secp256r1],
+      when group not in [:x25519, :secp256r1, :secp384r1],
       do: {:error, {:unsupported_group, group}}
 
   def shared_secret(%KeyPair{group: group, private_key: private_key}, peer_public_key) do
@@ -70,7 +70,7 @@ defmodule SSL.Crypto.KeyExchange do
 
   @spec validate_key_pair(term()) :: :ok | {:error, error_reason()}
   def validate_key_pair(%KeyPair{group: group, public_key: public_key, private_key: private_key})
-      when group in [:x25519, :secp256r1] do
+      when group in [:x25519, :secp256r1, :secp384r1] do
     if supported?(group) do
       with :ok <- validate_private_key(group, private_key),
            :ok <- validate_peer_public_key(group, public_key),
@@ -106,12 +106,15 @@ defmodule SSL.Crypto.KeyExchange do
   end
 
   defp validate_private_key(group, private_key)
-       when is_binary(private_key) and byte_size(private_key) == 32 do
+       when is_binary(private_key) and byte_size(private_key) in [32, 48] do
     case :crypto.generate_key(:ecdh, group, private_key) do
       {<<_public_key::binary-size(32)>>, ^private_key} when group == :x25519 ->
         :ok
 
       {<<4, _coordinates::binary-size(64)>>, ^private_key} when group == :secp256r1 ->
+        :ok
+
+      {<<4, _coordinates::binary-size(96)>>, ^private_key} when group == :secp384r1 ->
         :ok
 
       _invalid_key_pair ->
@@ -135,6 +138,8 @@ defmodule SSL.Crypto.KeyExchange do
        do: :ok
 
   defp validate_peer_public_key(:secp256r1, <<4, _coordinates::binary-size(64)>>), do: :ok
+
+  defp validate_peer_public_key(:secp384r1, <<4, _coordinates::binary-size(96)>>), do: :ok
 
   defp validate_peer_public_key(group, _peer_public_key),
     do: {:error, {:invalid_peer_public_key, group}}

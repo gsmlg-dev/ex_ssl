@@ -72,6 +72,12 @@ Supported connection options are:
 - `alpn_advertised_protocols: [nonempty_binary, ...]`;
 - `ex_ssl: [profile: :default | %SSL.ClientHello.WireProfile{}]`.
 
+The TLS 1.3 default capability set includes X25519, P-256 ECDHE, and P-384
+ECDHE when the linked OTP crypto provider exposes them. Server CertificateVerify
+validation includes P-256 ECDSA, P-384 ECDSA, RSA-PSS-RSAE, and Ed25519 when
+their runtime primitives are available. RSA-PSS-PSS certificates remain
+unsupported until certificate SPKI parameters are retained and enforced.
+
 Verification cannot be disabled. TLS 1.2 and mixed TLS 1.3/TLS 1.2 version
 lists are rejected. Packet modes, list mode, active true/active-N, arbitrary TCP
 options, client certificates, and `send_timeout_close: false` remain
@@ -161,6 +167,20 @@ identity verification. Record, handshake, certificate, trust-store, and passive
 plaintext bounds remain independently enforced. No traffic secrets, private
 keys, or application payloads are exposed through public metadata or ordinary
 inspection.
+
+## Consumer integration status
+
+The opt-in `http_fetch` integration is implemented in PR #14 at `690258a`.
+It keeps OTP `:ssl` as the default and pins an explicitly selected `:ex_ssl`
+backend through redirects, WebSocket upgrades, and EventSource reconnects.
+The adapter maps the supported TLS options, preserves active-once delivery and
+operation deadlines, and rejects unsupported socket/TLS options explicitly.
+HTTP/3 and WebTransport continue to use their existing QUIC path.
+
+The integration is validated by the consumer's HTTP/1.1, HTTP/2, WSS, and
+EventSource tests. The deterministic cross-record HTTP/2 closure suite passed
+at `690258a`; see the progress ledger for exact commands and remaining Phase 6
+evidence.
 
 ## Remaining limitations
 

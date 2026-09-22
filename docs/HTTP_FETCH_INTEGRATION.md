@@ -132,19 +132,19 @@ The existing Manifold passive direct-TLS and STARTTLS subset remains supported.
 This work does not weaken its verification, plaintext-boundary, close, or
 receive-timeout behavior.
 
-## Consumer changes still required
+## Consumer integration status
 
-1. Add explicit backend selection and a new transport module implementing the
-   existing callbacks with `SSL`; keep OTP as the initial default.
-2. Build TLS-1.3-specific ex_ssl options instead of copying the OTP adapter's
-   mixed version defaults.
-3. Dispatch negotiated-protocol lookup through the selected transport rather
-   than pattern-matching specifically on `HTTP.Transport.SSL`.
-4. Dispatch passive receive through the transport for the shared WebSocket HTTP
-   Upgrade path; it currently calls `:ssl.recv` directly for SSL.
-5. Broaden concrete socket types that currently assume OTP `:ssl.sslsocket()`.
-6. Add adapter-level error mapping for `:busy`, ownership failures, ALPN absence,
-   send timeout, graceful closure, and abrupt failure.
+The consumer adapter described above is implemented in http_fetch PR #14 at
+`690258a`. It keeps OTP `:ssl` as the default, selects `:ex_ssl` only when
+explicitly configured, pins that backend through redirects and reconnects, and
+uses the transport contract for ALPN, passive reads, active-once delivery,
+deadlines, backpressure, and cleanup. Unsupported options are rejected before
+I/O where possible. HTTP/3 and WebTransport remain on the QUIC path.
+
+The current http_fetch branch has HTTP/1.1, HTTP/2, WSS, and EventSource
+integration coverage, including the cross-record HTTP/2 closure regressions.
+This document records the adapter contract; release-readiness evidence and
+unimplemented ex_ssl phases remain tracked in the progress ledger.
 
 ## Consumer acceptance checklist
 
@@ -165,7 +165,6 @@ HTTP/2:
   behavior through the existing HTTP/2 implementation;
 - cancellation and connection teardown with no replay or leaked task/socket.
 
-Only those consumer tests can establish actual HTTP integration. The ex_ssl
-fixture establishes that the underlying transport contract is available; this
-library-only lifecycle behavior does not complete the separate http_fetch
-adapter migration.
+Those consumer tests establish actual HTTP integration for the documented
+subset. The ex_ssl fixture remains useful as a focused transport-contract test,
+but it is not a substitute for the consumer-level HTTP matrix.

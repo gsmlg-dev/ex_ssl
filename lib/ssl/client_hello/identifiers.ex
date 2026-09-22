@@ -7,12 +7,14 @@ defmodule SSL.ClientHello.Identifiers do
       tls_aes_256_gcm_sha384: 0x1302,
       tls_chacha20_poly1305_sha256: 0x1303
     },
-    group: %{secp256r1: 0x0017, x25519: 0x001D},
+    group: %{secp256r1: 0x0017, secp384r1: 0x0018, x25519: 0x001D},
     signature_algorithm: %{
       ecdsa_secp256r1_sha256: 0x0403,
+      ecdsa_secp384r1_sha384: 0x0503,
       rsa_pss_rsae_sha256: 0x0804,
       rsa_pss_rsae_sha384: 0x0805,
-      rsa_pss_rsae_sha512: 0x0806
+      rsa_pss_rsae_sha512: 0x0806,
+      ed25519: 0x0807
     },
     version: %{tlsv1_3: 0x0304}
   }
@@ -39,10 +41,12 @@ defmodule SSL.ClientHello.Identifiers do
     end
   end
 
-  @spec key_exchange_group(term()) :: {:ok, :x25519 | :secp256r1} | {:error, term()}
+  @spec key_exchange_group(term()) :: {:ok, :x25519 | :secp256r1 | :secp384r1} | {:error, term()}
   def key_exchange_group(:x25519), do: {:ok, :x25519}
   def key_exchange_group(0x001D), do: {:ok, :x25519}
   def key_exchange_group(:secp256r1), do: {:ok, :secp256r1}
   def key_exchange_group(0x0017), do: {:ok, :secp256r1}
+  def key_exchange_group(:secp384r1), do: {:ok, :secp384r1}
+  def key_exchange_group(0x0018), do: {:ok, :secp384r1}
   def key_exchange_group(group), do: {:error, {:unsupported_key_share_group, group}}
 end
