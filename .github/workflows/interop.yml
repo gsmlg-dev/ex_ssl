@@ -48,6 +48,8 @@ jobs:
           test/ssl/p384_interop_test.exs
           test/ssl/client_auth_interop_test.exs
           test/ssl/client_auth_lifecycle_test.exs
+          test/ssl/tls_policy_interop_test.exs
+          test/ssl/tcp_options_test.exs
           test/ssl/crypto/signature_expansion_test.exs
           test/ssl/depth_interop_test.exs
           test/ssl/input_ordering_regression_test.exs

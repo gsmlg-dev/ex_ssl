@@ -84,7 +84,7 @@ defmodule ExSSL.TestSupport.ClientAuthFixtures do
 
     File.write!(
       extensions,
-      "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=#{usage}\nsubjectAltName=DNS:exssl.test,IP:127.0.0.1\n" <>
+      "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=#{usage}\nsubjectAltName=DNS:exssl.test,IP:127.0.0.1,IP:::1\n" <>
         padding
     )
 

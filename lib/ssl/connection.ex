@@ -1,7 +1,7 @@
 defmodule SSL.Connection do
   @moduledoc false
   @behaviour :gen_statem
-  alias SSL.{ConnectionWriter, IodataCursor, Options, Socket}
+  alias SSL.{ConnectionWriter, IodataCursor, Options, Socket, TCPOptions}
   alias SSL.ClientHello.Materializer
   alias SSL.Protocol.{HandshakeMachine, RecordFramer}
 
@@ -109,14 +109,17 @@ defmodule SSL.Connection do
       fail(state, :timeout)
     else
       with :ok <-
-             :inet.setopts(tcp, [
-               :binary,
-               packet: :raw,
-               active: false,
-               send_timeout: state.send_timeout,
-               send_timeout_close: state.send_timeout_close,
-               buffer: 16_640
-             ]),
+             :inet.setopts(
+               tcp,
+               [
+                 :binary,
+                 packet: :raw,
+                 active: false,
+                 send_timeout: state.send_timeout,
+                 send_timeout_close: state.send_timeout_close,
+                 buffer: 16_640
+               ] ++ TCPOptions.mutable(state.options.tcp_options)
+             ),
            {:ok, materialized} <-
              Materializer.materialize(
                state.options.profile,
@@ -202,13 +205,19 @@ defmodule SSL.Connection do
     if options[:active] == :once and state.recv != nil do
       reply(from, {:error, :einval})
     else
-      state =
-        state
-        |> apply_send_options(options)
-        |> apply_active_option(options)
-        |> deliver(true)
+      case apply_tcp_options(state.tcp, TCPOptions.mutable(options)) do
+        :ok ->
+          state =
+            state
+            |> apply_send_options(options)
+            |> apply_active_option(options)
+            |> deliver(true)
 
-      continue(:connected, state, [{:reply, from, :ok}])
+          continue(:connected, state, [{:reply, from, :ok}])
+
+        {:error, reason} ->
+          reply(from, {:error, reason})
+      end
     end
   end
 
@@ -890,6 +899,10 @@ defmodule SSL.Connection do
       :error -> state
     end
   end
+
+  defp apply_tcp_options(_tcp, []), do: :ok
+  defp apply_tcp_options(nil, _options), do: {:error, :closed}
+  defp apply_tcp_options(tcp, options), do: :inet.setopts(tcp, options)
 
   defp finish_write(state, result) do
     state = settle_write(state, result)

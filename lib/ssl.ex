@@ -53,7 +53,7 @@ defmodule SSL do
                send_timeout: options.send_timeout,
                send_timeout_close: options.send_timeout_close,
                buffer: 16_640
-             ],
+             ] ++ options.tcp_options,
              Options.remaining(deadline)
            ) do
       close_on_error(handoff(tcp_socket, options, deadline), tcp_socket)
@@ -73,7 +73,7 @@ defmodule SSL do
          do: call(socket, {:send, token, cursor, size})
   end
 
-  @doc "Atomically changes supported application delivery and send options."
+  @doc "Changes supported delivery, send, and mutable TCP options after validation."
   @spec setopts(Socket.t(), list()) :: :ok | {:error, term()}
   def setopts(socket, options) do
     with {:ok, normalized} <- Options.normalize_setopts(options),

@@ -3,20 +3,11 @@ defmodule SSL.Protocol.ClientAuthentication do
 
   alias SSL.ClientIdentity
   alias SSL.Crypto.Signature
+  alias SSL.PKIX.CertificateSignaturePolicy
   alias SSL.Protocol.{Record, ServerFlight, Transcript}
   alias SSL.Protocol.ServerFlight.CertificateRequest
 
   @max_record_plaintext 16_384
-  @rsa_pss_oid {1, 2, 840, 113_549, 1, 1, 10}
-  @ecdsa_sha256_oid {1, 2, 840, 10_045, 4, 3, 2}
-  @ecdsa_sha384_oid {1, 2, 840, 10_045, 4, 3, 3}
-  @ed25519_oid {1, 3, 101, 112}
-  @hash_oids %{
-    {2, 16, 840, 1, 101, 3, 4, 2, 1} => {0x0804, 0x0809},
-    {2, 16, 840, 1, 101, 3, 4, 2, 2} => {0x0805, 0x080A},
-    {2, 16, 840, 1, 101, 3, 4, 2, 3} => {0x0806, 0x080B}
-  }
-  @mgf1_oid {1, 2, 840, 113_549, 1, 1, 8}
   @key_usage_filter <<6, 3, 85, 29, 15>>
   @extended_key_usage_filter <<6, 3, 85, 29, 37>>
 
@@ -59,7 +50,7 @@ defmodule SSL.Protocol.ClientAuthentication do
       authorities != [] and not authority_matches?(identity.chain, authorities) ->
         {:ok, nil}
 
-      not certificate_policy_matches?(identity.chain, certificate_policy) ->
+      not CertificateSignaturePolicy.compatible?(identity.chain, nil, certificate_policy) ->
         {:ok, nil}
 
       true ->
@@ -160,95 +151,5 @@ defmodule SSL.Protocol.ClientAuthentication do
     end)
   catch
     _, _ -> false
-  end
-
-  defp certificate_policy_matches?(chain, accepted) do
-    Enum.all?(Enum.with_index(chain), fn {der, index} ->
-      if :public_key.pkix_is_self_signed(der) do
-        true
-      else
-        issuer_key =
-          case Enum.at(chain, index + 1) do
-            nil -> nil
-            issuer_der -> certificate_public_key_oid(issuer_der)
-          end
-
-        Enum.any?(certificate_signature_schemes(der, issuer_key), &(&1 in accepted))
-      end
-    end)
-  end
-
-  defp certificate_signature_schemes(der, issuer_key) do
-    cert = :public_key.pkix_decode_cert(der, :otp)
-    {:SignatureAlgorithm, oid, params} = elem(cert, 2)
-
-    case oid do
-      {1, 2, 840, 113_549, 1, 1, 11} -> [0x0401]
-      {1, 2, 840, 113_549, 1, 1, 12} -> [0x0501]
-      {1, 2, 840, 113_549, 1, 1, 13} -> [0x0601]
-      @ecdsa_sha256_oid -> ecdsa_certificate_scheme(0x0403, issuer_key)
-      @ecdsa_sha384_oid -> ecdsa_certificate_scheme(0x0503, issuer_key)
-      @ed25519_oid -> [0x0807]
-      @rsa_pss_oid -> pss_certificate_schemes(params, issuer_key)
-      _ -> []
-    end
-  catch
-    _, _ -> []
-  end
-
-  defp ecdsa_certificate_scheme(scheme, nil), do: [scheme]
-
-  defp ecdsa_certificate_scheme(
-         0x0403,
-         {{1, 2, 840, 10_045, 2, 1}, {:namedCurve, {1, 2, 840, 10_045, 3, 1, 7}}}
-       ),
-       do: [0x0403]
-
-  defp ecdsa_certificate_scheme(
-         0x0503,
-         {{1, 2, 840, 10_045, 2, 1}, {:namedCurve, {1, 3, 132, 0, 34}}}
-       ),
-       do: [0x0503]
-
-  defp ecdsa_certificate_scheme(_, _), do: []
-
-  defp pss_certificate_schemes(
-         {:"RSASSA-PSS-params", {:HashAlgorithm, hash_oid, _},
-          {:MaskGenAlgorithm, @mgf1_oid, {:HashAlgorithm, hash_oid, _}}, salt_length, 1},
-         issuer_key
-       ) do
-    case Map.get(@hash_oids, hash_oid) do
-      {rsae, pss} ->
-        if salt_length == hash_size(hash_oid) do
-          case issuer_key do
-            nil -> [rsae, pss]
-            {@rsa_pss_oid, _} -> [pss]
-            _ -> [rsae]
-          end
-        else
-          []
-        end
-
-      _ ->
-        []
-    end
-  end
-
-  defp pss_certificate_schemes(_, _), do: []
-
-  defp hash_size({2, 16, 840, 1, 101, 3, 4, 2, 1}), do: 32
-  defp hash_size({2, 16, 840, 1, 101, 3, 4, 2, 2}), do: 48
-  defp hash_size({2, 16, 840, 1, 101, 3, 4, 2, 3}), do: 64
-  defp hash_size(_), do: 0
-
-  defp certificate_public_key_oid(der) do
-    der
-    |> :public_key.pkix_decode_cert(:otp)
-    |> elem(1)
-    |> elem(7)
-    |> elem(1)
-    |> then(fn {:PublicKeyAlgorithm, oid, params} -> {oid, params} end)
-  catch
-    _, _ -> nil
   end
 end

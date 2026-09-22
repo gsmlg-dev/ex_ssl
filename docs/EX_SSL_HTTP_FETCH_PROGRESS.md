@@ -36,7 +36,7 @@ have not been executed locally.
 | P2.1 identity loading | ex_ssl `a9c5713` | verified | Internal loader, role-aware key matching, bounded DER/PEM and redaction. 78 tests+5 properties pass; public options remain unsupported until P2.2. |
 | P2.2 client authentication | ex_ssl `fc1319d` | verified | Public identity options, authenticated request selection, fragmented client flight and original-deadline/cancellation cleanup. Seed53:240 tests+11 properties, zero failures. |
 | P2.3 HTTP mTLS | ex_ssl `fc1319d`, http_fetch `cbbc2f6` | verified | 30 source-candidate tests;442 root consumer tests+20 doctests,zero failures. Exact identities, required/optional negatives, redirect scope, WSS and deterministic SSE reconnect. |
-| P3.1 policy/profile options | ex_ssl `fc1319d`, http_fetch `cbbc2f6` | in_progress | Ordered registry-backed configuration and enforced certificate-signature policy. |
+| P3.1 policy/profile options | ex_ssl (P3 commit after `66c650c`) | verified | Explicit ordered policies, exact profile conflicts and enforced issuer-signature policy. Full local library seed61:438tests+15properties pass. Consumer evidence pending. |
 | P3.2 TCP allowlist | both | in_progress | Validation and real socket behavior; consumer adapter follows the library gate. |
 | P3.3 advanced certificate policy | both | verified | Production audit has no advanced-policy consumers. Unsupported callback/trust/CRL/OCSP policies explicitly reject; one test exercises nine pre-I/O rejections, seed55. |
 | P4.1 TLS 1.2 architecture | ex_ssl | not_started | ADR before protocol changes. |
@@ -323,3 +323,39 @@ passed: **1 test,zero failures**, exercising9 rejected option configurations
 before I/O and proving supplied permissive callbacks were never called.
 No production behavior changed. Required advanced policy would need a separate
 reviewed implementation; none is required by this audited consumer.
+
+
+### P3.1 / P3.2 library option gates
+
+Added ordered public TLS1.3 suite maps/RFC names, signature/group atoms and
+explicit certificate-signature restrictions. Explicit profiles must agree in
+order; generated profiles retain requested order. PKIX applies certificate policy
+to the validated chain and chosen trust anchor; client-auth selection shares the
+same key/curve/PSS metadata logic. No ext50 preserves previous default behavior.
+Certificate-only RSA PKCS1 support requires the exact runtime padding primitive.
+
+TCP parsing strips only the validated safe allowlist, rejects conflicts and
+unsupported STARTTLS binding/family changes, and preserves raw ownership controls.
+Mutable options validate fully before I/O; driver errors leave TLS mode unchanged
+but kernel rollback is not promised. Parent review caught an unconditional empty
+raw setopts call after TCP cleanup: the deterministic closure regression failed
+(1 executed test failed,30 excluded) before virtual-only options were separated.
+Local `ip` strings were also incorrectly accepted; a focused red test reproduced
+it, then tuple-only validation fixed it. Malformed lists, invalid UTF8 and oversized
+driver integers reject explicitly.
+
+- Agent policy focused seed56:142 tests+7 properties,zero failures. Related
+  mTLS/connection/P384 seed57:28 tests,zero failures; final padding capability
+  review was covered by the subsequent focused rerun and full library gate.
+- TCP initial agent gate:6 tests,zero failures. Parent added real IPv6 textual/IP
+  SAN/SNI evidence, STARTTLS, OTP reference and forced underlying socket errors.
+  Parent seed57:40tests,2 fixture failures (OTP getopts order, assumed spontaneous
+  DOWN after externally closing a port); seed58:40tests,1 remaining order failure
+  because the first edit did not match formatted source. Corrected comparisons
+  use option values; forced-error test verifies unchanged TLS state and explicit
+  cleanup. Seed59:41tests,zero failures including all31 transport regressions.
+- Final `MIX_ENV=test mix test --include integration --seed 61`: **438 tests and
+  15 properties,zero failures,no exclusions**. IPv6 loopback available and tested.
+  Log `/tmp/ex-ssl-tls-plan-p3-library.log`.
+
+Next incomplete gate: P3 consumer adapter/source-candidate option coverage.

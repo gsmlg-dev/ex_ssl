@@ -10,6 +10,7 @@ defmodule SSL.Options do
     :trust_source,
     :client_identity,
     :alpn_advertised_protocols,
+    tcp_options: [],
     active: false,
     depth: 10,
     send_timeout: 5_000,
@@ -37,6 +38,10 @@ defmodule SSL.Options do
     :server_name_indication,
     :customize_hostname_check,
     :versions,
+    :ciphers,
+    :signature_algs,
+    :signature_algs_cert,
+    :supported_groups,
     :alpn_advertised_protocols,
     :ex_ssl
   ]
@@ -58,7 +63,8 @@ defmodule SSL.Options do
 
   @spec normalize(term(), term()) :: {:ok, t()} | {:error, term()}
   def normalize(host, options) do
-    with {:ok, options} <- option_list(options),
+    with {:ok, options, tcp_options} <- SSL.TCPOptions.extract(host, options),
+         {:ok, options} <- option_list(options),
          :ok <- validate_options(options),
          {:ok, identity, context} <-
            identity(host, Keyword.get(options, :server_name_indication)),
@@ -73,6 +79,7 @@ defmodule SSL.Options do
          context: context,
          trust_source: trust,
          client_identity: client_identity,
+         tcp_options: tcp_options,
          alpn_advertised_protocols: profile_alpn(profile),
          active: Keyword.get(options, :active, false),
          depth: Keyword.get(options, :depth, 10),
@@ -85,9 +92,10 @@ defmodule SSL.Options do
 
   @spec normalize_setopts(term()) :: {:ok, keyword()} | {:error, term()}
   def normalize_setopts(options) do
-    with {:ok, options} <- option_list(options),
+    with {:ok, options, tcp_options} <- SSL.TCPOptions.extract_setopts(options),
+         {:ok, options} <- option_list(options),
          :ok <- validate_setopts(options) do
-      {:ok, options}
+      {:ok, options ++ tcp_options}
     end
   end
 
@@ -158,6 +166,11 @@ defmodule SSL.Options do
   defp valid_option?(:send_timeout_close, value), do: value == true
   defp valid_option?(:verify, value), do: value == :verify_peer
   defp valid_option?(:versions, value), do: value == [:"tlsv1.3"]
+
+  defp valid_option?(key, value)
+       when key in [:ciphers, :signature_algs, :signature_algs_cert, :supported_groups],
+       do: is_list(value) and value != [] and proper_list?(value)
+
   defp valid_option?(:alpn_advertised_protocols, value), do: valid_alpn_protocols?(value)
   defp valid_option?(:cacerts, value), do: is_list(value) and value != []
 
@@ -208,13 +221,30 @@ defmodule SSL.Options do
     _, _ -> :error
   end
 
-  defp host_identity(host) do
-    with {:ok, name} <- dns_name(host) do
-      case :inet.parse_address(String.to_charlist(name)) do
-        {:ok, ip} -> {:ok, {:ip, ip}}
-        {:error, _} -> {:ok, {:dns_id, name}}
+  defp host_identity(host) when is_binary(host) or is_list(host) do
+    with {:ok, text} <- host_text(host) do
+      case :inet.parse_address(String.to_charlist(text)) do
+        {:ok, ip} ->
+          {:ok, {:ip, ip}}
+
+        {:error, _} ->
+          with {:ok, name} <- dns_name(text), do: {:ok, {:dns_id, name}}
       end
     else
+      _ -> :error
+    end
+  end
+
+  defp host_identity(_host), do: :error
+
+  defp host_text(host) when is_binary(host),
+    do: if(String.valid?(host), do: {:ok, host}, else: :error)
+
+  defp host_text(host) when is_list(host) do
+    try do
+      text = List.to_string(host)
+      host_text(text)
+    rescue
       _ -> :error
     end
   end
@@ -264,11 +294,13 @@ defmodule SSL.Options do
     explicit_profile? = Keyword.has_key?(options, :ex_ssl)
     profile = get_in(options, [:ex_ssl, :profile]) || :default
 
-    with {:ok, profile} <-
+    with {:ok, policy} <- policy_lists(options),
+         {:ok, profile} <-
            if(profile == :default,
-             do: {:ok, default_profile(context, advertised_protocols)},
+             do: {:ok, default_profile(context, advertised_protocols, policy)},
              else: resolve_explicit_profile(profile, advertised_protocols, explicit_profile?)
-           ) do
+           ),
+         :ok <- require_policy_match(profile, policy) do
       validate_profile(profile)
     end
   end
@@ -290,24 +322,153 @@ defmodule SSL.Options do
     end
   end
 
-  defp default_profile(context, alpn_protocols) do
+  defp default_profile(context, alpn_protocols, policy) do
     capabilities = capabilities()
-    groups = Enum.filter(capabilities.groups, &is_integer/1)
+    groups = policy.supported_groups || Enum.filter(capabilities.groups, &is_integer/1)
+    ciphers = policy.ciphers || Enum.filter(capabilities.ciphers, &is_integer/1)
+
+    signatures =
+      policy.signature_algs || Enum.filter(capabilities.signature_algorithms, &is_integer/1)
+
+    certificate_signatures =
+      if policy.signature_algs_cert,
+        do: [{:signature_algorithms_cert, policy.signature_algs_cert}],
+        else: []
 
     %WireProfile{
       name: :default,
-      cipher_suites: Enum.filter(capabilities.ciphers, &is_integer/1),
+      cipher_suites: ciphers,
       extensions:
         if(Map.has_key?(context, :server_name), do: [{:server_name, :from_connection}], else: []) ++
           [
             {:supported_versions, [0x0304]},
             {:supported_groups, groups},
-            {:signature_algorithms,
-             Enum.filter(capabilities.signature_algorithms, &is_integer/1)},
+            {:signature_algorithms, signatures},
             {:key_share, Enum.take(groups, 1)}
-          ] ++ alpn_extension(alpn_protocols)
+          ] ++ certificate_signatures ++ alpn_extension(alpn_protocols)
     }
   end
+
+  defp policy_lists(options) do
+    with {:ok, ciphers} <- policy_list(options, :ciphers, :cipher_suite),
+         {:ok, signatures} <- policy_list(options, :signature_algs, :signature_algorithm),
+         {:ok, cert_signatures} <-
+           policy_list(options, :signature_algs_cert, :certificate_signature_algorithm),
+         {:ok, groups} <- policy_list(options, :supported_groups, :group) do
+      {:ok,
+       %{
+         ciphers: ciphers,
+         signature_algs: signatures,
+         signature_algs_cert: cert_signatures,
+         supported_groups: groups
+       }}
+    end
+  end
+
+  defp policy_list(options, key, kind) do
+    case Keyword.fetch(options, key) do
+      :error ->
+        {:ok, nil}
+
+      {:ok, values} ->
+        allowed = Map.fetch!(capabilities(), capability_key(kind))
+
+        result =
+          Enum.reduce_while(values, {:ok, [], MapSet.new()}, fn value, {:ok, ids, seen} ->
+            with {:ok, value} <- documented_identifier(kind, value),
+                 %{id: id} <- Capabilities.resolve(kind, value),
+                 true <- id in allowed and not MapSet.member?(seen, id) do
+              {:cont, {:ok, [id | ids], MapSet.put(seen, id)}}
+            else
+              _ -> {:halt, :error}
+            end
+          end)
+
+        case result do
+          {:ok, ids, _seen} when ids != [] -> {:ok, Enum.reverse(ids)}
+          _ -> option_error({key, :unsupported_or_invalid})
+        end
+    end
+  end
+
+  defp documented_identifier(
+         :cipher_suite,
+         %{key_exchange: :any, cipher: _, mac: :aead, prf: _} = suite
+       )
+       when map_size(suite) == 4,
+       do: {:ok, suite}
+
+  defp documented_identifier(:cipher_suite, name) when is_binary(name), do: {:ok, name}
+
+  defp documented_identifier(:cipher_suite, name) when is_list(name) do
+    if proper_list?(name) and Enum.all?(name, &is_integer/1) do
+      try do
+        {:ok, List.to_string(name)}
+      rescue
+        _ -> :error
+      end
+    else
+      :error
+    end
+  end
+
+  defp documented_identifier(kind, name)
+       when kind in [:signature_algorithm, :certificate_signature_algorithm, :group] and
+              is_atom(name),
+       do: {:ok, name}
+
+  defp documented_identifier(_, _), do: :error
+
+  defp proper_list?([]), do: true
+  defp proper_list?([_ | rest]), do: proper_list?(rest)
+  defp proper_list?(_), do: false
+
+  defp capability_key(:cipher_suite), do: :ciphers
+  defp capability_key(:signature_algorithm), do: :signature_algorithms
+  defp capability_key(:certificate_signature_algorithm), do: :certificate_signature_algorithms
+  defp capability_key(:group), do: :groups
+
+  defp require_policy_match(profile, policy) do
+    Enum.reduce_while(
+      [
+        {:ciphers, profile.cipher_suites},
+        {:signature_algs, profile_extension(profile, :signature_algorithms)},
+        {:signature_algs_cert, profile_extension(profile, :signature_algorithms_cert)},
+        {:supported_groups, profile_extension(profile, :supported_groups)}
+      ],
+      :ok,
+      fn {key, actual}, :ok ->
+        requested = Map.fetch!(policy, key)
+
+        if requested == nil or canonical_list(actual, policy_kind(key)) == requested,
+          do: {:cont, :ok},
+          else: {:halt, option_error({key, :profile_conflict})}
+      end
+    )
+  end
+
+  defp policy_kind(:ciphers), do: :cipher_suite
+  defp policy_kind(:signature_algs), do: :signature_algorithm
+  defp policy_kind(:signature_algs_cert), do: :certificate_signature_algorithm
+  defp policy_kind(:supported_groups), do: :group
+
+  defp profile_extension(profile, name) do
+    case List.keyfind(profile.extensions, name, 0) do
+      {^name, values} -> values
+      nil -> nil
+    end
+  end
+
+  defp canonical_list(values, kind) when is_list(values) do
+    Enum.map(values, fn value ->
+      case Capabilities.resolve(kind, value) do
+        %{id: id} -> id
+        _ -> nil
+      end
+    end)
+  end
+
+  defp canonical_list(_, _), do: nil
 
   defp alpn_extension(nil), do: []
   defp alpn_extension(protocols), do: [{:alpn, protocols}]

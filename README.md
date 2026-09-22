@@ -14,6 +14,12 @@ The OTP application is `:ex_ssl`. The public compatibility module is `SSL` (`Eli
 > [compatibility matrix](docs/COMPATIBILITY.md) for exact restrictions. OTP
 > `:ssl` remains the default recommendation.
 
+The source candidate also supports ordered TLS 1.3 algorithm options, explicit
+certificate-chain signature restrictions, one client identity, and a validated
+TCP option allowlist. These additions are not in the published 0.3.0 dependency;
+see [compatibility](docs/COMPATIBILITY.md) and the
+[implementation ledger](docs/EX_SSL_HTTP_FETCH_PROGRESS.md) for executed gates.
+
 ## Installation
 
 Once published, add the `ex_ssl` package to your dependencies:

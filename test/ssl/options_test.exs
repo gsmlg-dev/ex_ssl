@@ -166,6 +166,13 @@ defmodule SSL.OptionsTest do
     assert options.identity == {:ip, {127, 0, 0, 1}}
     assert options.context == %{}
     refute Enum.any?(options.profile.extensions, &match?({:server_name, _}, &1))
+
+    for host <- ["::1", ~c"::1", "127.0.0.1"] do
+      assert {:ok, textual} = SSL.Options.normalize(host, [])
+      assert match?({:ip, _}, textual.identity)
+      assert textual.context == %{}
+      refute Enum.any?(textual.profile.extensions, &match?({:server_name, _}, &1))
+    end
   end
 
   test "incomplete profiles are rejected before a TCP connection is attempted" do
@@ -175,7 +182,7 @@ defmodule SSL.OptionsTest do
              )
   end
 
-  test "rejects explicit certificate signature policy until chain enforcement exists" do
+  test "accepts an explicit certificate signature policy only when PKIX can enforce it" do
     assert {:ok, %{profile: profile}} = SSL.Options.normalize("mail.example", [])
 
     profile = %{
@@ -183,8 +190,81 @@ defmodule SSL.OptionsTest do
       | extensions: profile.extensions ++ [{:signature_algorithms_cert, [0x0403]}]
     }
 
-    assert {:error, {:options, {:ex_ssl, :unsupported_profile}}} =
+    assert {:ok, %{profile: ^profile}} =
              SSL.Options.normalize("mail.example", ex_ssl: [profile: profile])
+  end
+
+  test "ordered public TLS policy lists materialize exact ClientHello choices" do
+    suites = :ssl.cipher_suites(:exclusive, :"tlsv1.3")
+    aes_256 = Enum.find(suites, &(&1.cipher == :aes_256_gcm))
+
+    assert {:ok, %{profile: profile}} =
+             SSL.Options.normalize("mail.example",
+               ciphers: [aes_256, "TLS_AES_128_GCM_SHA256"],
+               signature_algs: [:rsa_pss_rsae_sha384, :ecdsa_secp256r1_sha256],
+               signature_algs_cert: [:rsa_pkcs1_sha256, :rsa_pss_rsae_sha384],
+               supported_groups: [:secp384r1, :x25519]
+             )
+
+    assert profile.cipher_suites == [0x1302, 0x1301]
+    assert {:supported_groups, [0x0018, 0x001D]} in profile.extensions
+    assert {:key_share, [0x0018]} in profile.extensions
+    assert {:signature_algorithms, [0x0805, 0x0403]} in profile.extensions
+    assert {:signature_algorithms_cert, [0x0401, 0x0805]} in profile.extensions
+
+    assert {:ok, materialized} =
+             SSL.ClientHello.Materializer.materialize(profile, SSL.Options.capabilities(), %{
+               server_name: "mail.example"
+             })
+
+    assert {:ok, encoded} =
+             SSL.ClientHello.Serializer.encode(materialized.client_hello)
+
+    assert {:ok, offer} = SSL.Protocol.ClientOffer.from_client_hello(encoded)
+    assert offer.cipher_suites == [0x1302, 0x1301]
+    assert offer.supported_groups == [0x0018, 0x001D]
+    assert offer.signature_schemes == [0x0805, 0x0403]
+    assert offer.certificate_signature_schemes == [0x0401, 0x0805]
+  end
+
+  test "invalid or duplicate public TLS policy values fail instead of using defaults" do
+    for option <- [
+          ciphers: [],
+          ciphers: ["TLS_RSA_WITH_AES_128_GCM_SHA256"],
+          ciphers: ["TLS_AES_128_GCM_SHA256", "TLS_AES_128_GCM_SHA256"],
+          signature_algs: [],
+          signature_algs: [0x0804],
+          signature_algs: [:rsa_pkcs1_sha256],
+          signature_algs_cert: [0x0401],
+          signature_algs_cert: [:rsa_pkcs1_sha256, :rsa_pkcs1_sha256],
+          supported_groups: [],
+          supported_groups: [0x001D],
+          supported_groups: [:x25519, :x25519],
+          signature_algs: [:rsa_pss_rsae_sha256 | :bad],
+          ciphers: [~c"TLS_AES_128_GCM_SHA256" | :bad]
+        ] do
+      assert {:error, {:options, _}} = SSL.Options.normalize("mail.example", [option])
+    end
+  end
+
+  test "explicit profiles cannot silently override supplied TLS policy" do
+    assert {:ok, %{profile: profile}} = SSL.Options.normalize("mail.example", [])
+
+    assert {:ok, %{profile: ^profile}} =
+             SSL.Options.normalize("mail.example",
+               ex_ssl: [profile: profile],
+               supported_groups: [:x25519, :secp256r1, :secp384r1]
+             )
+
+    for option <- [
+          ciphers: ["TLS_AES_256_GCM_SHA384"],
+          signature_algs: [:rsa_pss_rsae_sha256],
+          signature_algs_cert: [:rsa_pkcs1_sha256],
+          supported_groups: [:secp384r1]
+        ] do
+      assert {:error, {:options, {_key, :profile_conflict}}} =
+               SSL.Options.normalize("mail.example", [{:ex_ssl, [profile: profile]}, option])
+    end
   end
 
   defp default_profile_with_alpn(protocols) do

@@ -67,9 +67,37 @@ defmodule SSL.CapabilitiesTest do
              [0x1301, :tls_aes_128_gcm_sha256]
   end
 
-  test "certificate-chain policy is distinct from handshake verification" do
-    assert Capabilities.certificate_chain_policy() == :not_enforced
+  test "certificate-chain policy has its own runtime-gated registry" do
+    assert Capabilities.certificate_chain_policy() == :enforced
     assert Capabilities.identifiers(:certificate_signature_algorithm, %{}) == []
+
+    assert %{id: 0x0401} =
+             Capabilities.resolve(:certificate_signature_algorithm, :rsa_pkcs1_sha256)
+
+    assert %{id: 0x1302} =
+             Capabilities.resolve(:cipher_suite, %{
+               key_exchange: :any,
+               cipher: :aes_256_gcm,
+               mac: :aead,
+               prf: :sha384
+             })
+
+    runtime = %{
+      ciphers: [:aes_128_gcm],
+      curves: [],
+      public_keys: [:rsa],
+      hashs: [:sha256],
+      macs: [:hmac],
+      rsa_opts: [:rsa_pkcs1_padding]
+    }
+
+    assert 0x0401 in Capabilities.identifiers(:certificate_signature_algorithm, runtime)
+    refute 0x0804 in Capabilities.identifiers(:certificate_signature_algorithm, runtime)
+
+    refute 0x0401 in Capabilities.identifiers(:certificate_signature_algorithm, %{
+             runtime
+             | rsa_opts: []
+           })
   end
 
   test "each missing PSS option, hash, ECDSA curve, ECDH or HMAC removes its dependent offer" do

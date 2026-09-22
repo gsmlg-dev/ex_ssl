@@ -11,7 +11,7 @@ certification, and OTP `:ssl` remains the recommended default.
 | `SSL.connect/2,3,4` | Authenticated TLS 1.3 client connections and passive binary/raw STARTTLS upgrades. Connect succeeds only after CertificateVerify and Finished validation. |
 | `SSL.send/2` | Valid iodata of any logical size supported by available caller memory. Data is traversed without flattening the entire write and protected in records of at most 16,384 plaintext bytes. One logical write is admitted at a time; another caller receives `{:error, :busy}`. There is no automatic replay. An unfinished admitted send is settled promptly as `{:error, :closed}` after an authenticated peer closure makes further writes impossible; a send already acknowledged in full remains `:ok`. |
 | `SSL.recv/2,3` | Passive raw binary receive. Length zero returns available plaintext; a positive length waits for exactly that many bytes. One passive receive is admitted, and the maximum requested/buffered plaintext is 1 MiB. |
-| `SSL.setopts/2` | Atomic support for `active: false | :once`, `send_timeout`, and `send_timeout_close: true`. Unknown, duplicate, malformed, or unsupported options reject the whole request. |
+| `SSL.setopts/2` | Validates the whole request for `active: false` or `:once`, send timeouts and the mutable TCP allowlist below. Invalid options reject before changes. Driver failures can partially apply TCP options; TLS state changes only after driver success. |
 | `SSL.controlling_process/2` | Transfers the application owner and monitor. The connection process remains the TCP owner and sole owner of TLS state. Only the current application owner may transfer. |
 | `SSL.negotiated_protocol/1` | Returns authenticated ALPN as `{:ok, binary}` or `{:error, :protocol_not_negotiated}`. |
 | `SSL.close/1` | Idempotent local close. Sends close_notify when no application write is uncertain and wakes admitted calls. |
@@ -67,6 +67,8 @@ Supported connection options are:
 - DNS `server_name_indication`;
 - `customize_hostname_check: [match_fun: fun]`;
 - `versions: [:"tlsv1.3"]`;
+- ordered `ciphers`, `signature_algs`, `signature_algs_cert` and `supported_groups` (forms below);
+- validated TCP options from the allowlist below;
 - non-negative integer `depth` (default `10`);
 - non-negative integer or `:infinity` `send_timeout` (default 5,000 ms);
 - `send_timeout_close: true`;
@@ -75,7 +77,7 @@ Supported connection options are:
 
 Verification cannot be disabled. TLS 1.2 and mixed TLS 1.3/TLS 1.2 version
 lists are rejected. Packet modes, list mode, active true/active-N, arbitrary TCP
-options and `send_timeout_close: false` remain
+options outside the allowlist and `send_timeout_close: false` remain
 unsupported. Unsupported or malformed options return a redacted
 `{:error, {:options, reason}}`; supplied option data is not echoed.
 
@@ -106,14 +108,32 @@ authentication is supported as described below; post-handshake authentication
 remains unsupported.
 
 Certificate-chain signature policy is separate from the leaf's TLS
-CertificateVerify scheme. An explicit `signature_algorithms_cert` profile
-extension is now rejected as `:unsupported_certificate_signature_algorithms`:
-ex_ssl does not yet enforce that requested chain policy. Normal PKIX path and
-identity validation still run. The pure profile codec can accept a separate
-certificate capability list for fixtures, but runtime options do not infer one
-from handshake-signature support. Top-level `signature_algs` and
-`signature_algs_cert` options remain unsupported until their policy semantics
-are implemented.
+CertificateVerify scheme. An explicit `signature_algs_cert` option or
+`signature_algorithms_cert` profile extension restricts the signatures on the
+validated chain, using the chosen trust anchor and issuer key type/curve/PSS
+parameters. Trust-anchor and self-signed signatures are exempt, but normal PKIX
+trust/path/identity validation still runs. RSA PKCS1 SHA256/384/512 is supported
+for certificate signatures only, with the required runtime padding primitive.
+It is never accepted as a TLS 1.3 CertificateVerify signature.
+
+The default profile and trust behavior remain unchanged when no certificate
+signature policy is supplied. `signature_algs` restricts CertificateVerify;
+use `signature_algs_cert` to impose a chain restriction. This explicit-policy
+boundary is a documented difference from OTP's default option derivation.
+
+| TLS policy option | Supported forms |
+| --- | --- |
+| `ciphers` | Nonempty ordered list of exact OTP TLS1.3 suite maps (`key_exchange: :any`, `cipher`, `mac: :aead`, `prf`) or RFC cipher-name binary/charlist strings |
+| `signature_algs` | Nonempty ordered list of supported OTP signature-scheme atoms |
+| `signature_algs_cert` | Nonempty ordered list of supported certificate signature-scheme atoms, including `rsa_pkcs1_sha256/384/512` |
+| `supported_groups` | Nonempty ordered list of `x25519`, `secp256r1`, `secp384r1` atoms available in the runtime |
+
+Numeric IDs remain a WireProfile representation, not an additional public
+option dialect. Empty, duplicate, unsupported or malformed supplied lists fail;
+no supplied value falls back to a default. Generated profiles preserve requested
+ordering and choose the first supported group for the initial fresh share.
+Explicit profiles require exact ordered policy agreement and are not rewritten.
+Legacy OpenSSL cipher expressions and legacy hash/signature tuples are unsupported.
 
 - The default profile incorporates a top-level ALPN list in its declared order.
 - An explicit profile with no top-level ALPN is emitted unchanged.
@@ -125,6 +145,28 @@ are implemented.
 The server selection is validated as exactly one protocol offered by the
 materialized ClientHello. It is retained only after authenticated handshake
 validation and is never inferred from the first advertisement.
+
+## TCP option allowlist
+
+`nodelay` and `keepalive` accept booleans. `sndbuf` and `recbuf` accept positive
+signed-32-bit integers; the operating system may clamp or round their values.
+`ip` accepts a local IPv4/IPv6 address tuple and `port` accepts 0..65535. Direct
+`SSL.connect` accepts one bare `:inet` or `:inet6` family flag; literal remote or
+local bind addresses infer the family when absent. Conflicting families reject.
+DNS references and IP SAN references remain distinct; inferred IP literals do
+not send SNI. Both textual and tuple IPv6 literals are supported.
+
+Only `nodelay`, `keepalive`, `sndbuf` and `recbuf` are mutable. A complete
+`SSL.setopts` request validates before I/O. Driver errors propagate; no stronger
+rollback guarantee is made for partially applied driver settings. Virtual TLS
+options and buffered delivery remain usable after raw TCP shutdown. STARTTLS
+allows mutable options after ownership handoff but rejects local bind/family
+requests, which cannot change an existing connection.
+
+Raw `buffer`, active/packet ownership controls, arbitrary socket backends and
+unsafe linger are unsupported. Driver buffer tuning cannot change the TLS record,
+handshake or plaintext bounds. The private binary/raw/active-once configuration
+remains controlled by the connection process.
 
 ## Send deadlines, ordering, and cleanup
 

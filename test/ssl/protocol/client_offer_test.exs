@@ -31,8 +31,24 @@ defmodule SSL.Protocol.ClientOfferTest do
     assert [%{group: 0x001D, key_exchange: key_exchange}] = offer.key_shares
     assert key_exchange == @capture.client_public
     assert offer.signature_schemes == [0x0403]
+    assert offer.certificate_signature_schemes == nil
     assert offer.alpn_protocols == ["h2", "http/1.1"]
     assert offer.extension_ids == [43, 10, 51, 13, 16, 5, 18]
+  end
+
+  test "certificate-signature policy is extracted only from exact extension 50" do
+    base = extensions(@capture.client_hello)
+
+    encoded =
+      replace_extensions(@capture.client_hello, base ++ [{50, <<4::16, 0x0401::16, 0x0804::16>>}])
+
+    assert {:ok, %{certificate_signature_schemes: [0x0401, 0x0804]}} =
+             ClientOffer.from_client_hello(encoded)
+
+    for payload <- [<<0::16>>, <<3::16, 4, 1, 8>>, <<2::16, 4, 1, 0>>] do
+      malformed = replace_extensions(@capture.client_hello, base ++ [{50, payload}])
+      assert {:error, _} = ClientOffer.from_client_hello(malformed)
+    end
   end
 
   test "does not invent signature schemes for the historical malformed offer" do

@@ -847,7 +847,8 @@ defmodule SSL.Protocol.ServerFlightVerifier do
 
     case PKIX.verify(chain, input.trust_source, input.identity,
            customize_hostname_check: config.hostname_check,
-           depth: config.depth
+           depth: config.depth,
+           certificate_signature_schemes: config.certificate_signature_schemes
          ) do
       {:ok, verified_peer} ->
         {:ok, verified_peer}
@@ -1142,7 +1143,10 @@ defmodule SSL.Protocol.ServerFlightVerifier do
         |> Keyword.put(:offered_extension_ids, offer.extension_ids)
         |> Keyword.put(:allowed_signature_schemes, allowed_signatures)
 
-      {:ok, %{config | server_flight_options: options}}
+      {:ok,
+       config
+       |> Map.put(:server_flight_options, options)
+       |> Map.put(:certificate_signature_schemes, offer.certificate_signature_schemes)}
     end
   end
 

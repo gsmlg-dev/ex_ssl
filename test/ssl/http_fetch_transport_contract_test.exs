@@ -573,6 +573,10 @@ defmodule SSL.HTTPFetchTransportContractTest do
       settled = wait_for_closed_writer_cleanup(socket.pid)
       assert settled.size == byte_size(buffered)
 
+      # Virtual TLS options remain usable while authenticated bytes outlive TCP.
+      assert :ok = SSL.setopts(socket, send_timeout: 123)
+      assert {:error, :closed} = SSL.setopts(socket, nodelay: true)
+
       connection_monitor = Process.monitor(socket.pid)
       assert {:ok, ^buffered} = SSL.recv(socket, byte_size(buffered), 1_000)
       assert_receive {:ssl_closed, ^socket}, 1_000

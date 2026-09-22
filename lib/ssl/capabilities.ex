@@ -1,8 +1,8 @@
 defmodule SSL.Capabilities do
   @moduledoc false
 
-  # Wire order is intentional. Certificate-chain signature policy is not yet
-  # enforced by PKIX and must not be inferred from CertificateVerify support.
+  # Wire order is intentional. Certificate signatures and CertificateVerify
+  # signatures have distinct registries even when they share wire IDs.
   @ciphers [
     %{
       id: 0x1301,
@@ -208,6 +208,24 @@ defmodule SSL.Capabilities do
     0x080A,
     0x080B
   ]
+  @certificate_signatures [
+    %{
+      id: 0x0401,
+      name: :rsa_pkcs1_sha256,
+      needs: [public_keys: :rsa, hashs: :sha256, rsa_opts: :rsa_pkcs1_padding]
+    },
+    %{
+      id: 0x0501,
+      name: :rsa_pkcs1_sha384,
+      needs: [public_keys: :rsa, hashs: :sha384, rsa_opts: :rsa_pkcs1_padding]
+    },
+    %{
+      id: 0x0601,
+      name: :rsa_pkcs1_sha512,
+      needs: [public_keys: :rsa, hashs: :sha512, rsa_opts: :rsa_pkcs1_padding]
+    }
+    | Enum.map(@signatures, &Map.take(&1, [:id, :name, :needs]))
+  ]
 
   @spec runtime() :: map()
   def runtime do
@@ -225,13 +243,13 @@ defmodule SSL.Capabilities do
   end
 
   @spec resolve(atom(), term()) :: map() | nil
-  def resolve(kind, value), do: Enum.find(entries(kind), &(&1.id == value or &1.name == value))
+  def resolve(kind, value), do: Enum.find(entries(kind), &matches?(&1, kind, value))
 
   @spec signature(term()) :: map() | nil
   def signature(value), do: resolve(:signature_algorithm, value)
 
-  @spec certificate_chain_policy() :: :not_enforced
-  def certificate_chain_policy, do: :not_enforced
+  @spec certificate_chain_policy() :: :enforced
+  def certificate_chain_policy, do: :enforced
 
   @spec tls13_signature_scheme?(term()) :: boolean()
   def tls13_signature_scheme?(value), do: value in @tls13_signature_ids
@@ -248,8 +266,19 @@ defmodule SSL.Capabilities do
   defp entries(:cipher_suite), do: @ciphers
   defp entries(:group), do: @groups
   defp entries(:signature_algorithm), do: @signatures
-  defp entries(:certificate_signature_algorithm), do: []
+  defp entries(:certificate_signature_algorithm), do: @certificate_signatures
   defp entries(_kind), do: []
+
+  defp matches?(entry, _kind, value) when value == entry.id or value == entry.name,
+    do: true
+
+  defp matches?(entry, :cipher_suite, value) when is_binary(value),
+    do: value == entry.name |> Atom.to_string() |> String.upcase()
+
+  defp matches?(entry, :cipher_suite, %{key_exchange: :any, cipher: cipher, mac: :aead, prf: hash}),
+       do: entry.cipher == cipher and entry.hash == hash
+
+  defp matches?(_entry, _kind, _value), do: false
 
   defp available?(entry, runtime) do
     :hmac in Map.get(runtime, :macs, []) and

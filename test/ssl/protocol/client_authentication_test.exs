@@ -6,6 +6,7 @@ defmodule SSL.Protocol.ClientAuthenticationTest do
   alias SSL.ClientIdentity
   alias SSL.Crypto.KeySchedule
   alias SSL.Crypto.Signature
+  alias SSL.PKIX.CertificateSignaturePolicy
   alias SSL.Protocol.{ClientAuthentication, HandshakeFramer, Record, ServerFlight, Transcript}
   alias SSL.Protocol.ServerFlight.{Certificate, CertificateRequest, CertificateVerify}
 
@@ -100,6 +101,13 @@ defmodule SSL.Protocol.ClientAuthenticationTest do
     pss_der = signed_leaf(pss, "sha256")
     extensions = p384_der |> :public_key.pkix_decode_cert(:otp) |> elem(1) |> elem(10)
     refute Enum.any?(extensions, &match?({:Extension, {2, 5, 29, 15}, _, _}, &1))
+
+    assert CertificateSignaturePolicy.schemes(p384_der, p384.der) == [0x0503]
+    assert CertificateSignaturePolicy.schemes(p384_der, context.fixtures.ca.der) == []
+    assert CertificateSignaturePolicy.schemes(pss_der, pss.der) == [0x0809]
+
+    assert CertificateSignaturePolicy.schemes(pss_der, context.signature_fixtures[0x080A].der) ==
+             []
 
     p384_identity = %ClientIdentity{
       chain: [p384_der, p384.der],

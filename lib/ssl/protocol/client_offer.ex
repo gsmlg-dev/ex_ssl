@@ -18,6 +18,7 @@ defmodule SSL.Protocol.ClientOffer do
     :supported_groups,
     :key_shares,
     :signature_schemes,
+    :certificate_signature_schemes,
     :alpn_protocols,
     :psk_key_exchange_modes,
     :psk_count
@@ -35,6 +36,7 @@ defmodule SSL.Protocol.ClientOffer do
           supported_groups: [0..0xFFFF],
           key_shares: [key_share()],
           signature_schemes: [0..0xFFFF],
+          certificate_signature_schemes: [0..0xFFFF] | nil,
           alpn_protocols: [binary()],
           psk_key_exchange_modes: [0 | 1],
           psk_count: non_neg_integer()
@@ -117,6 +119,7 @@ defmodule SSL.Protocol.ClientOffer do
       supported_groups: [],
       key_shares: [],
       signature_schemes: [],
+      certificate_signature_schemes: nil,
       alpn_protocols: [],
       psk_key_exchange_modes: [],
       psk_count: 0
@@ -158,6 +161,13 @@ defmodule SSL.Protocol.ClientOffer do
     with {:ok, bytes} <- exact_vector16(payload, 13),
          {:ok, values} <- parse_uint16_list(bytes, :signature_algorithms, false) do
       {:ok, %{fields | signature_schemes: values}}
+    end
+  end
+
+  defp extract_field({50, payload}, fields) do
+    with {:ok, bytes} <- exact_vector16(payload, 50),
+         {:ok, values} <- parse_uint16_list(bytes, :signature_algorithms_cert, false) do
+      {:ok, %{fields | certificate_signature_schemes: values}}
     end
   end
 
