@@ -221,3 +221,13 @@ HTTP/2, required/optional failures, same-origin/manual redirects, and WSS and
 EventSource reconnects with exact peer-observed client identities. The released
 0.3.0 dependency does not contain this feature. Source-candidate validation is
 separate from released-dependency packaging evidence.
+
+## Source candidate option gate (Phase 3)
+
+The source candidate supports ordered suite/group/handshake-signature and
+certificate-signature policies plus safe TCP nodelay/keepalive/sndbuf/recbuf/local
+ip/port. The consumer adapter forwards only the tested allowlist; keyword
+containers and duplicate keys fail before fetch modifies ALPN or deadlines.
+IPv6 literals infer family and IPv6 local binds select IPv6 DNS. Raw active/packet
+controls and unsafe linger remain private/unsupported. The released0.3.0 package
+has not gained these features. See COMPATIBILITY.md for exact forms and limits.

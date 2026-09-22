@@ -36,10 +36,10 @@ have not been executed locally.
 | P2.1 identity loading | ex_ssl `a9c5713` | verified | Internal loader, role-aware key matching, bounded DER/PEM and redaction. 78 tests+5 properties pass; public options remain unsupported until P2.2. |
 | P2.2 client authentication | ex_ssl `fc1319d` | verified | Public identity options, authenticated request selection, fragmented client flight and original-deadline/cancellation cleanup. Seed53:240 tests+11 properties, zero failures. |
 | P2.3 HTTP mTLS | ex_ssl `fc1319d`, http_fetch `cbbc2f6` | verified | 30 source-candidate tests;442 root consumer tests+20 doctests,zero failures. Exact identities, required/optional negatives, redirect scope, WSS and deterministic SSE reconnect. |
-| P3.1 policy/profile options | ex_ssl (P3 commit after `66c650c`) | verified | Explicit ordered policies, exact profile conflicts and enforced issuer-signature policy. Full local library seed61:438tests+15properties pass. Consumer evidence pending. |
-| P3.2 TCP allowlist | both | in_progress | Validation and real socket behavior; consumer adapter follows the library gate. |
+| P3.1 policy/profile options | ex_ssl `509f002` | verified | Explicit ordered policies, exact profile conflicts and enforced issuer-signature policy. Full local library seed61:438tests+15properties pass. 39 packaged candidate tests pass. |
+| P3.2 TCP allowlist | ex_ssl `509f002`, http_fetch P3 adapter commit | verified | Full library438tests+15properties;39 packaged candidate tests;442 root consumer tests+20doctests,zero failures. |
 | P3.3 advanced certificate policy | both | verified | Production audit has no advanced-policy consumers. Unsupported callback/trust/CRL/OCSP policies explicitly reject; one test exercises nine pre-I/O rejections, seed55. |
-| P4.1 TLS 1.2 architecture | ex_ssl | not_started | ADR before protocol changes. |
+| P4.1 TLS 1.2 architecture | ex_ssl | in_progress | ADR_TLS12_CLIENT.md records the boundary before code; independent pure engine pending. |
 | P4.2 modern TLS 1.2 subset | ex_ssl | not_started | Independent ECDHE/AEAD/EMS implementation. |
 | P4.3 dual-version integration | both | not_started | Full negative and consumer evidence. |
 | P5 resumption/diagnostics | ex_ssl | not_started | Ticket isolation, real resumption, benchmarks. |
@@ -359,3 +359,21 @@ driver integers reject explicitly.
   Log `/tmp/ex-ssl-tls-plan-p3-library.log`.
 
 Next incomplete gate: P3 consumer adapter/source-candidate option coverage.
+
+### P3 consumer gate
+
+Expanded only the adapter TCP allowlist and pre-normalization validation of ex_ssl
+keyword containers/duplicates. The initial packaged red ran8tests with5failures
+(adapter rejections and malformed-list crash). After the adapter change, targeted
+source smoke ran9tests with0failures; full source smoke ran39tests with0failures,
+seed36. No edits to the test script after green. Source override remains confined
+to the isolated consumer.
+
+Root `MIX_ENV=test mix test apps/http_core/test apps/http_fetch/test
+apps/http_web_socket/test apps/http_event_source/test apps/http_web_transport/test
+--seed 62` passed442tests+20doctests,zero failures/no exclusions. Log
+`/tmp/http-fetch-tls-plan-p3-regression.log`. Dev/test strict compilation, full
+format and diff checks passed. Both compatibility documents updated.
+
+Next incomplete task: P4.1 pure TLS1.2 engine under the recorded ADR; public TLS1.2
+version acceptance remains disabled until end-to-end proof.
