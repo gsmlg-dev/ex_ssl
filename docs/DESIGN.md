@@ -831,3 +831,10 @@ The first implementation MUST NOT:
 - add a Rust NIF before a measured requirement exists;
 - implement HTTP/2 or HTTP/3 inside this library;
 - advertise TLS 1.2 support before TLS 1.2 is implemented.
+
+## Bounded dual-version client decision
+
+The TLS1.2 extension follows [ADR_TLS12_CLIENT.md](ADR_TLS12_CLIENT.md). It keeps
+the socket/runtime contract and separates version-specific pure handshake, key
+schedule and record logic. See the progress ledger for implementation status;
+this decision alone does not claim TLS1.2 support.
