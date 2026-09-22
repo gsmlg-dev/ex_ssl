@@ -39,10 +39,10 @@ have not been executed locally.
 | P3.1 policy/profile options | ex_ssl `509f002` | verified | Explicit ordered policies, exact profile conflicts and enforced issuer-signature policy. Full local library seed61:438tests+15properties pass. 39 packaged candidate tests pass. |
 | P3.2 TCP allowlist | ex_ssl `509f002`, http_fetch `f482322` | verified | Full library438tests+15properties;39 packaged candidate tests;442 root consumer tests+20doctests,zero failures. |
 | P3.3 advanced certificate policy | both | verified | Production audit has no advanced-policy consumers. Unsupported callback/trust/CRL/OCSP policies explicitly reject; one test exercises nine pre-I/O rejections, seed55. |
-| P4.1 TLS 1.2 architecture | ex_ssl `031dcea` ADR + P4 protocol commit | verified | Pure engine dispatch retains runtime; PRF/EMS/AEAD/codecs/signatures independently tested. |
-| P4.2 modern TLS 1.2 subset | ex_ssl P4 protocol commit | verified | Four ECDHE-GCM suites, required EMS/reneg indication, bounded full/mTLS and version negotiation. Local OTP28 omits EMS and is deliberately rejected. |
-| P4.3 dual-version integration | both | in_progress | Library492tests+16properties pass; packaged HTTP1/2/WSS/SSE gate in progress. OTP positiveTLS12 unavailable under EMS policy; other runtime matrix pending. |
-| P5 resumption/diagnostics | ex_ssl | not_started | Ticket isolation, real resumption, benchmarks. |
+| P4.1 TLS 1.2 architecture | ex_ssl `031dcea` ADR + `844d4a6` | verified | Pure engine dispatch retains runtime; PRF/EMS/AEAD/codecs/signatures independently tested. |
+| P4.2 modern TLS 1.2 subset | ex_ssl `844d4a6` | verified | Four ECDHE-GCM suites, required EMS/reneg indication, bounded full/mTLS and version negotiation. Local OTP28 omits EMS and is deliberately rejected. |
+| P4.3 dual-version integration | ex_ssl `844d4a6`, http_fetch candidate after `f482322` | verified | Library492tests+16properties pass; packaged46tests pass; cross-window H2 refinement7tests pass. OTP positiveTLS12 unavailable under EMS policy; other runtime matrix pending. |
+| P5 resumption/diagnostics | ex_ssl ADR `a156a7c` + candidate | in_progress | Independent OpenSSL full/resumed/HRR/restart and policy negatives7tests pass; cache12tests, context6tests, verifier43tests+3properties pass. Final regression/benchmark in progress. |
 | P6 packaging/readiness | http_fetch `b4414db`, ex_ssl `2942433` | in_progress | Consumer package smoke and58 E2E tests pass; Credo and Dialyzer pass. Other runtime matrix, later features, benchmarks/resource campaigns and human security review remain. |
 
 ## Executed commands
@@ -421,3 +421,33 @@ profiles retain ordered version/policy validation. Default remainsTLS13-only.
 Compatibility docs and mandatory interoperability workflow updated. These are
 source-candidate features, not changes to published0.3.0. Next incomplete task:
 P4.3 packaged dual-version HTTP1/2, WSS and EventSource evidence.
+
+### P4 consumer completion and P5 progress
+
+P4 packaged source gate:46tests,zero failures,seed36. Seven new OpenSSL cases
+cover HTTP1/2,mixed negotiation,WSS,SSE with required exact client identity.
+The first H2 fixture sent60000bytes; P6 expanded it to262144 with explicit
+connection/stream WINDOW_UPDATE accounting. Targeted source gate7tests,zero
+failures. No production adapter changes were needed for TLS12.
+
+P5 ADR `a156a7c` preceded code. Initial independent red seed78 rejected auto as
+unsupported; first green seed79:1test. Expanded seed82:7tests,zero failures,
+including real resumption, P384 HRR, server context restart, invalid binder,
+trust/reference/ALPN isolation. Context seed83:6tests,zero failures. Cache plus
+binder seed92:12tests,zero failures. Diagnostics seed81:3tests,zero failures
+with integration included (earlier run executed2,excluded1; not a three-testpass).
+Source-package HTTP1 resumption:1test,zero failures; independent OpenSSL observed
+false then true. Cache tokenized timer, atomic checkout, memory bounds and status
+redaction are tested. Unknown/manual/early-data/mTLS/mixed combinations reject.
+
+First full P5 seed84:525tests+16properties,3failures. Two exposed new batch
+ServerHello pre-validation ordering (improper list crash and changed error
+precedence); moved PSK rejection after exact input validation. Third was a test
+using an empty Certificate to assert flight order; replaced with nonempty framed
+Certificate. Focused seed85:43tests+3properties,zero failures. Worker had stopped
+after two fixture repair rounds; parent completed repair without relaxing auth.
+
+P6 resource seed94:1test,zero failures over17connections (12success including
+11resumed,3bad identities,2owner deaths). Parent strengthened aggregate binary/
+monitor sampling to execute inside sensitive processes instead of observing
+redacted external Process.info. Revalidation and final gates still pending.
