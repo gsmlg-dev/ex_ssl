@@ -565,3 +565,10 @@ Release integration validation: `MIX_ENV=test mix test --include integration
 Formatting and dev/test strict compilation passed; OTP29/Elixir1.20 strict
 compilation plus preserved crypto regressions seed109 passed three tests.
 Both ex_ssl worktrees and merged branches were removed after ancestry checks.
+
+GitHub validation of `292b4c2`: CI, TLS interoperability and E2E passed. Test
+failed on all three matrix tuples because an OpenSSL fixture without extensions
+decodes to `:asn1_NOVALUE`; the test incorrectly assumed a list. The fixture
+assertion now treats absent extensions as empty while retaining all certificate
+signature policy assertions. Focused client authentication tests, seed110:
+8 tests, zero failures; formatting passed. GitHub validation is rerun before release.

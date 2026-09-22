@@ -100,6 +100,8 @@ defmodule SSL.Protocol.ClientAuthenticationTest do
     p384_der = signed_leaf(p384, "sha384")
     pss_der = signed_leaf(pss, "sha256")
     extensions = p384_der |> :public_key.pkix_decode_cert(:otp) |> elem(1) |> elem(10)
+    # OpenSSL versions differ in whether they add identifier extensions to this leaf.
+    extensions = if extensions == :asn1_NOVALUE, do: [], else: extensions
     refute Enum.any?(extensions, &match?({:Extension, {2, 5, 29, 15}, _, _}, &1))
 
     assert CertificateSignaturePolicy.schemes(p384_der, p384.der) == [0x0503]
