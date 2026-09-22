@@ -236,3 +236,28 @@ CertificateRequest CA-name and OID-filter vectors each allow at most 64 entries
 within the existing bounded extension envelope.
 Restricted PSS private keys and leaf constraints are both checked through the
 shared signature verifier. Unsupported key/parameter combinations fail explicitly.
+
+## Advanced certificate-policy boundary (Phase 3 audit)
+
+The http_fetch production inventory uses CA overrides, depth, inferred DNS/IP
+identity, and the HTTPS hostname matcher. It has no production calls requesting
+`verify_fun`, `partial_chain`, CRL or OCSP policies. Those options therefore do
+not block the restricted backend, but consumers that depend on them cannot use
+this subset unchanged.
+
+| Policy | Candidate support |
+| --- | --- |
+| `cacerts` / `cacertfile` | Explicit trust sources; no silent replacement with system trust |
+| `depth` | Intermediate-CA bound, independent of parser/resource limits |
+| SNI / reference identity | DNS identity or IP SAN verification; SNI is omitted for IP addresses |
+| `customize_hostname_check: [match_fun: fun]` | Supported hostname matching customization; path validation remains required |
+| `verify_fun` | Rejected; supplied callbacks never replace authentication failures |
+| `partial_chain` | Rejected; no user callback can introduce an intermediate trust anchor |
+| `crl_check` / `crl_cache` | Rejected; no revocation freshness or retrieval guarantee is claimed |
+| `stapling` | Rejected; OCSP response validation and availability policy are not implemented |
+| `cert_policy_opts` / `allow_any_ca_purpose` | Rejected; no implicit acceptance of policy overrides |
+
+These names follow the [OTP 29 public option documentation](https://www.erlang.org/docs/29/apps/ssl/ssl.html).
+Each supplied unsupported policy fails before network I/O, with its value
+redacted. Implementing one requires a separate trust-semantics design and
+negative/availability tests; no permissive verification callback is installed.

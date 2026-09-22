@@ -38,7 +38,7 @@ have not been executed locally.
 | P2.3 HTTP mTLS | ex_ssl `fc1319d`, http_fetch `cbbc2f6` | verified | 30 source-candidate tests;442 root consumer tests+20 doctests,zero failures. Exact identities, required/optional negatives, redirect scope, WSS and deterministic SSE reconnect. |
 | P3.1 policy/profile options | ex_ssl `fc1319d`, http_fetch `cbbc2f6` | in_progress | Ordered registry-backed configuration and enforced certificate-signature policy. |
 | P3.2 TCP allowlist | both | in_progress | Validation and real socket behavior; consumer adapter follows the library gate. |
-| P3.3 certificate policy | both | not_started | Explicit supported/unsupported matrix. |
+| P3.3 advanced certificate policy | both | verified | Production audit has no advanced-policy consumers. Unsupported callback/trust/CRL/OCSP policies explicitly reject; one test exercises nine pre-I/O rejections, seed55. |
 | P4.1 TLS 1.2 architecture | ex_ssl | not_started | ADR before protocol changes. |
 | P4.2 modern TLS 1.2 subset | ex_ssl | not_started | Independent ECDHE/AEAD/EMS implementation. |
 | P4.3 dual-version integration | both | not_started | Full negative and consumer evidence. |
@@ -310,3 +310,16 @@ retain credentials; OTP behavior, defaults and QUIC are unchanged.
   still targets ex_ssl0.3.0. No source overrides, lock changes or upgrades committed.
 
 Next incomplete task: P3.1 ordered TLS policy/profile option support.
+
+
+### P3.3 advanced-policy inventory
+
+`rg` over all five consumer production trees found only the existing HTTPS
+hostname matcher; no verify_fun, partial_chain, CRL or OCSP caller was found.
+The compatibility matrix now states the supported trust/depth/identity boundary
+and explicitly rejected advanced policies, using OTP29 public documentation.
+`MIX_ENV=test mix test test/ssl/certificate_policy_options_test.exs --seed 55`
+passed: **1 test,zero failures**, exercising9 rejected option configurations
+before I/O and proving supplied permissive callbacks were never called.
+No production behavior changed. Required advanced policy would need a separate
+reviewed implementation; none is required by this audited consumer.
