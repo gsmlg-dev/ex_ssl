@@ -21,7 +21,7 @@ defmodule SSL.Protocol.HandshakeMachine do
   @max_handshake_length 1_048_576
   @ccs <<20, 3, 3, 0, 1, 1>>
 
-  @derive {Inspect, except: [:key_pair, :read_state, :write_state, :verifier]}
+  @derive {Inspect, except: [:key_pair, :read_state, :write_state, :verifier, :client_identity]}
   defstruct [
     :client_hello,
     :client_ast,
@@ -29,6 +29,7 @@ defmodule SSL.Protocol.HandshakeMachine do
     :key_pairs,
     :trust_source,
     :identity,
+    :client_identity,
     :offer,
     :server_hello,
     :read_state,
@@ -51,7 +52,9 @@ defmodule SSL.Protocol.HandshakeMachine do
   def init(materialized, trust_source, identity, opts \\ [])
 
   def init(%Materialized{} = materialized, trust_source, identity, opts) when is_list(opts) do
-    with {:ok, client_hello} <- encoded_client_hello(materialized, opts),
+    {client_identity, verifier_opts} = Keyword.pop(opts, :client_identity)
+
+    with {:ok, client_hello} <- encoded_client_hello(materialized, verifier_opts),
          {:ok, offer} <- ClientOffer.from_client_hello(client_hello),
          {:ok, key_pairs} <- matching_key_pairs(materialized.key_pairs, offer),
          :ok <- validate_identity(identity) do
@@ -62,10 +65,11 @@ defmodule SSL.Protocol.HandshakeMachine do
         key_pairs: key_pairs,
         trust_source: trust_source,
         identity: identity,
+        client_identity: client_identity,
         offer: offer,
         phase: :await_server_hello,
         framer: HandshakeFramer.new(),
-        options: opts
+        options: verifier_opts
       }
 
       {:ok, state, plaintext_handshake_records(client_hello)}
@@ -230,7 +234,8 @@ defmodule SSL.Protocol.HandshakeMachine do
            client_key_pair: key_pair,
            records: [],
            trust_source: state.trust_source,
-           identity: state.identity
+           identity: state.identity,
+           client_identity: state.client_identity
          },
          {:ok, %Incremental{} = verifier} <-
            start_verifier(input, verifier_options(state.options), state.hrr_transcript) do
@@ -262,6 +267,7 @@ defmodule SSL.Protocol.HandshakeMachine do
               | phase: :connected,
                 verifier: nil,
                 key_pair: nil,
+                client_identity: nil,
                 hrr_transcript: nil,
                 read_state: result.server_application_state,
                 write_state: result.client_application_state,

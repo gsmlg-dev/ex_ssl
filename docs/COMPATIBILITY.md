@@ -63,6 +63,7 @@ Supported connection options are:
 - `active: false | :once` (default `false`);
 - `verify: :verify_peer`;
 - `cacerts` or `cacertfile`;
+- one initial-handshake client identity through `cert`/`certfile` and `key`/`keyfile` (forms and bounds below);
 - DNS `server_name_indication`;
 - `customize_hostname_check: [match_fun: fun]`;
 - `versions: [:"tlsv1.3"]`;
@@ -74,7 +75,7 @@ Supported connection options are:
 
 Verification cannot be disabled. TLS 1.2 and mixed TLS 1.3/TLS 1.2 version
 lists are rejected. Packet modes, list mode, active true/active-N, arbitrary TCP
-options, client certificates, and `send_timeout_close: false` remain
+options and `send_timeout_close: false` remain
 unsupported. Unsupported or malformed options return a redacted
 `{:error, {:options, reason}}`; supplied option data is not echoed.
 
@@ -100,8 +101,9 @@ Absent PSS key parameters are unrestricted, while the TLS signature still uses
 the scheme-specific parameters. P-384 ECDHE uses fresh 48-byte scalars and
 97-byte uncompressed public points; invalid points fail closed.
 
-Client/server signed-content and client-signing primitives are internal only;
-client certificate options and the mTLS handshake are not yet implemented.
+Client and server CertificateVerify use distinct role contexts. Initial client
+authentication is supported as described below; post-handshake authentication
+remains unsupported.
 
 Certificate-chain signature policy is separate from the leaf's TLS
 CertificateVerify scheme. An explicit `signature_algorithms_cert` profile
@@ -192,19 +194,31 @@ inspection.
 
 ## Remaining limitations
 
-TLS 1.2, server TLS, DTLS, QUIC/HTTP/3, client authentication, resumption,
+TLS 1.2, server TLS, DTLS, QUIC/HTTP/3, resumption,
 0-RTT, post-handshake authentication, active true/active-N, packet framing,
 exporters, and full OTP API parity are out of scope. ALPN negotiation alone is
 not evidence of an HTTP/2 request. See
 [HTTP_FETCH_INTEGRATION.md](HTTP_FETCH_INTEGRATION.md) for the opt-in consumer
 integration and its remaining acceptance gates.
 
-## Client identity preparation (internal)
+## Initial-handshake client authentication
 
-The bounded `SSL.ClientIdentity` loader is implemented as a prerequisite for
-initial-handshake client authentication. Public `SSL.connect` still rejects
-client identity options until the client-authentication flight is integrated.
-No configured identity is silently accepted and omitted from a handshake.
+`SSL.connect` accepts one client identity and sends it only in response to an
+authenticated initial CertificateRequest. The request must offer a compatible
+CertificateVerify scheme and certificate-chain signature policy. Requested CA
+names constrain selection. Unknown OID filters are ignored as specified by TLS.
+Recognized Key Usage and Extended Key Usage filters currently result in an empty
+Certificate because filter-value matching is not implemented. A present leaf
+Key Usage must permit digital signatures even without a filter. Missing or
+incompatible identities also produce an empty Certificate, as required for
+optional client authentication. No CertificateVerify is sent for an empty chain.
+
+The client Certificate, role-specific CertificateVerify and Finished use exact
+transcript bytes and the existing bounded writer and original connect deadline.
+Large certificates span multiple records. Connect success means the server was
+authenticated and the client flight was written; the peer may reject the client
+identity afterward. Callers must handle subsequent alerts and HTTP failures.
+Server trust and hostname verification are unchanged.
 
 The loader handles one DER certificate or leaf-first DER chain, typed DER RSA/EC/
 PKCS#8 private keys, and unencrypted PEM through binary or charlist paths. One
@@ -218,5 +232,7 @@ Bounds: 16 certificates, 256 KiB per DER certificate, 512 KiB aggregate DER,
 1 MiB per PEM file or typed DER key. The chain bound leaves room for TLS record
 and handshake overhead within the existing 1 MiB writer ceiling. Errors contain
 only fixed reason atoms; ordinary identity inspection exposes only scheme IDs.
+CertificateRequest CA-name and OID-filter vectors each allow at most 64 entries
+within the existing bounded extension envelope.
 Restricted PSS private keys and leaf constraints are both checked through the
 shared signature verifier. Unsupported key/parameter combinations fail explicitly.

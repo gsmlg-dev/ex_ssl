@@ -187,3 +187,28 @@ temporary consumer project. It tests every new signature over HTTP/1.1 with
 P-384 HRR and HTTP/2 with a direct P-384 share, plus hostname rejection. The
 separate `external_consumer_smoke.sh` validates released dependency metadata
 without that override. No installed dependency sources are modified.
+
+
+## Candidate client authentication
+
+The Phase 2 source candidate supports one initial-handshake client identity.
+These options use the existing HTTP transport's `ssl:` path:
+
+```elixir
+HTTP.fetch("https://service.example/resource",
+  tls_backend: :ex_ssl,
+  ssl: [
+    cacertfile: "/etc/service/server-ca.pem",
+    certfile: "/etc/service/client-chain.pem",
+    keyfile: "/etc/service/client-key.pem"
+  ]
+)
+```
+
+Client identity and server trust remain separate. The key must match the leaf
+certificate; files must be unencrypted. Peer acceptance is observed through the
+HTTP result, because TLS 1.3 permits a client-identity rejection after the local
+client Finished write. No retry, backend fallback or weakened verification is
+performed. See the compatibility matrix for input forms, chain bounds and
+CertificateRequest selection constraints. The P2.3 consumer/origin-scope gate
+is still pending; the existing released dependency does not contain this feature.

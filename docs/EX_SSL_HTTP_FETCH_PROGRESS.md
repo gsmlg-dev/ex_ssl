@@ -33,9 +33,9 @@ have not been executed locally.
 | P1.1 capability registry | ex_ssl `0175097` | verified | Runtime-filtered registry, separate certificate-chain policy, registry-backed group/cipher negotiation and AEAD. Seed30: 292 tests +13 properties, zero failures. |
 | P1.2 algorithm expansion | ex_ssl `5463ad9` | verified | P-384 ECDHE/ECDSA, Ed25519, RSA-PSS-PSS; independent vectors, negatives and constrained peers. |
 | P1.3 negotiation evidence | ex_ssl `5463ad9`, http_fetch `93efee0` | verified | 327 library tests+15 properties; 12 external-candidate tests cover10 HTTP exchanges+5 identity negatives, zero failures. Other CI runtime tuples pending. |
-| P2.1 identity loading | ex_ssl (identity commit following `5463ad9`) | verified | Internal loader, role-aware key matching, bounded DER/PEM and redaction. 78 tests+5 properties pass; public options remain unsupported until P2.2. |
-| P2.2 client authentication | ex_ssl | not_started | Client Certificate/CertificateVerify flight. |
-| P2.3 HTTP mTLS | both | not_started | Origin scope and required/optional auth. |
+| P2.1 identity loading | ex_ssl `a9c5713` | verified | Internal loader, role-aware key matching, bounded DER/PEM and redaction. 78 tests+5 properties pass; public options remain unsupported until P2.2. |
+| P2.2 client authentication | ex_ssl (client-auth commit following `a9c5713`) | verified | Public identity options, authenticated request selection, fragmented client flight and original-deadline/cancellation cleanup. Seed53:240 tests+11 properties, zero failures. |
+| P2.3 HTTP mTLS | both | in_progress | Packaged HTTP/WSS/SSE mTLS and redirect origin scope. |
 | P3.1 policy/profile options | both | not_started | Ordered registry-backed configuration. |
 | P3.2 TCP allowlist | both | not_started | Validation and real socket behavior. |
 | P3.3 certificate policy | both | not_started | Explicit supported/unsupported matrix. |
@@ -222,3 +222,47 @@ checks key matching and ordered chain signatures without trusting the identity.
   accepting an identity before implementing its flight would silently omit it.
 
 Next incomplete task: P2.2 initial-handshake client authentication.
+
+
+### P2.2 initial client-authentication flight
+
+Public identity options now feed the pure handshake machine. The client signs
+only after authenticating the server flight, derives application keys at the
+server-Finished transcript boundary, and includes its exact Certificate and
+CertificateVerify bytes in its own Finished. Certificates larger than one record
+are fragmented through the existing writer and original connect deadline.
+Credentials remain absent without CertificateRequest. Selection applies requested
+schemes, CA names, chain signature policy, and leaf digitalSignature eligibility.
+Unknown OID filters are ignored; recognized KU/EKU filter value matching remains
+unsupported and conservatively selects an empty Certificate. Post-handshake auth
+remains unsupported. Self-signed chain roots are exempt from issuer-signature
+policy. Documentation states these limits and late peer rejection semantics.
+
+- Public-options initial red: 3 tests, 1 failure. Seed50 options gate:16 tests,
+  zero failures. Initial real-peer red:6 tests,3 required-auth failures before
+  implementing the flight. OTP reference fixture initially lacked binary mode;
+  corrected run executed1 test,7 excluded,zero failures (not eight passing).
+- Pure protocol final seed50:74 tests+4 properties,zero failures. Review repaired
+  issuer-EC tuple shape, strict DER Names, unknown-OID handling and leaf key usage;
+  generic DER filter-value validation was removed for unsupported opaque values.
+- Real-peer seed51:9 tests,zero failures: RSA/P256/large identity, P384 HRR,
+  OTP reference, optional/no-request and required-identity rejection cases.
+- Lifecycle seed160526:2 tests,zero failures. A gated peer plus suspended writer
+  proves a queued client-authentication flight larger than16KiB. Bounded state
+  probes establish the barrier; no timing assumption creates it. Deadline and
+  owner cancellation each assert port, writer, connection and timer cleanup.
+  Existing record-gate input-order suite seed329021:6 tests,zero failures.
+- Combined seed52:238 tests+11 properties,1 failure from an unvalidated fixture
+  assertion that OpenSSL emitted no extensions. It now checks specifically that
+  Key Usage is absent; automatically added Subject Key Identifier is allowed.
+- Final `MIX_ENV=test mix test test/ssl/client_identity_test.exs
+  test/ssl/client_identity_options_test.exs test/ssl/options_test.exs
+  test/ssl/protocol test/ssl/crypto/signature_test.exs
+  test/ssl/crypto/signature_expansion_test.exs test/ssl/client_auth_interop_test.exs
+  test/ssl/client_auth_lifecycle_test.exs test/ssl/connection_interop_test.exs
+  test/ssl/http_fetch_transport_contract_test.exs --include integration --seed 53`: **240 tests+11 properties,zero failures**,
+  no exclusions. Log `/tmp/ex-ssl-tls-plan-mtls-final.log`.
+- Dev/test strict compile, full formatting and diff checks pass. Mandatory
+  interop workflow now includes both new mTLS suites; remote matrix not run.
+
+Next incomplete task: P2.3 packaged consumer mTLS and redirect-origin policy.

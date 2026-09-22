@@ -129,7 +129,8 @@ defmodule SSL.Connection do
                state.options.trust_source,
                state.options.identity,
                customize_hostname_check: state.options.hostname_check,
-               depth: state.options.depth
+               depth: state.options.depth,
+               client_identity: state.options.client_identity
              ),
            {:ok, state} <-
              start_output(

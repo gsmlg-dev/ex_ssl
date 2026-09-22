@@ -8,6 +8,7 @@ defmodule SSL.Options do
     :profile,
     :identity,
     :trust_source,
+    :client_identity,
     :alpn_advertised_protocols,
     active: false,
     depth: 10,
@@ -29,6 +30,10 @@ defmodule SSL.Options do
     :verify,
     :cacerts,
     :cacertfile,
+    :cert,
+    :certfile,
+    :key,
+    :keyfile,
     :server_name_indication,
     :customize_hostname_check,
     :versions,
@@ -58,13 +63,16 @@ defmodule SSL.Options do
          {:ok, identity, context} <-
            identity(host, Keyword.get(options, :server_name_indication)),
          {:ok, trust} <- trust_source(options),
-         {:ok, profile} <- profile(options, context) do
+         {:ok, profile} <- profile(options, context),
+         {:ok, client_identity} <-
+           SSL.ClientIdentity.load(Keyword.take(options, [:cert, :certfile, :key, :keyfile])) do
       {:ok,
        %__MODULE__{
          profile: profile,
          identity: identity,
          context: context,
          trust_source: trust,
+         client_identity: client_identity,
          alpn_advertised_protocols: profile_alpn(profile),
          active: Keyword.get(options, :active, false),
          depth: Keyword.get(options, :depth, 10),
@@ -152,6 +160,9 @@ defmodule SSL.Options do
   defp valid_option?(:versions, value), do: value == [:"tlsv1.3"]
   defp valid_option?(:alpn_advertised_protocols, value), do: valid_alpn_protocols?(value)
   defp valid_option?(:cacerts, value), do: is_list(value) and value != []
+
+  # The identity loader owns shape, size, source-conflict and key matching checks.
+  defp valid_option?(key, _value) when key in [:cert, :certfile, :key, :keyfile], do: true
 
   defp valid_option?(:cacertfile, value),
     do: (is_binary(value) or is_list(value)) and value not in ["", []]

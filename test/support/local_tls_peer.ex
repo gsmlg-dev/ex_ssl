@@ -175,17 +175,32 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
              task: Task.t(),
              controller: pid()
            }}
-  def start_record_gate_proxy(upstream_port, observer)
-      when is_integer(upstream_port) and is_pid(observer) do
+  def start_record_gate_proxy(upstream_port, observer),
+    do: start_record_gate_proxy(upstream_port, observer, [])
+
+  @spec start_record_gate_proxy(:inet.port_number(), pid(), keyword()) ::
+          {:ok,
+           %{
+             listener: port(),
+             port: :inet.port_number(),
+             ref: reference(),
+             task: Task.t(),
+             controller: pid()
+           }}
+  def start_record_gate_proxy(upstream_port, observer, options)
+      when is_integer(upstream_port) and is_pid(observer) and is_list(options) do
     {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, packet: :raw, reuseaddr: true])
     {:ok, {_address, port}} = :inet.sockname(listener)
     ref = make_ref()
+    initially_gated = Keyword.get(options, :initially_gated, false)
 
     controller =
       spawn(fn ->
+        if initially_gated, do: send(observer, {:tls_record_proxy, ref, :gated})
+
         receive do
-          {:start, upstream, downstream, task_pid} ->
-            record_gate_loop(upstream, downstream, observer, ref, task_pid)
+          {:start, upstream, downstream, task_pid, gated} ->
+            record_gate_loop(upstream, downstream, observer, ref, task_pid, gated)
 
           :stop_record_gate_proxy ->
             :ok
@@ -211,7 +226,7 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
 
           :ok = :gen_tcp.controlling_process(upstream, controller)
           :ok = :gen_tcp.controlling_process(downstream, client_to_server.pid)
-          send(controller, {:start, upstream, downstream, self()})
+          send(controller, {:start, upstream, downstream, self(), initially_gated})
           send(client_to_server.pid, :start)
 
           receive do
@@ -363,14 +378,14 @@ defmodule ExSSL.TestSupport.LocalTLSPeer do
     Task.shutdown(task, 6_000)
   end
 
-  defp record_gate_loop(upstream, downstream, observer, ref, parent) do
-    :ok = :inet.setopts(upstream, active: :once)
-    record_gate_loop(upstream, downstream, observer, ref, parent, <<>>, :queue.new(), false, 0)
-  end
-
   defp backpressure_forward(downstream, upstream, observer, ref, parent) do
     :ok = :inet.setopts(downstream, active: :once)
     backpressure_forward(downstream, upstream, observer, ref, parent, false, nil)
+  end
+
+  defp record_gate_loop(upstream, downstream, observer, ref, parent, gated) do
+    :ok = :inet.setopts(upstream, active: :once)
+    record_gate_loop(upstream, downstream, observer, ref, parent, <<>>, :queue.new(), gated, 0)
   end
 
   defp backpressure_forward(downstream, upstream, observer, ref, parent, paused, held) do

@@ -9,7 +9,8 @@ The OTP application is `:ex_ssl`. The public compatibility module is `SSL` (`Eli
 
 > **Status:** experimental TLS 1.3 client runtime with authenticated connections,
 > passive and active-once binary/raw traffic, application ownership transfer,
-> ALPN lookup, bounded streaming writes, and TCP-to-TLS upgrades. See the
+> ALPN lookup, bounded streaming writes, initial-handshake client authentication,
+> and TCP-to-TLS upgrades. See the
 > [compatibility matrix](docs/COMPATIBILITY.md) for exact restrictions. OTP
 > `:ssl` remains the default recommendation.
 
