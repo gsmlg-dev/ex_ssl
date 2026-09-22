@@ -30,7 +30,7 @@ have not been executed locally.
 | P0.1 consumer inventory | http_fetch `690258a` | verified | Inventory in consumer `docs/ex-ssl-consumer-contract.md`; implemented, deliberately unsupported, missing, and QUIC/test-only surfaces separated. |
 | P0.2 deterministic closure | http_fetch `b4414db7d9061c8892483e3bd632aa384a03ac70` | verified | Existing closure and early-response fixes preserved; missing Content-Length, exact-once completion, frame/header bounds fixed. Final seed25:442 tests+20 doctests, zero failures; independent review approved. |
 | P0.3 consumer boundary | both bases above | verified | Root-scoped baseline: 422 tests + 20 doctests, zero failures. ex_ssl transport contract: 31 integration tests; interoperability: 15 integration tests, zero failures. |
-| P1.1 capability registry | ex_ssl `0f16c2c` | in_progress | Phase0 gate complete; registry and runtime prerequisite tests in progress. |
+| P1.1 capability registry | ex_ssl (registry commit following `2942433`) | verified | Runtime-filtered registry, separate certificate-chain policy, registry-backed group/cipher negotiation and AEAD. Seed30: 292 tests +13 properties, zero failures. |
 | P1.2 algorithm expansion | ex_ssl `0f16c2c` | not_started | P-384, Ed25519, restricted RSA-PSS. |
 | P1.3 negotiation evidence | both | not_started | Independent positive/negative handshakes and HTTP. |
 | P2.1 identity loading | ex_ssl | not_started | Bounded and redacted client credentials. |
@@ -43,7 +43,7 @@ have not been executed locally.
 | P4.2 modern TLS 1.2 subset | ex_ssl | not_started | Independent ECDHE/AEAD/EMS implementation. |
 | P4.3 dual-version integration | both | not_started | Full negative and consumer evidence. |
 | P5 resumption/diagnostics | ex_ssl | not_started | Ticket isolation, real resumption, benchmarks. |
-| P6 packaging/readiness | both | not_started | Matrix, static analysis, packages, smoke, resources; human security review separate. |
+| P6 packaging/readiness | http_fetch `b4414db`, ex_ssl `2942433` | in_progress | Consumer package smoke and58 E2E tests pass; Credo and Dialyzer pass. Other runtime matrix, later features, benchmarks/resource campaigns and human security review remain. |
 
 ## Executed commands
 
@@ -113,3 +113,40 @@ both TLS backends; OTP adapter behavior and backend defaults remain unchanged.
 Protocol rationale: RFC9113 sections4.2 and8.1.1; HTTP content/trailer semantics
 from RFC9110. Limits are explicit: at most20 decimal digits within unsigned64,
 16384-byte inbound frame payload, 65536-byte compressed header block.
+
+- Consumer E2E: `go build -o /tmp/http-fetch-tls-plan-server .` from the Go
+  fixture directory — exit0. Started that binary, read its ephemeral port,
+  checked HTTP health and ran `MIX_ENV=test E2E_BASE_URL=http://127.0.0.1:<port>
+  mix test.e2e` — **58 tests, zero failures**, no exclusions (50 fetch,3 WSS,
+  3 WebTransport,2 EventSource), seed344001. Server terminated and reaped afterward.
+  Log: `/tmp/http-fetch-tls-plan-e2e.log`.
+- Consumer `mix dialyzer --format github` — exit0 after fresh PLT build;
+  4 existing ignored diagnostics, 0 unnecessary ignores, no new diagnostics.
+  Log: `/tmp/http-fetch-tls-plan-dialyzer.log`.
+
+### P1.1 capability registry
+
+Centralized implemented cipher/signature/group identifiers, key restrictions,
+share encoding/size, AEAD/hash metadata, and exact runtime prerequisites.
+Handshake decoding may recognize a TLS identifier without advertising it; Ed448
+regression proves recognition does not enable verification. Certificate-chain
+signature policy remains separate and unenforced; runtime profiles explicitly
+reject `signature_algorithms_cert` rather than borrowing handshake capabilities.
+No new algorithm or changed backend/version default in this commit.
+
+- Registry initial missing-module regressions: 3 failures. Review found an
+  outdated materializer fixture that omitted certificate-chain capabilities;
+  fixture now supplies its explicit pure-codec policy (no runtime fallback).
+- Additional metadata regression: 5 tests, 1 failure before repair.
+- Intermediate focused run: 128 tests +7 properties, zero failures.
+- Final `mix test test/ssl/capabilities_test.exs test/ssl/options_test.exs
+  test/ssl/client_hello test/ssl/crypto test/ssl/protocol
+  test/ssl/connection_interop_test.exs test/ssl/http_fetch_transport_contract_test.exs
+  --include integration --seed 30`: **292 tests +13 properties, zero failures**,
+  no exclusions. Dev/test warnings-as-errors compile, format and diff checks pass.
+- Independent review identified remaining duplicated negotiation mappings;
+  ServerHello, HandshakeMachine, ServerFlightVerifier, KeySchedule and AEAD now
+  consume the registry. Existing record encryption limits remain separate policy.
+
+Next incomplete task: P1.2 algorithm expansion, followed by P1.3 independent
+negotiation and HTTP evidence. Later phases remain unimplemented.

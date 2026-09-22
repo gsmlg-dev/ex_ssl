@@ -85,6 +85,23 @@ tests cover direct root-signed and one-intermediate paths at both boundaries.
 
 ## ALPN and WireProfile precedence
 
+Algorithm offers use the internal capability registry, with runtime checks for
+the required hash, AEAD, HMAC, ECDHE/curve, and RSA-PSS padding/MGF/salt controls.
+Generic RSA or ECDSA availability alone is insufficient. The supported subset
+remains X25519/P-256 ECDHE, P-256 ECDSA, RSA-PSS-RSAE SHA-256/384/512 and the
+three TLS 1.3 AEAD suites. No additional algorithm is promised by this registry
+refactor, and supplied profile ordering remains authoritative.
+
+Certificate-chain signature policy is separate from the leaf's TLS
+CertificateVerify scheme. An explicit `signature_algorithms_cert` profile
+extension is now rejected as `:unsupported_certificate_signature_algorithms`:
+ex_ssl does not yet enforce that requested chain policy. Normal PKIX path and
+identity validation still run. The pure profile codec can accept a separate
+certificate capability list for fixtures, but runtime options do not infer one
+from handshake-signature support. Top-level `signature_algs` and
+`signature_algs_cert` options remain unsupported until their policy semantics
+are implemented.
+
 - The default profile incorporates a top-level ALPN list in its declared order.
 - An explicit profile with no top-level ALPN is emitted unchanged.
 - An explicit profile plus top-level ALPN requires an exact ordered match.

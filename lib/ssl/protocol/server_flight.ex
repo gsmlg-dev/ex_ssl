@@ -1,4 +1,6 @@
 defmodule SSL.Protocol.ServerFlight do
+  alias SSL.Capabilities
+
   @moduledoc """
   Bounded codecs for the encrypted TLS 1.3 server handshake flight.
 
@@ -94,19 +96,6 @@ defmodule SSL.Protocol.ServerFlight do
                                 @certificate_extension_ids ++
                                 @certificate_request_extension_ids ++ [41, 43, 51]
                             )
-  @tls13_signature_schemes [
-    0x0403,
-    0x0503,
-    0x0603,
-    0x0804,
-    0x0805,
-    0x0806,
-    0x0807,
-    0x0808,
-    0x0809,
-    0x080A,
-    0x080B
-  ]
 
   @type decoded ::
           EncryptedExtensions.t()
@@ -394,7 +383,7 @@ defmodule SSL.Protocol.ServerFlight do
 
   defp validate_signature_scheme(signature_scheme, allowed_signature_schemes) do
     cond do
-      signature_scheme not in @tls13_signature_schemes ->
+      not Capabilities.tls13_signature_scheme?(signature_scheme) ->
         {:error, {:unsupported_signature_scheme, signature_scheme}}
 
       signature_scheme not in allowed_signature_schemes ->
@@ -686,7 +675,7 @@ defmodule SSL.Protocol.ServerFlight do
       max_signature_bytes: Keyword.get(opts, :max_signature_bytes, @default_max_signature_bytes),
       offered_extension_ids: Keyword.get(opts, :offered_extension_ids, []),
       allowed_signature_schemes:
-        Keyword.get(opts, :allowed_signature_schemes, @tls13_signature_schemes),
+        Keyword.get(opts, :allowed_signature_schemes, Capabilities.tls13_signature_ids()),
       hash: Keyword.get(opts, :hash, :sha256)
     }
 

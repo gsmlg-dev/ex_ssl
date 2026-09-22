@@ -1,6 +1,7 @@
 defmodule SSL.Options do
   @moduledoc false
   alias SSL.ClientHello.{Profile, WireProfile}
+  alias SSL.Capabilities
 
   @derive {Inspect, only: [:identity]}
   defstruct [
@@ -18,15 +19,6 @@ defmodule SSL.Options do
 
   @type t :: %__MODULE__{}
 
-  @capabilities %{
-    versions: [0x0304],
-    ciphers: [0x1301, 0x1302, 0x1303],
-    groups: [0x001D, 0x0017],
-    signature_algorithms: [0x0403, 0x0804, 0x0805, 0x0806],
-    psk_key_exchange_modes: [],
-    raw_extensions: [],
-    key_share_sizes: %{0x001D => 32, 0x0017 => 65}
-  }
   @keys [
     :mode,
     :active,
@@ -46,48 +38,17 @@ defmodule SSL.Options do
 
   @spec capabilities() :: map()
   def capabilities do
-    ciphers =
-      available_identifiers(
-        [
-          {0x1301, :tls_aes_128_gcm_sha256, :aes_128_gcm},
-          {0x1302, :tls_aes_256_gcm_sha384, :aes_256_gcm},
-          {0x1303, :tls_chacha20_poly1305_sha256, :chacha20_poly1305}
-        ],
-        :ciphers
-      )
-
-    groups =
-      available_identifiers(
-        [{0x001D, :x25519, :x25519}, {0x0017, :secp256r1, :secp256r1}],
-        :curves
-      )
-
-    signatures =
-      available_identifiers(
-        [
-          {0x0403, :ecdsa_secp256r1_sha256, :ecdsa},
-          {0x0804, :rsa_pss_rsae_sha256, :rsa},
-          {0x0805, :rsa_pss_rsae_sha384, :rsa},
-          {0x0806, :rsa_pss_rsae_sha512, :rsa}
-        ],
-        :public_keys
-      )
-
     %{
-      @capabilities
-      | versions: [0x0304, :tlsv1_3],
-        ciphers: ciphers,
-        groups: groups,
-        signature_algorithms: signatures
+      versions: [0x0304, :tlsv1_3],
+      ciphers: Capabilities.identifiers(:cipher_suite),
+      groups: Capabilities.identifiers(:group),
+      signature_algorithms: Capabilities.identifiers(:signature_algorithm),
+      certificate_signature_algorithms:
+        Capabilities.identifiers(:certificate_signature_algorithm),
+      psk_key_exchange_modes: [],
+      raw_extensions: [],
+      key_share_sizes: Capabilities.key_share_sizes()
     }
-  end
-
-  defp available_identifiers(identifiers, capability) do
-    available = :crypto.supports(capability)
-
-    Enum.flat_map(identifiers, fn {id, name, primitive} ->
-      if primitive in available, do: [id, name], else: []
-    end)
   end
 
   @spec normalize(term(), term()) :: {:ok, t()} | {:error, term()}

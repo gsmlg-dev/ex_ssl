@@ -453,12 +453,12 @@ defmodule SSL.Protocol.ServerFlightVerifier do
     end
   end
 
-  defp cipher_suite(0x1301), do: {:ok, :tls_aes_128_gcm_sha256, :sha256}
-  defp cipher_suite(0x1302), do: {:ok, :tls_aes_256_gcm_sha384, :sha384}
-  defp cipher_suite(0x1303), do: {:ok, :tls_chacha20_poly1305_sha256, :sha256}
-
-  defp cipher_suite(cipher_suite),
-    do: alert(:illegal_parameter, {:unsupported_cipher_suite, cipher_suite})
+  defp cipher_suite(cipher_suite) do
+    case SSL.Capabilities.resolve(:cipher_suite, cipher_suite) do
+      %{name: name, hash: hash} -> {:ok, name, hash}
+      nil -> alert(:illegal_parameter, {:unsupported_cipher_suite, cipher_suite})
+    end
+  end
 
   defp server_key_share(extensions), do: server_key_share(extensions, nil)
 
@@ -490,11 +490,12 @@ defmodule SSL.Protocol.ServerFlightVerifier do
   defp server_key_share(_improper_tail, _key_share),
     do: alert(:illegal_parameter, :malformed_server_hello_extensions)
 
-  defp bind_key_share_group(0x001D, :x25519), do: :ok
-  defp bind_key_share_group(0x0017, :secp256r1), do: :ok
-
-  defp bind_key_share_group(group, client_group),
-    do: alert(:illegal_parameter, {:key_share_group_mismatch, group, client_group})
+  defp bind_key_share_group(group, client_group) do
+    case SSL.Capabilities.resolve(:group, group) do
+      %{name: ^client_group} -> :ok
+      _ -> alert(:illegal_parameter, {:key_share_group_mismatch, group, client_group})
+    end
+  end
 
   defp derive_handshake_secrets(input, suite, hash, peer_public_key, transcript_prefix \\ nil) do
     with {:ok, shared_secret} <-

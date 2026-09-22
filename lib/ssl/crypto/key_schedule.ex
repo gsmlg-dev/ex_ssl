@@ -172,12 +172,12 @@ defmodule SSL.Crypto.KeySchedule do
   defp hash_length(:sha384), do: {:ok, 48}
   defp hash_length(_hash), do: {:error, :unsupported_hash}
 
-  defp cipher_suite_spec(:tls_aes_128_gcm_sha256), do: {:ok, :sha256, 16}
-  defp cipher_suite_spec(:tls_aes_256_gcm_sha384), do: {:ok, :sha384, 32}
-  defp cipher_suite_spec(:tls_chacha20_poly1305_sha256), do: {:ok, :sha256, 32}
-
-  defp cipher_suite_spec(cipher_suite),
-    do: {:error, {:unsupported_cipher_suite, cipher_suite}}
+  defp cipher_suite_spec(cipher_suite) do
+    case SSL.Capabilities.resolve(:cipher_suite, cipher_suite) do
+      %{hash: hash, key_length: length} -> {:ok, hash, length}
+      nil -> {:error, {:unsupported_cipher_suite, cipher_suite}}
+    end
+  end
 
   defp psk_input(nil, hash_length), do: {:ok, :binary.copy(<<0>>, hash_length)}
   defp psk_input(psk, _hash_length) when is_binary(psk), do: {:ok, psk}

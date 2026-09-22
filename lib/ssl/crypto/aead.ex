@@ -81,10 +81,12 @@ defmodule SSL.Crypto.AEAD do
     end
   end
 
-  defp cipher_spec(:tls_aes_128_gcm_sha256), do: {:ok, :aes_128_gcm, 16}
-  defp cipher_spec(:tls_aes_256_gcm_sha384), do: {:ok, :aes_256_gcm, 32}
-  defp cipher_spec(:tls_chacha20_poly1305_sha256), do: {:ok, :chacha20_poly1305, 32}
-  defp cipher_spec(cipher_suite), do: {:error, {:unsupported_cipher_suite, cipher_suite}}
+  defp cipher_spec(cipher_suite) do
+    case SSL.Capabilities.resolve(:cipher_suite, cipher_suite) do
+      %{cipher: cipher, key_length: length} -> {:ok, cipher, length}
+      nil -> {:error, {:unsupported_cipher_suite, cipher_suite}}
+    end
+  end
 
   defp validate_key(key, key_length) when is_binary(key) and byte_size(key) == key_length, do: :ok
 

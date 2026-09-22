@@ -7,6 +7,7 @@ defmodule SSL.ClientHello.Profile do
   """
 
   alias SSL.ClientHello.{GreasePolicy, RecordPolicy, WireProfile}
+  alias SSL.Capabilities
 
   @extension_ids %{
     server_name: 0,
@@ -23,7 +24,6 @@ defmodule SSL.ClientHello.Profile do
   }
 
   @typed_extension_ids Map.values(@extension_ids)
-  @known_key_share_sizes %{x25519: 32, secp256r1: 65}
 
   @typedoc "Capabilities the current TLS engine can safely advertise."
   @type capabilities :: %{
@@ -32,6 +32,7 @@ defmodule SSL.ClientHello.Profile do
           required(:groups) => [WireProfile.group()],
           optional(:raw_extensions) => [0..0xFFFF],
           optional(:signature_algorithms) => [atom() | 0..0xFFFF],
+          optional(:certificate_signature_algorithms) => [atom() | 0..0xFFFF],
           optional(:psk_key_exchange_modes) => [atom() | 0..0xFF],
           optional(:key_share_sizes) => %{optional(WireProfile.group()) => pos_integer()}
         }
@@ -65,6 +66,8 @@ defmodule SSL.ClientHello.Profile do
          :ok <- require_capability_list(capabilities, :ciphers),
          :ok <- require_capability_list(capabilities, :groups),
          :ok <- validate_optional_capability_list(capabilities, :signature_algorithms),
+         :ok <-
+           validate_optional_capability_list(capabilities, :certificate_signature_algorithms),
          :ok <- validate_optional_capability_list(capabilities, :psk_key_exchange_modes),
          :ok <- validate_raw_extension_capability(capabilities),
          :ok <- validate_key_share_size_capability(capabilities) do
@@ -386,18 +389,30 @@ defmodule SSL.ClientHello.Profile do
   end
 
   defp validate_signature_algorithms(extensions, capabilities) do
-    algorithms =
+    handshake =
       Enum.flat_map(extensions, fn
         {:signature_algorithms, algorithms} -> algorithms
+        _extension -> []
+      end)
+
+    certificates =
+      Enum.flat_map(extensions, fn
         {:signature_algorithms_cert, algorithms} -> algorithms
         _extension -> []
       end)
 
-    reject_unsupported(
-      without_grease(algorithms),
-      Map.get(capabilities, :signature_algorithms, []),
-      :unsupported_signature_algorithms
-    )
+    with :ok <-
+           reject_unsupported(
+             without_grease(handshake),
+             Map.get(capabilities, :signature_algorithms, []),
+             :unsupported_signature_algorithms
+           ) do
+      reject_unsupported(
+        without_grease(certificates),
+        Map.get(capabilities, :certificate_signature_algorithms, []),
+        :unsupported_certificate_signature_algorithms
+      )
+    end
   end
 
   defp validate_psk_modes(extensions, capabilities) do
@@ -557,7 +572,7 @@ defmodule SSL.ClientHello.Profile do
   defp key_share_size(group, capabilities) do
     capabilities
     |> Map.get(:key_share_sizes, %{})
-    |> Map.get(group, Map.get(@known_key_share_sizes, group))
+    |> Map.get(group, Map.get(Capabilities.key_share_sizes(), group))
   end
 
   defp without_grease(values), do: Enum.reject(values, &match?({:grease, _slot}, &1))

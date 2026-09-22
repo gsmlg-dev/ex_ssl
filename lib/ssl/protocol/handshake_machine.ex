@@ -416,9 +416,13 @@ defmodule SSL.Protocol.HandshakeMachine do
   end
 
   defp retry_key_pair(nil, pair), do: {:ok, pair}
-  defp retry_key_pair(0x001D, _pair), do: KeyExchange.generate(:x25519)
-  defp retry_key_pair(0x0017, _pair), do: KeyExchange.generate(:secp256r1)
-  defp retry_key_pair(group, _pair), do: {:error, {:unsupported_selected_group, group}}
+
+  defp retry_key_pair(group, _pair) do
+    case SSL.Capabilities.resolve(:group, group) do
+      %{name: name} -> KeyExchange.generate(name)
+      nil -> {:error, {:unsupported_selected_group, group}}
+    end
+  end
 
   defp retry_key_pairs(key_pairs, hrr, pair) do
     if Enum.any?(hrr.extensions, &match?({:selected_group, _}, &1)),
@@ -624,14 +628,16 @@ defmodule SSL.Protocol.HandshakeMachine do
   defp start_verifier(input, options, transcript),
     do: ServerFlightVerifier.start_incremental(input, options, transcript)
 
-  defp suite(0x1301), do: {:ok, :tls_aes_128_gcm_sha256, :sha256}
-  defp suite(0x1302), do: {:ok, :tls_aes_256_gcm_sha384, :sha384}
-  defp suite(0x1303), do: {:ok, :tls_chacha20_poly1305_sha256, :sha256}
-  defp suite(value), do: {:error, {:unsupported_cipher_suite, value}}
-  defp hash_for(%{cipher_suite: :tls_aes_256_gcm_sha384}), do: :sha384
-  defp hash_for(_), do: :sha256
-  defp group_id(:x25519), do: 0x001D
-  defp group_id(:secp256r1), do: 0x0017
+  defp suite(value) do
+    case SSL.Capabilities.resolve(:cipher_suite, value) do
+      %{name: name, hash: hash} -> {:ok, name, hash}
+      nil -> {:error, {:unsupported_cipher_suite, value}}
+    end
+  end
+
+  defp hash_for(%{cipher_suite: suite}), do: SSL.Capabilities.resolve(:cipher_suite, suite).hash
+  defp group_id(group), do: SSL.Capabilities.resolve(:group, group).id
+
   defp validate_identity({:dns_id, name}) when is_binary(name), do: :ok
   defp validate_identity({:ip, _}), do: :ok
   defp validate_identity(_), do: {:error, :invalid_identity}

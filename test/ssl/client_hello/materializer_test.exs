@@ -48,6 +48,7 @@ defmodule SSL.ClientHello.MaterializerTest do
       ciphers: [0x1301],
       groups: [:x25519],
       signature_algorithms: [:ecdsa_secp256r1_sha256, :rsa_pss_rsae_sha256, 0x0403],
+      certificate_signature_algorithms: [0x0403],
       psk_key_exchange_modes: [:psk_dhe_ke],
       raw_extensions: [0xFE0D]
     }

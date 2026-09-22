@@ -353,7 +353,7 @@ defmodule SSL.Protocol.ServerHello do
       cipher_suite not in offered_ciphers ->
         {:error, {:cipher_not_offered, cipher_suite}}
 
-      cipher_suite not in [0x1301, 0x1302, 0x1303] ->
+      cipher_suite not in SSL.Capabilities.identifiers(:cipher_suite) ->
         {:error, {:unsupported_selected_cipher, cipher_suite}}
 
       true ->
@@ -364,13 +364,11 @@ defmodule SSL.Protocol.ServerHello do
   defp require_compression(0), do: :ok
   defp require_compression(method), do: {:error, {:invalid_compression_method, method}}
 
-  defp require_implemented_group(group) when group in [0x001D, 0x0017], do: :ok
-
   defp require_implemented_group(group) do
-    if grease?(group) do
-      {:error, {:grease_selected, :group, group}}
-    else
-      {:error, {:unsupported_selected_group, group}}
+    cond do
+      group in SSL.Capabilities.identifiers(:group) -> :ok
+      grease?(group) -> {:error, {:grease_selected, :group, group}}
+      true -> {:error, {:unsupported_selected_group, group}}
     end
   end
 
@@ -382,12 +380,16 @@ defmodule SSL.Protocol.ServerHello do
     end
   end
 
-  defp validate_key_exchange(0x001D, key_exchange) when byte_size(key_exchange) == 32, do: :ok
+  defp validate_key_exchange(group, key_exchange) do
+    capability = SSL.Capabilities.resolve(:group, group)
+    valid_encoding = capability.share_encoding == :raw or match?(<<4, _::binary>>, key_exchange)
 
-  defp validate_key_exchange(0x0017, <<4, _coordinates::binary-size(64)>>), do: :ok
-
-  defp validate_key_exchange(group, key_exchange),
-    do: {:error, {:invalid_key_exchange, group, byte_size(key_exchange)}}
+    if byte_size(key_exchange) == capability.share_size and valid_encoding do
+      :ok
+    else
+      {:error, {:invalid_key_exchange, group, byte_size(key_exchange)}}
+    end
+  end
 
   defp message_kind(@hello_retry_request_random), do: :hello_retry_request
   defp message_kind(_random), do: :server_hello

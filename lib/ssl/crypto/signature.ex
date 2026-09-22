@@ -8,7 +8,7 @@ defmodule SSL.Crypto.Signature do
 
   @server_context "TLS 1.3, server CertificateVerify"
   @space_prefix :binary.copy(<<0x20>>, 64)
-  @secp256r1_oid {1, 2, 840, 10_045, 3, 1, 7}
+  alias SSL.Capabilities
   @secp384r1_oid {1, 3, 132, 0, 34}
 
   @type signature_scheme :: 0x0403 | 0x0804 | 0x0805 | 0x0806
@@ -41,58 +41,49 @@ defmodule SSL.Crypto.Signature do
         transcript_digest,
         signature
       ) do
-    with {:ok, key_type, signature_hash, verify_options} <- signature_scheme(signature_scheme),
+    with {:ok, scheme} <- signature_scheme(signature_scheme),
          {:ok, signed_content} <-
            server_signed_content(transcript_hash_algorithm, transcript_digest),
          :ok <- validate_signature(signature),
-         :ok <- validate_public_key(key_type, public_key) do
-      verify(signed_content, signature_hash, signature, public_key, verify_options)
+         :ok <- validate_public_key(scheme, public_key) do
+      verify(signed_content, scheme.hash, signature, public_key, scheme.verify_options)
     end
   end
 
-  defp signature_scheme(0x0403), do: {:ok, :ecdsa, :sha256, []}
+  defp signature_scheme(value) do
+    case Capabilities.signature(value) do
+      %{id: ^value} = scheme ->
+        if value in Capabilities.identifiers(:signature_algorithm),
+          do: {:ok, scheme},
+          else: {:error, {:unsupported_signature_scheme, value}}
 
-  defp signature_scheme(0x0804),
-    do: {:ok, :rsa, :sha256, rsa_pss_options(:sha256, 32)}
-
-  defp signature_scheme(0x0805),
-    do: {:ok, :rsa, :sha384, rsa_pss_options(:sha384, 48)}
-
-  defp signature_scheme(0x0806),
-    do: {:ok, :rsa, :sha512, rsa_pss_options(:sha512, 64)}
-
-  defp signature_scheme(signature_scheme),
-    do: {:error, {:unsupported_signature_scheme, signature_scheme}}
-
-  defp rsa_pss_options(hash, salt_length) do
-    [
-      {:rsa_padding, :rsa_pkcs1_pss_padding},
-      {:rsa_pss_saltlen, salt_length},
-      {:rsa_mgf1_md, hash}
-    ]
+      _ ->
+        {:error, {:unsupported_signature_scheme, value}}
+    end
   end
 
   defp validate_public_key(
-         :ecdsa,
-         {{:ECPoint, <<4, _coordinates::binary-size(64)>>}, {:namedCurve, @secp256r1_oid}}
-       ),
+         %{key: :ecdsa, curve_oid: oid, public_key_size: size},
+         {{:ECPoint, <<4, _coordinates::binary>> = point}, {:namedCurve, oid}}
+       )
+       when byte_size(point) == size,
        do: :ok
 
-  defp validate_public_key(:ecdsa, {{:ECPoint, _point}, {:namedCurve, @secp384r1_oid}}),
+  defp validate_public_key(%{key: :ecdsa}, {{:ECPoint, _point}, {:namedCurve, @secp384r1_oid}}),
     do: {:error, {:unsupported_ec_curve, :secp384r1}}
 
-  defp validate_public_key(:ecdsa, {{:ECPoint, _point}, {:namedCurve, oid}}),
+  defp validate_public_key(%{key: :ecdsa}, {{:ECPoint, _point}, {:namedCurve, oid}}),
     do: {:error, {:unsupported_ec_curve, oid}}
 
-  defp validate_public_key(:ecdsa, {:RSAPublicKey, modulus, exponent})
+  defp validate_public_key(%{key: :ecdsa}, {:RSAPublicKey, modulus, exponent})
        when is_integer(modulus) and is_integer(exponent),
        do: {:error, {:key_type_mismatch, :ecdsa}}
 
-  defp validate_public_key(:rsa, {:RSAPublicKey, modulus, exponent})
+  defp validate_public_key(%{key: :rsa}, {:RSAPublicKey, modulus, exponent})
        when is_integer(modulus) and modulus > 0 and is_integer(exponent) and exponent > 0,
        do: :ok
 
-  defp validate_public_key(:rsa, {{:ECPoint, _point}, {:namedCurve, _oid}}),
+  defp validate_public_key(%{key: :rsa}, {{:ECPoint, _point}, {:namedCurve, _oid}}),
     do: {:error, {:key_type_mismatch, :rsa}}
 
   defp validate_public_key(_key_type, _public_key), do: {:error, :invalid_public_key}

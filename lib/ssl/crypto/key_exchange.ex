@@ -21,6 +21,7 @@ defmodule SSL.Crypto.KeyExchange do
   end
 
   alias __MODULE__.KeyPair
+  alias SSL.Capabilities
 
   @type group :: KeyPair.group()
   @type error_reason ::
@@ -33,11 +34,7 @@ defmodule SSL.Crypto.KeyExchange do
           | :invalid_key_pair
 
   @spec supported?(term()) :: boolean()
-  def supported?(group) when group in [:x25519, :secp256r1] do
-    group in :crypto.supports(:curves) and :ecdh in :crypto.supports(:public_keys)
-  end
-
-  def supported?(_group), do: false
+  def supported?(group), do: group in Capabilities.identifiers(:group)
 
   @spec generate(term()) :: {:ok, KeyPair.t()} | {:error, error_reason()}
   def generate(group) when group in [:x25519, :secp256r1] do

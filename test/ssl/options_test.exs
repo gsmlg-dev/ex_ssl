@@ -175,6 +175,18 @@ defmodule SSL.OptionsTest do
              )
   end
 
+  test "rejects explicit certificate signature policy until chain enforcement exists" do
+    assert {:ok, %{profile: profile}} = SSL.Options.normalize("mail.example", [])
+
+    profile = %{
+      profile
+      | extensions: profile.extensions ++ [{:signature_algorithms_cert, [0x0403]}]
+    }
+
+    assert {:error, {:options, {:ex_ssl, :unsupported_profile}}} =
+             SSL.Options.normalize("mail.example", ex_ssl: [profile: profile])
+  end
+
   defp default_profile_with_alpn(protocols) do
     assert {:ok, %{profile: profile}} = SSL.Options.normalize("mail.example", [])
 
