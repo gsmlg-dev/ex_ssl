@@ -69,13 +69,14 @@ defmodule SSL.Crypto.KeyExchangeTest do
     end
   end
 
-  test "reports only the two supported groups" do
+  test "reports only implemented groups" do
     curves = :crypto.supports(:curves)
     public_keys = :crypto.supports(:public_keys)
     runtime_has_ecdh = :ecdh in public_keys
 
     assert KeyExchange.supported?(:x25519) == (:x25519 in curves and runtime_has_ecdh)
     assert KeyExchange.supported?(:secp256r1) == (:secp256r1 in curves and runtime_has_ecdh)
+    assert KeyExchange.supported?(:secp384r1) == (:secp384r1 in curves and runtime_has_ecdh)
     refute KeyExchange.supported?(:x448)
     refute KeyExchange.supported?(:unknown)
     refute KeyExchange.supported?(nil)

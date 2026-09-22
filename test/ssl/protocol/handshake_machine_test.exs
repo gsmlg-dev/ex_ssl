@@ -290,6 +290,52 @@ defmodule SSL.Protocol.HandshakeMachineTest do
     assert Enum.at(retried.client_ast.extensions, 0) == groups
   end
 
+  test "P384 HelloRetryRequest preserves fields and rejects repeated retry" do
+    {:ok, first_pair} = KeyExchange.generate(:x25519)
+    {:ok, groups} = Extension.encode({:supported_groups, [0x001D, 0x0018]})
+    {:ok, versions} = Extension.encode({:supported_versions, [0x0304]})
+    {:ok, shares} = Extension.encode({:key_share, [{0x001D, first_pair.public_key}]})
+
+    ast = %AST{
+      legacy_version: 0x0303,
+      random: <<7::256>>,
+      session_id: <<8, 9>>,
+      cipher_suites: [0x1301],
+      compression_methods: [0],
+      extensions: [groups, versions, shares]
+    }
+
+    materialized = %Materialized{client_hello: ast, key_pairs: [first_pair]}
+
+    assert {:ok, machine, [_]} =
+             HandshakeMachine.init(
+               materialized,
+               [@capture.client_public],
+               {:dns_id, "example.test"}
+             )
+
+    hrr_random =
+      Base.decode16!("CF21AD74E59A6111BE1D8C021E65B891C2A211167ABB8C5E079E09E2C8A8339C")
+
+    hrr =
+      hello(hrr_random, ast.session_id, 0x1301, [
+        extension(43, <<0x0304::16>>),
+        extension(51, <<0x0018::16>>)
+      ])
+
+    assert {:ok, retried, [record], []} = HandshakeMachine.feed(machine, plaintext_record(hrr))
+    <<22, 3, 3, _::16, client_hello2::binary>> = record
+    assert {:ok, offer} = ClientOffer.from_client_hello(client_hello2)
+    assert [%{group: 0x0018, key_exchange: second_public}] = offer.key_shares
+    assert byte_size(second_public) == 97
+    refute second_public == first_pair.public_key
+    assert {:error, _} = HandshakeMachine.feed(retried, plaintext_record(hrr))
+    assert retried.client_ast.random == ast.random
+    assert retried.client_ast.session_id == ast.session_id
+    assert retried.client_ast.cipher_suites == ast.cipher_suites
+    assert Enum.at(retried.client_ast.extensions, 0) == groups
+  end
+
   test "fragments a large ClientHello and incrementally frames ServerHello" do
     {:ok, pair} = KeyExchange.generate(:x25519)
     {:ok, versions} = Extension.encode({:supported_versions, [0x0304]})

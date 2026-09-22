@@ -30,9 +30,9 @@ have not been executed locally.
 | P0.1 consumer inventory | http_fetch `690258a` | verified | Inventory in consumer `docs/ex-ssl-consumer-contract.md`; implemented, deliberately unsupported, missing, and QUIC/test-only surfaces separated. |
 | P0.2 deterministic closure | http_fetch `b4414db7d9061c8892483e3bd632aa384a03ac70` | verified | Existing closure and early-response fixes preserved; missing Content-Length, exact-once completion, frame/header bounds fixed. Final seed25:442 tests+20 doctests, zero failures; independent review approved. |
 | P0.3 consumer boundary | both bases above | verified | Root-scoped baseline: 422 tests + 20 doctests, zero failures. ex_ssl transport contract: 31 integration tests; interoperability: 15 integration tests, zero failures. |
-| P1.1 capability registry | ex_ssl (registry commit following `2942433`) | verified | Runtime-filtered registry, separate certificate-chain policy, registry-backed group/cipher negotiation and AEAD. Seed30: 292 tests +13 properties, zero failures. |
-| P1.2 algorithm expansion | ex_ssl `0f16c2c` | not_started | P-384, Ed25519, restricted RSA-PSS. |
-| P1.3 negotiation evidence | both | not_started | Independent positive/negative handshakes and HTTP. |
+| P1.1 capability registry | ex_ssl `0175097` | verified | Runtime-filtered registry, separate certificate-chain policy, registry-backed group/cipher negotiation and AEAD. Seed30: 292 tests +13 properties, zero failures. |
+| P1.2 algorithm expansion | ex_ssl (expansion commit following `0175097`) | verified | P-384 ECDHE/ECDSA, Ed25519, RSA-PSS-PSS; independent vectors, negatives and constrained peers. |
+| P1.3 negotiation evidence | ex_ssl expansion, http_fetch `93efee0` | verified | 327 library tests+15 properties; 12 external-candidate tests cover10 HTTP exchanges+5 identity negatives, zero failures. Other CI runtime tuples pending. |
 | P2.1 identity loading | ex_ssl | not_started | Bounded and redacted client credentials. |
 | P2.2 client authentication | ex_ssl | not_started | Client Certificate/CertificateVerify flight. |
 | P2.3 HTTP mTLS | both | not_started | Origin scope and required/optional auth. |
@@ -150,3 +150,43 @@ No new algorithm or changed backend/version default in this commit.
 
 Next incomplete task: P1.2 algorithm expansion, followed by P1.3 independent
 negotiation and HTTP evidence. Later phases remain unimplemented.
+
+### P1.2 / P1.3 expanded algorithms
+
+Implemented P-384 ECDHE and ECDSA, Ed25519, RSA-PSS-PSS SHA256/384/512.
+Leaf OIDs and restricted PSS parameters remain distinct from unrestricted RSA.
+Internal client signing uses a separate context; mTLS options/flight are still
+unimplemented. Independent review approved the group and signature changes.
+
+- P384 initial unit regressions: 4 tests, 4 failures. First implementation run:
+  71 tests +3 properties, 1 failure exposing provider reduction of an out-of-range
+  scalar; explicit P384 scalar-range check fixed it.
+- P384 peer fixture initially requested unavailable OTP TLS1.3 `selected_group`,
+  then pre-TLS1.3 `ecc` diagnostic; both two-test runs failed. Final fixture
+  constrains the peer to P384 and proves a complete HTTP exchange instead.
+- P384 seed34: 190 tests +13 properties, zero failures; includes direct and HRR
+  HTTP exchanges, exact response length, connection death and listener cleanup.
+- Signature focused final: 21 tests, zero failures; OpenSSL-generated independent
+  signatures, client signing verified with OpenSSL, role/context isolation,
+  wrong keys/curves/DER/PSS parameters, and five constrained OTP HTTP exchanges.
+  Earlier adjacent run had one stale pre-expansion capability expectation; fixed.
+- Final library command: `mix test test/ssl/capabilities_test.exs
+  test/ssl/options_test.exs test/ssl/client_hello test/ssl/crypto test/ssl/pkix
+  test/ssl/protocol test/ssl/connection_interop_test.exs
+  test/ssl/http_fetch_transport_contract_test.exs test/ssl/p384_interop_test.exs
+  --include integration --seed 37` — **327 tests +15 properties, zero failures**,
+  no exclusions. Dev/test strict compilation and formatting passed.
+- Required interoperability workflow now explicitly includes both new integration
+  suites; it cannot silently omit all new algorithm tests. Remote CI not run.
+- Consumer `EX_SSL_SOURCE_DIR=/home/gao/Workspace/gsmlg-dev/ex_ssl/.trees/tls-backend-plan
+  bash scripts/ex_ssl_source_smoke.sh` — exit0, **12 tests, zero failures**, seed36.
+  Builds fresh http_core/http_fetch packages, overrides ex_ssl only in a temporary
+  isolated consumer, preserves locked quic1.6.5/telemetry1.3.0. Ten positive
+  requests cover all five signatures over HTTP1.1+P384 HRR and HTTP2+direct P384;
+  five hostname failures remain failures, OTP default is asserted. Initial two
+  fixture runs had five HTTP2 failures: the request omitted `http_version: :http2`.
+  Correcting explicit HTTP mode/ALPN (and peer SETTINGS-ACK barrier) resolved it;
+  no production transport change. Log `/tmp/http-fetch-tls-plan-algorithms.log`.
+
+Next incomplete task: P2.1 bounded client identity loading. Phases2–5 are not
+implemented; local gates do not imply full OTP parity or runtime-matrix coverage.

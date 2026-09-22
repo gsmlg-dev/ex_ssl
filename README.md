@@ -168,9 +168,14 @@ Initial target groups:
 ```text
 X25519
 secp256r1
+secp384r1
 ```
 
-Runtime support depends on the crypto provider available to OTP.
+Runtime support depends on the crypto provider available to OTP. Implemented
+TLS 1.3 handshake signatures are P-256/P-384 ECDSA, Ed25519, and RSA-PSS-RSAE /
+RSA-PSS-PSS SHA-256/384/512, with strict key and parameter checks. See
+[the compatibility matrix](docs/COMPATIBILITY.md) for the bounded subset; client
+certificates and TLS 1.2 remain future phases.
 
 ## Architecture
 

@@ -176,3 +176,14 @@ HTTP/2:
 Consumer tests establish the tested HTTP integration subset. The ex_ssl
 fixture separately establishes the transport lifecycle contract. Neither suite
 establishes full OTP parity, release readiness, or all server/runtime combinations.
+
+## Candidate algorithm validation
+
+The Phase 1 source candidate adds P-384 ECDHE/ECDSA, Ed25519, and
+RSA-PSS-PSS SHA-256/384/512. These changes are not in the published 0.3.0
+dependency. The consumer's `scripts/ex_ssl_source_smoke.sh` builds fresh HTTP
+package artifacts and uses an explicit `EX_SSL_SOURCE_DIR` override only in a
+temporary consumer project. It tests every new signature over HTTP/1.1 with
+P-384 HRR and HTTP/2 with a direct P-384 share, plus hostname rejection. The
+separate `external_consumer_smoke.sh` validates released dependency metadata
+without that override. No installed dependency sources are modified.

@@ -333,7 +333,7 @@ defmodule SSL.Protocol.ServerHelloTest do
     assert {:error, {:selected_group_not_offered, :key_share, 0x001D}} =
              ServerHello.decode(@server_hello, not_offered)
 
-    for group <- [0x0018, 0x0A0A] do
+    for group <- [0x0019, 0x0A0A] do
       expectations = %{
         @expectations
         | offered_groups: [group],
@@ -390,10 +390,10 @@ defmodule SSL.Protocol.ServerHelloTest do
                %{@expectations | offered_groups: [0x001D]}
              )
 
-    assert {:error, {:unsupported_selected_group, 0x0018}} =
+    assert {:error, {:unsupported_selected_group, 0x0019}} =
              ServerHello.decode(
-               hello(random: @hrr_random, extensions: [version, extension(51, <<0x0018::16>>)]),
-               %{@expectations | offered_groups: [0x0018], offered_key_share_groups: []}
+               hello(random: @hrr_random, extensions: [version, extension(51, <<0x0019::16>>)]),
+               %{@expectations | offered_groups: [0x0019], offered_key_share_groups: []}
              )
   end
 

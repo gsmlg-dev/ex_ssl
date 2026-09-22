@@ -12,8 +12,8 @@ defmodule SSL.CapabilitiesTest do
   test "exposes only complete TLS 1.3 handshake primitives in wire order" do
     runtime = %{
       ciphers: [:aes_128_gcm, :aes_256_gcm, :chacha20_poly1305],
-      curves: [:x25519, :secp256r1],
-      public_keys: [:ecdh, :ecdsa, :rsa],
+      curves: [:x25519, :secp256r1, :secp384r1, :ed25519],
+      public_keys: [:ecdh, :ecdsa, :rsa, :eddsa],
       hashs: [:sha256, :sha384, :sha512],
       macs: [:hmac],
       rsa_opts: [:rsa_pkcs1_pss_padding, :rsa_pss_saltlen, :rsa_mgf1_md]
@@ -23,16 +23,26 @@ defmodule SSL.CapabilitiesTest do
              [
                0x0403,
                :ecdsa_secp256r1_sha256,
+               0x0503,
+               :ecdsa_secp384r1_sha384,
                0x0804,
                :rsa_pss_rsae_sha256,
                0x0805,
                :rsa_pss_rsae_sha384,
                0x0806,
-               :rsa_pss_rsae_sha512
+               :rsa_pss_rsae_sha512,
+               0x0807,
+               :ed25519,
+               0x0809,
+               :rsa_pss_pss_sha256,
+               0x080A,
+               :rsa_pss_pss_sha384,
+               0x080B,
+               :rsa_pss_pss_sha512
              ]
 
     assert Capabilities.identifiers(:group, runtime) ==
-             [0x001D, :x25519, 0x0017, :secp256r1]
+             [0x001D, :x25519, 0x0017, :secp256r1, 0x0018, :secp384r1]
 
     assert Capabilities.signature(0x0805).verify_options ==
              [rsa_padding: :rsa_pkcs1_pss_padding, rsa_pss_saltlen: 48, rsa_mgf1_md: :sha384]

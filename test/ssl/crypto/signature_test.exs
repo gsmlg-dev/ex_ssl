@@ -132,7 +132,7 @@ defmodule SSL.Crypto.SignatureTest do
     assert {:error, :invalid_certificate_verify} =
              Signature.verify_server(0x0403, key, :sha256, :binary.copy(<<0>>, 32), signature)
 
-    assert {:error, :invalid_certificate_verify} =
+    assert {:error, :invalid_ecdsa_signature_encoding} =
              Signature.verify_server(
                0x0403,
                key,
@@ -173,8 +173,8 @@ defmodule SSL.Crypto.SignatureTest do
   test "rejects unsupported schemes and malformed arbitrary terms" do
     ec_key = public_key(@ec_public_pem)
 
-    assert {:error, {:unsupported_signature_scheme, 0x0807}} =
-             Signature.verify_server(0x0807, ec_key, :sha256, sequence(32), <<1>>)
+    assert {:error, {:unsupported_signature_scheme, 0x0808}} =
+             Signature.verify_server(0x0808, ec_key, :sha256, sequence(32), <<1>>)
 
     assert {:error, {:unsupported_signature_scheme, nil}} =
              Signature.verify_server(nil, ec_key, :sha256, sequence(32), <<1>>)

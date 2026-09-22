@@ -365,15 +365,18 @@ defmodule SSL.ClientHello.Materializer do
     end
   end
 
-  defp validate_generated_key_pair(%KeyPair{group: :x25519, public_key: public_key}, :x25519)
-       when is_binary(public_key) and byte_size(public_key) == 32,
-       do: :ok
+  defp validate_generated_key_pair(%KeyPair{group: group, public_key: public_key}, group)
+       when is_binary(public_key) do
+    case SSL.Capabilities.resolve(:group, group) do
+      %{share_size: size, share_encoding: encoding} when byte_size(public_key) == size ->
+        if encoding == :raw or match?(<<4, _::binary>>, public_key),
+          do: :ok,
+          else: {:error, {:invalid_generated_key_share, group}}
 
-  defp validate_generated_key_pair(
-         %KeyPair{group: :secp256r1, public_key: <<4, _::binary-size(64)>>},
-         :secp256r1
-       ),
-       do: :ok
+      _ ->
+        {:error, {:invalid_generated_key_share, group}}
+    end
+  end
 
   defp validate_generated_key_pair(_key_pair, group),
     do: {:error, {:invalid_generated_key_share, group}}

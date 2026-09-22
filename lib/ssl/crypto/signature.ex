@@ -7,11 +7,18 @@ defmodule SSL.Crypto.Signature do
   """
 
   @server_context "TLS 1.3, server CertificateVerify"
+  @client_context "TLS 1.3, client CertificateVerify"
   @space_prefix :binary.copy(<<0x20>>, 64)
   alias SSL.Capabilities
-  @secp384r1_oid {1, 3, 132, 0, 34}
+  @rsa_pss_oid {1, 2, 840, 113_549, 1, 1, 10}
+  @mgf1_oid {1, 2, 840, 113_549, 1, 1, 8}
+  @hash_oids %{
+    sha256: {2, 16, 840, 1, 101, 3, 4, 2, 1},
+    sha384: {2, 16, 840, 1, 101, 3, 4, 2, 2},
+    sha512: {2, 16, 840, 1, 101, 3, 4, 2, 3}
+  }
 
-  @type signature_scheme :: 0x0403 | 0x0804 | 0x0805 | 0x0806
+  @type signature_scheme :: 0x0403 | 0x0503 | 0x0804..0x0807 | 0x0809..0x080B
   @type error_reason ::
           :unsupported_hash
           | :invalid_certificate_verify
@@ -21,15 +28,30 @@ defmodule SSL.Crypto.Signature do
           | {:unsupported_signature_scheme, term()}
           | {:invalid_input, :transcript_hash | :signature}
           | {:invalid_transcript_hash_length, pos_integer()}
-          | {:key_type_mismatch, :ecdsa | :rsa}
+          | {:key_type_mismatch, :ecdsa | :rsa | :rsa_pss | :eddsa}
           | {:unsupported_ec_curve, atom() | tuple()}
+          | :invalid_ecdsa_signature_encoding
+          | :invalid_rsa_pss_parameters
 
   @spec server_signed_content(atom(), term()) ::
           {:ok, binary()} | {:error, error_reason()}
   def server_signed_content(hash, transcript_hash) do
+    signed_content(:server, hash, transcript_hash)
+  end
+
+  @spec client_signed_content(atom(), term()) ::
+          {:ok, binary()} | {:error, error_reason()}
+  def client_signed_content(hash, transcript_hash) do
+    signed_content(:client, hash, transcript_hash)
+  end
+
+  @spec signed_content(:server | :client, atom(), term()) ::
+          {:ok, binary()} | {:error, error_reason()}
+  def signed_content(role, hash, transcript_hash) when role in [:server, :client] do
     with {:ok, hash_length} <- hash_length(hash),
          :ok <- validate_transcript_hash(transcript_hash, hash_length) do
-      {:ok, <<@space_prefix::binary, @server_context::binary, 0, transcript_hash::binary>>}
+      context = if role == :server, do: @server_context, else: @client_context
+      {:ok, <<@space_prefix::binary, context::binary, 0, transcript_hash::binary>>}
     end
   end
 
@@ -45,8 +67,23 @@ defmodule SSL.Crypto.Signature do
          {:ok, signed_content} <-
            server_signed_content(transcript_hash_algorithm, transcript_digest),
          :ok <- validate_signature(signature),
-         :ok <- validate_public_key(scheme, public_key) do
-      verify(signed_content, scheme.hash, signature, public_key, scheme.verify_options)
+         {:ok, verification_key} <- validate_public_key(scheme, public_key),
+         :ok <- validate_signature_encoding(scheme, signature) do
+      verify(signed_content, scheme.hash, signature, verification_key, scheme.verify_options)
+    end
+  end
+
+  @spec sign_client(term(), term(), atom(), term()) ::
+          {:ok, binary()} | {:error, error_reason()}
+  def sign_client(signature_scheme, private_key, transcript_hash_algorithm, transcript_digest) do
+    with {:ok, scheme} <- signature_scheme(signature_scheme),
+         {:ok, content} <- client_signed_content(transcript_hash_algorithm, transcript_digest),
+         {:ok, signing_key} <- validate_private_key(scheme, private_key) do
+      try do
+        {:ok, :public_key.sign(content, scheme.hash, signing_key, scheme.verify_options)}
+      catch
+        :error, _reason -> {:error, :signature_verification_failed}
+      end
     end
   end
 
@@ -67,10 +104,20 @@ defmodule SSL.Crypto.Signature do
          {{:ECPoint, <<4, _coordinates::binary>> = point}, {:namedCurve, oid}}
        )
        when byte_size(point) == size,
-       do: :ok
+       do: {:ok, {{:ECPoint, point}, {:namedCurve, oid}}}
 
-  defp validate_public_key(%{key: :ecdsa}, {{:ECPoint, _point}, {:namedCurve, @secp384r1_oid}}),
-    do: {:error, {:unsupported_ec_curve, :secp384r1}}
+  defp validate_public_key(
+         %{key: :ecdsa, curve_oid: expected},
+         {{:ECPoint, _point}, {:namedCurve, oid}}
+       )
+       when oid == expected,
+       do: {:error, :invalid_public_key}
+
+  defp validate_public_key(
+         %{key: :ecdsa},
+         {{:ECPoint, _point}, {:namedCurve, {1, 3, 132, 0, 34}}}
+       ),
+       do: {:error, {:unsupported_ec_curve, :secp384r1}}
 
   defp validate_public_key(%{key: :ecdsa}, {{:ECPoint, _point}, {:namedCurve, oid}}),
     do: {:error, {:unsupported_ec_curve, oid}}
@@ -79,14 +126,116 @@ defmodule SSL.Crypto.Signature do
        when is_integer(modulus) and is_integer(exponent),
        do: {:error, {:key_type_mismatch, :ecdsa}}
 
-  defp validate_public_key(%{key: :rsa}, {:RSAPublicKey, modulus, exponent})
+  defp validate_public_key(%{key: :rsa}, {:RSAPublicKey, modulus, exponent} = key)
        when is_integer(modulus) and modulus > 0 and is_integer(exponent) and exponent > 0,
-       do: :ok
+       do: {:ok, key}
 
-  defp validate_public_key(%{key: :rsa}, {{:ECPoint, _point}, {:namedCurve, _oid}}),
+  defp validate_public_key(
+         %{key: :rsa_pss, hash: hash, verify_options: options},
+         {@rsa_pss_oid, {:RSAPublicKey, modulus, exponent} = key, parameters}
+       )
+       when is_integer(modulus) and modulus > 0 and is_integer(exponent) and exponent > 0 do
+    if valid_pss_parameters?(parameters, hash, options),
+      do: {:ok, key},
+      else: {:error, :invalid_rsa_pss_parameters}
+  end
+
+  defp validate_public_key(
+         %{key: :eddsa, curve_oid: oid, public_key_size: size},
+         {oid, {:ECPoint, point}, {:namedCurve, oid}} = key
+       )
+       when is_binary(point) and byte_size(point) == size,
+       do: {:ok, {elem(key, 1), elem(key, 2)}}
+
+  defp validate_public_key(%{key: :eddsa}, {_, {:ECPoint, _}, _}),
+    do: {:error, {:key_type_mismatch, :eddsa}}
+
+  defp validate_public_key(%{key: :rsa_pss}, {:RSAPublicKey, _, _}),
+    do: {:error, {:key_type_mismatch, :rsa_pss}}
+
+  defp validate_public_key(%{key: :rsa}, {@rsa_pss_oid, _, _}),
     do: {:error, {:key_type_mismatch, :rsa}}
 
+  defp validate_public_key(%{key: key}, {{:ECPoint, _point}, {:namedCurve, _oid}})
+       when key in [:rsa, :rsa_pss],
+       do: {:error, {:key_type_mismatch, key}}
+
   defp validate_public_key(_key_type, _public_key), do: {:error, :invalid_public_key}
+
+  defp valid_pss_parameters?(:asn1_NOVALUE, _hash, _options), do: true
+
+  defp valid_pss_parameters?(
+         {:"RSASSA-PSS-params", hash_algorithm, mask_gen_algorithm, salt_length, 1},
+         hash,
+         options
+       ) do
+    hash_oid = Map.fetch!(@hash_oids, hash)
+
+    valid_hash_algorithm?(hash_algorithm, hash_oid) and
+      case mask_gen_algorithm do
+        {:MaskGenAlgorithm, @mgf1_oid, mgf_hash} -> valid_hash_algorithm?(mgf_hash, hash_oid)
+        _ -> false
+      end and salt_length == Keyword.fetch!(options, :rsa_pss_saltlen)
+  end
+
+  defp valid_pss_parameters?(_, _, _), do: false
+
+  defp valid_hash_algorithm?({:HashAlgorithm, oid, parameters}, oid)
+       when parameters in [:NULL, :asn1_NOVALUE],
+       do: true
+
+  defp valid_hash_algorithm?(_, _), do: false
+
+  defp validate_private_key(
+         %{key: :ecdsa, curve_oid: oid},
+         {:ECPrivateKey, _, _, {:namedCurve, oid}, _, _} = key
+       ),
+       do: {:ok, key}
+
+  defp validate_private_key(
+         %{key: :eddsa, curve_oid: oid},
+         {:ECPrivateKey, _, _, {:namedCurve, oid}, _, _} = key
+       ),
+       do: {:ok, key}
+
+  defp validate_private_key(
+         %{key: :rsa},
+         {:RSAPrivateKey, _, _, _, _, _, _, _, _, _, _} = key
+       ),
+       do: {:ok, key}
+
+  defp validate_private_key(
+         %{key: :rsa_pss, hash: hash, verify_options: options},
+         {{:RSAPrivateKey, _, _, _, _, _, _, _, _, _, _} = key, parameters}
+       ) do
+    if valid_pss_parameters?(parameters, hash, options),
+      do: {:ok, key},
+      else: {:error, :invalid_rsa_pss_parameters}
+  end
+
+  defp validate_private_key(%{key: key}, _private_key), do: {:error, {:key_type_mismatch, key}}
+
+  defp validate_signature_encoding(%{key: :ecdsa}, signature) do
+    case :public_key.der_decode(:"ECDSA-Sig-Value", signature) do
+      {:"ECDSA-Sig-Value", r, s} when is_integer(r) and r > 0 and is_integer(s) and s > 0 ->
+        if :public_key.der_encode(:"ECDSA-Sig-Value", {:"ECDSA-Sig-Value", r, s}) == signature,
+          do: :ok,
+          else: {:error, :invalid_ecdsa_signature_encoding}
+
+      _ ->
+        {:error, :invalid_ecdsa_signature_encoding}
+    end
+  catch
+    :error, _reason -> {:error, :invalid_ecdsa_signature_encoding}
+  end
+
+  defp validate_signature_encoding(%{key: :eddsa}, signature) when byte_size(signature) == 64,
+    do: :ok
+
+  defp validate_signature_encoding(%{key: :eddsa}, _signature),
+    do: {:error, :invalid_certificate_verify}
+
+  defp validate_signature_encoding(_scheme, _signature), do: :ok
 
   defp validate_signature(signature) when is_binary(signature) and byte_size(signature) > 0,
     do: :ok

@@ -34,7 +34,7 @@ defmodule SSL.ClientHello.Identifiers do
     end
   end
 
-  @spec key_exchange_group(term()) :: {:ok, :x25519 | :secp256r1} | {:error, term()}
+  @spec key_exchange_group(term()) :: {:ok, :x25519 | :secp256r1 | :secp384r1} | {:error, term()}
   def key_exchange_group(group) do
     case Capabilities.resolve(:group, group) do
       %{name: name} -> {:ok, name}

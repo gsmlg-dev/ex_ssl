@@ -87,10 +87,21 @@ tests cover direct root-signed and one-intermediate paths at both boundaries.
 
 Algorithm offers use the internal capability registry, with runtime checks for
 the required hash, AEAD, HMAC, ECDHE/curve, and RSA-PSS padding/MGF/salt controls.
-Generic RSA or ECDSA availability alone is insufficient. The supported subset
-remains X25519/P-256 ECDHE, P-256 ECDSA, RSA-PSS-RSAE SHA-256/384/512 and the
-three TLS 1.3 AEAD suites. No additional algorithm is promised by this registry
-refactor, and supplied profile ordering remains authoritative.
+Generic RSA or ECDSA availability alone is insufficient. The supported subset is X25519/P-256/P-384 ECDHE, P-256/P-384 ECDSA, Ed25519,
+RSA-PSS-RSAE and RSA-PSS-PSS SHA-256/384/512, and the three TLS 1.3 AEAD suites.
+Supplied profile ordering remains authoritative. P-521, Ed448, X448, finite-field
+and post-quantum groups remain unsupported.
+
+ECDSA requires the scheme-specific curve and canonical DER signatures. Ed25519
+uses PureEdDSA with the correct TLS CertificateVerify context. RSA-PSS-PSS
+requires an RSASSA-PSS leaf key, distinct from RSAE; present key restrictions
+must exactly match the scheme hash, MGF1 hash, digest-sized salt and trailer 1.
+Absent PSS key parameters are unrestricted, while the TLS signature still uses
+the scheme-specific parameters. P-384 ECDHE uses fresh 48-byte scalars and
+97-byte uncompressed public points; invalid points fail closed.
+
+Client/server signed-content and client-signing primitives are internal only;
+client certificate options and the mTLS handshake are not yet implemented.
 
 Certificate-chain signature policy is separate from the leaf's TLS
 CertificateVerify scheme. An explicit `signature_algorithms_cert` profile

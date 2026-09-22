@@ -37,6 +37,8 @@ defmodule SSL.PKIX do
   @default_max_pem_bytes 8_388_608
   @rsa_encryption_oid {1, 2, 840, 113_549, 1, 1, 1}
   @ec_public_key_oid {1, 2, 840, 10_045, 2, 1}
+  @rsa_pss_oid {1, 2, 840, 113_549, 1, 1, 10}
+  @ed25519_oid {1, 3, 101, 112}
   @subject_alt_name_oid {2, 5, 29, 17}
   @maximum_dns_name_length 253
   @option_keys [
@@ -289,6 +291,14 @@ defmodule SSL.PKIX do
          {@rsa_encryption_oid, {:RSAPublicKey, _modulus, _exponent} = public_key, _parameters}
        ),
        do: public_key
+
+  # Retain the SubjectPublicKeyInfo algorithm and restrictions for TLS
+  # CertificateVerify scheme selection. OTP's bare RSA key omits this policy.
+  defp certificate_verify_key({@rsa_pss_oid, {:RSAPublicKey, _, _}, _} = public_key_info),
+    do: public_key_info
+
+  defp certificate_verify_key({@ed25519_oid, {:ECPoint, _}, _} = public_key_info),
+    do: public_key_info
 
   defp certificate_verify_key(public_key_info), do: public_key_info
 

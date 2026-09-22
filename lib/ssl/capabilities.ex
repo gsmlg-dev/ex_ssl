@@ -43,6 +43,13 @@ defmodule SSL.Capabilities do
       needs: [public_keys: :ecdh, curves: :secp256r1],
       share_size: 65,
       share_encoding: :uncompressed
+    },
+    %{
+      id: 0x0018,
+      name: :secp384r1,
+      needs: [public_keys: :ecdh, curves: :secp384r1],
+      share_size: 97,
+      share_encoding: :uncompressed
     }
   ]
   @signatures [
@@ -55,6 +62,17 @@ defmodule SSL.Capabilities do
       curve_oid: {1, 2, 840, 10_045, 3, 1, 7},
       public_key_size: 65,
       needs: [public_keys: :ecdsa, curves: :secp256r1, hashs: :sha256],
+      verify_options: []
+    },
+    %{
+      id: 0x0503,
+      name: :ecdsa_secp384r1_sha384,
+      key: :ecdsa,
+      hash: :sha384,
+      curve: :secp384r1,
+      curve_oid: {1, 3, 132, 0, 34},
+      public_key_size: 97,
+      needs: [public_keys: :ecdsa, curves: :secp384r1, hashs: :sha384],
       verify_options: []
     },
     %{
@@ -97,6 +115,71 @@ defmodule SSL.Capabilities do
       id: 0x0806,
       name: :rsa_pss_rsae_sha512,
       key: :rsa,
+      hash: :sha512,
+      needs: [
+        public_keys: :rsa,
+        hashs: :sha512,
+        rsa_opts: :rsa_pkcs1_pss_padding,
+        rsa_opts: :rsa_pss_saltlen,
+        rsa_opts: :rsa_mgf1_md
+      ],
+      verify_options: [
+        rsa_padding: :rsa_pkcs1_pss_padding,
+        rsa_pss_saltlen: 64,
+        rsa_mgf1_md: :sha512
+      ]
+    },
+    %{
+      id: 0x0807,
+      name: :ed25519,
+      key: :eddsa,
+      hash: :none,
+      curve: :ed25519,
+      curve_oid: {1, 3, 101, 112},
+      public_key_size: 32,
+      needs: [public_keys: :eddsa, curves: :ed25519],
+      verify_options: []
+    },
+    %{
+      id: 0x0809,
+      name: :rsa_pss_pss_sha256,
+      key: :rsa_pss,
+      hash: :sha256,
+      needs: [
+        public_keys: :rsa,
+        hashs: :sha256,
+        rsa_opts: :rsa_pkcs1_pss_padding,
+        rsa_opts: :rsa_pss_saltlen,
+        rsa_opts: :rsa_mgf1_md
+      ],
+      verify_options: [
+        rsa_padding: :rsa_pkcs1_pss_padding,
+        rsa_pss_saltlen: 32,
+        rsa_mgf1_md: :sha256
+      ]
+    },
+    %{
+      id: 0x080A,
+      name: :rsa_pss_pss_sha384,
+      key: :rsa_pss,
+      hash: :sha384,
+      needs: [
+        public_keys: :rsa,
+        hashs: :sha384,
+        rsa_opts: :rsa_pkcs1_pss_padding,
+        rsa_opts: :rsa_pss_saltlen,
+        rsa_opts: :rsa_mgf1_md
+      ],
+      verify_options: [
+        rsa_padding: :rsa_pkcs1_pss_padding,
+        rsa_pss_saltlen: 48,
+        rsa_mgf1_md: :sha384
+      ]
+    },
+    %{
+      id: 0x080B,
+      name: :rsa_pss_pss_sha512,
+      key: :rsa_pss,
       hash: :sha512,
       needs: [
         public_keys: :rsa,
