@@ -120,7 +120,8 @@ defmodule SSL.PKIX do
        %VerifiedPeer{
          leaf_der: leaf.der,
          leaf: leaf.decoded,
-         public_key: public_key
+         public_key: public_key,
+         chain: Enum.map(chain, & &1.der)
        }}
     end
   end

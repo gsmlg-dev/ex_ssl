@@ -98,7 +98,7 @@ defmodule SSL.Protocol.TLS12RecordTest do
   end
 
   defp flip(bytes, index) do
-    <<before::binary-size(index), byte, after_bytes::binary>> = bytes
+    <<before::binary-size(^index), byte, after_bytes::binary>> = bytes
     <<before::binary, Bitwise.bxor(byte, 1), after_bytes::binary>>
   end
 end

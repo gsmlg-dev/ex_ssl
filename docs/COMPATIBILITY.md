@@ -14,6 +14,9 @@ certification, and OTP `:ssl` remains the recommended default.
 | `SSL.setopts/2` | Validates the whole request for `active: false` or `:once`, send timeouts and the mutable TCP allowlist below. Invalid options reject before changes. Driver failures can partially apply TCP options; TLS state changes only after driver success. |
 | `SSL.controlling_process/2` | Transfers the application owner and monitor. The connection process remains the TCP owner and sole owner of TLS state. Only the current application owner may transfer. |
 | `SSL.negotiated_protocol/1` | Returns authenticated ALPN as `{:ok, binary}` or `{:error, :protocol_not_negotiated}`. |
+| `SSL.connection_information/1,2` | Only `:protocol`, `:selected_cipher_suite`, and `:session_resumption`; explicit ordered key lists reject unknown/duplicate keys. No secret-bearing OTP keys. |
+| `SSL.peercert/1` | Authenticated leaf DER, including the revalidated cached chain for resumption. |
+| `SSL.peername/1`, `SSL.sockname/1` | Live peer/local TCP address and port. |
 | `SSL.close/1` | Idempotent local close. Sends close_notify when no application write is uncertain and wakes admitted calls. |
 
 Closed and invalid handles follow the existing public call mapping. An orderly
@@ -235,7 +238,7 @@ inspection.
 
 ## Remaining limitations
 
-Server TLS, DTLS, QUIC/HTTP/3, resumption,
+Server TLS, DTLS, QUIC/HTTP/3, TLS 1.2/mTLS resumption,
 0-RTT, post-handshake authentication, active true/active-N, packet framing,
 exporters, and full OTP API parity are out of scope. ALPN negotiation alone is
 not evidence of an HTTP/2 request. See
@@ -351,3 +354,40 @@ Tests cover primitive vectors, fragmented/malformed input, EMS/renegotiation,
 signed parameters, downgrade, CCS/Finished/AEAD errors, real suites/mTLS,
 active-once, ownership, truncation and deterministic blocked-flight timeout/cancel.
 See the ledger for exact executed gates and remaining consumer work.
+
+## Opt-in TLS 1.3 resumption and diagnostics
+
+`session_tickets: :disabled | :auto` defaults to `:disabled`. Auto is supported
+only with TLS 1.3-only versions and no configured client certificate/key. Mixed
+versions, TLS 1.2, mTLS auto, manual ticket export/import, PSK-only exchange and
+`early_data` return explicit option errors. Explicit WireProfiles must reserve
+`{:psk_key_exchange_modes, [1]}` and a last `{:pre_shared_key, :deferred}` slot;
+other extension ordering is preserved. A cache miss omits only the PSK slot.
+
+Tickets are authenticated post-handshake messages and consume no application
+active-once credit. Up to eight tickets per connection are processed; each PSK is
+derived from its nonce. Retained entries are limited to 128 partitions, 4 MiB
+aggregate, 256 KiB each, 16 KiB ticket bytes and seven days lifetime. Atomic
+one-use checkout and a single expiry timer bound cache lifetime and concurrency.
+Cache calls fail closed after 25 ms; a cache failure takes the full-handshake
+path. There is no persistent state. Each checkout revalidates the saved chain
+against current time, reference identity, loaded CA content, depth and certificate
+signature policy. Partition digests also cover the concrete endpoint, hostname,
+ALPN and ordered version/cipher/group/signature/profile policies.
+
+Resumption requires fresh ECDHE, a valid binder, selected identity zero with a
+compatible hash, unchanged selected ALPN, and authenticated Finished. HRR uses
+the exact CH1 message-hash rewrite and recomputed CH2 binder; a hash-incompatible
+PSK is removed. Server decline, including ticket-key rotation, follows the normal
+full certificate flight on the same socket. Invalid binders/Finished never cause
+reconnect or replay. Ticket bytes and secrets are excluded from runtime inspection
+and diagnostics; authenticated peer DER is intentionally public through peercert.
+
+Diagnostics return only the three keys listed above; ALPN remains available from
+`negotiated_protocol/1`. Closed diagnostic calls return `{:error, :closed}` under
+the existing public handle mapping. Local OTP28 reference scenarios cover the
+implemented return forms, not all OTP29 information keys or full API parity.
+Independent OpenSSL peers prove full/resumed exchanges, P384 HRR resumption,
+server ticket-key restart, disabled mode and authentication-policy rejection.
+The source-package consumer gate proves HTTP/1.1 resumption; HTTP/2/WSS/SSE
+resumption is not separately certified by that gate.

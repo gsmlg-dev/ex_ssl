@@ -44,7 +44,7 @@ defmodule SSL.Protocol.TLS12NegativeTest do
     <<22, 3, 3, _::16, encoded::binary>> = server_hello([{23, <<>>}, {0xFF01, <<0>>}], 0xC02F)
 
     for split <- 1..(byte_size(encoded) - 1) do
-      <<first::binary-size(split), last::binary>> = encoded
+      <<first::binary-size(^split), last::binary>> = encoded
       {:ok, partial, [], []} = TLS12.feed(state([0x0303]), plain(first))
       {:ok, complete, [], []} = TLS12.feed(partial, plain(last))
       assert complete.phase == :await_certificate
@@ -92,7 +92,7 @@ defmodule SSL.Protocol.TLS12NegativeTest do
     assert {:error, {:fatal_alert, :decrypt_error, :invalid_finished}} = TLS12.feed(state, bad)
     {:ok, app, _} = TLS12Record.encrypt(state.read_state, :application_data, "early")
     assert {:error, {:fatal_alert, :unexpected_message, _}} = TLS12.feed(state, app)
-    <<prefix::binary-size(byte_size(valid_wire) - 1), tag>> = valid_wire
+    <<prefix::binary-size(byte_size(^valid_wire) - 1), tag>> = valid_wire
 
     assert {:error, {:fatal_alert, :bad_record_mac, _}} =
              TLS12.feed(state, <<prefix::binary, Bitwise.bxor(tag, 1)>>)

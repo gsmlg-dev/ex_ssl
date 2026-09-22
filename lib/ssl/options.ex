@@ -6,10 +6,12 @@ defmodule SSL.Options do
   @derive {Inspect, only: [:identity]}
   defstruct [
     :profile,
+    :endpoint,
     :identity,
     :trust_source,
     :client_identity,
     :alpn_advertised_protocols,
+    session_tickets: :disabled,
     tcp_options: [],
     active: false,
     depth: 10,
@@ -38,6 +40,7 @@ defmodule SSL.Options do
     :server_name_indication,
     :customize_hostname_check,
     :versions,
+    :session_tickets,
     :ciphers,
     :signature_algs,
     :signature_algs_cert,
@@ -55,7 +58,7 @@ defmodule SSL.Options do
       signature_algorithms: Capabilities.identifiers(:signature_algorithm),
       certificate_signature_algorithms:
         Capabilities.identifiers(:certificate_signature_algorithm),
-      psk_key_exchange_modes: [],
+      psk_key_exchange_modes: [1, :psk_dhe_ke],
       raw_extensions: [],
       key_share_sizes: Capabilities.key_share_sizes()
     }
@@ -71,10 +74,13 @@ defmodule SSL.Options do
          {:ok, trust} <- trust_source(options),
          {:ok, profile} <- profile(options, context),
          {:ok, client_identity} <-
-           SSL.ClientIdentity.load(Keyword.take(options, [:cert, :certfile, :key, :keyfile])) do
+           SSL.ClientIdentity.load(Keyword.take(options, [:cert, :certfile, :key, :keyfile])),
+         :ok <- ticket_identity(options, client_identity) do
       {:ok,
        %__MODULE__{
          profile: profile,
+         endpoint: host,
+         session_tickets: Keyword.get(options, :session_tickets, :disabled),
          identity: identity,
          context: context,
          trust_source: trust,
@@ -151,6 +157,7 @@ defmodule SSL.Options do
     end)
   end
 
+  defp valid_option?(:session_tickets, value), do: value in [:disabled, :auto]
   defp valid_option?(:mode, value), do: value == :binary
   defp valid_option?(:active, value), do: value in [false, :once]
   defp valid_option?(:packet, value), do: value in [:raw, 0]
@@ -304,8 +311,48 @@ defmodule SSL.Options do
              else: resolve_explicit_profile(profile, advertised_protocols, explicit_profile?)
            ),
          :ok <- require_version_match(profile, versions),
-         :ok <- require_policy_match(profile, policy) do
+         :ok <- require_policy_match(profile, policy),
+         {:ok, profile} <- ticket_profile(options, profile, versions) do
       validate_profile(profile)
+    end
+  end
+
+  defp ticket_identity(options, identity) do
+    if Keyword.get(options, :session_tickets, :disabled) == :auto and identity != nil,
+      do: option_error({:session_tickets, :client_identity_unsupported}),
+      else: :ok
+  end
+
+  defp ticket_profile(options, profile, versions) do
+    auto? = Keyword.get(options, :session_tickets, :disabled) == :auto
+    configured = get_in(options, [:ex_ssl, :profile])
+    modes = profile_extension(profile, :psk_key_exchange_modes)
+    slot = List.last(profile.extensions)
+
+    cond do
+      auto? and versions != [0x0304] ->
+        option_error({:session_tickets, :tls13_only})
+
+      auto? and configured in [nil, :default] ->
+        {:ok,
+         %{
+           profile
+           | extensions:
+               profile.extensions ++
+                 [{:psk_key_exchange_modes, [1]}, {:pre_shared_key, :deferred}]
+         }}
+
+      auto? and modes in [[1], [:psk_dhe_ke]] and slot == {:pre_shared_key, :deferred} ->
+        {:ok, profile}
+
+      auto? ->
+        option_error({:session_tickets, :profile_conflict})
+
+      modes != nil or Enum.any?(profile.extensions, &match?({:pre_shared_key, _}, &1)) ->
+        option_error({:session_tickets, :disabled})
+
+      true ->
+        {:ok, profile}
     end
   end
 
@@ -450,7 +497,6 @@ defmodule SSL.Options do
   defp proper_list?([_ | rest]), do: proper_list?(rest)
   defp proper_list?(_), do: false
 
-  defp capability_key(:cipher_suite), do: :ciphers
   defp capability_key(:signature_algorithm), do: :signature_algorithms
   defp capability_key(:certificate_signature_algorithm), do: :certificate_signature_algorithms
   defp capability_key(:group), do: :groups

@@ -91,6 +91,30 @@ defmodule SSL do
   @spec negotiated_protocol(Socket.t()) :: {:ok, binary()} | {:error, term()}
   def negotiated_protocol(socket), do: call(socket, :negotiated_protocol)
 
+  @doc "Returns the supported non-secret connection metadata."
+  @spec connection_information(Socket.t()) :: {:ok, keyword()} | {:error, term()}
+  def connection_information(socket), do: connection_information(socket, SSL.Diagnostics.keys())
+
+  @spec connection_information(Socket.t(), term()) :: {:ok, keyword()} | {:error, term()}
+  def connection_information(socket, keys) do
+    with :ok <- SSL.Diagnostics.validate_keys(keys),
+         do: call(socket, {:connection_information, keys})
+  end
+
+  @doc "Returns the authenticated server leaf certificate as DER."
+  @spec peercert(Socket.t()) :: {:ok, binary()} | {:error, term()}
+  def peercert(socket), do: call(socket, :peercert)
+
+  @doc "Returns the live TCP peer address and port."
+  @spec peername(Socket.t()) ::
+          {:ok, {:inet.ip_address(), :inet.port_number()}} | {:error, term()}
+  def peername(socket), do: call(socket, :peername)
+
+  @doc "Returns the live local TCP address and port."
+  @spec sockname(Socket.t()) ::
+          {:ok, {:inet.ip_address(), :inet.port_number()}} | {:error, term()}
+  def sockname(socket), do: call(socket, :sockname)
+
   @doc "Receives available bytes for length 0, or exactly length bytes. Timeout retains buffered data."
   @spec recv(Socket.t(), non_neg_integer(), timeout()) :: {:ok, binary()} | {:error, term()}
   def recv(socket, length, timeout \\ :infinity)

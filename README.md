@@ -94,13 +94,24 @@ The initial compatibility baseline is the Erlang/OTP 29 `:ssl` client API.
 
 Implemented client functions are `connect/2,3,4`, `send/2`, `recv/2,3`,
 `close/1`, `setopts/2`, `controlling_process/2`, and
-`negotiated_protocol/1`. Calls return success only after CertificateVerify and
-Finished verification and transmission of client Finished. The connection runs
+`negotiated_protocol/1`, `connection_information/1,2`, `peercert/1`,
+`peername/1`, and `sockname/1`. Full handshakes verify CertificateVerify and
+Finished; resumed handshakes verify the ticket-bound Finished. Connect succeeds
+after the client Finished is transmitted. The connection runs
 as a temporary supervised `:gen_statem`; a failed session is never restarted.
 
 Defaults are deliberately restricted to binary, passive, raw, verified TLS 1.3.
 They differ from OTP's defaults. Supported options and receive/upgrade ownership
 rules are documented in the [compatibility matrix](docs/COMPATIBILITY.md).
+
+TLS 1.3 resumption is opt-in with `session_tickets: :auto`; the default is
+`:disabled`. Auto requires TLS 1.3-only versions and no configured client identity.
+Tickets remain in a bounded in-memory cache, partitioned by endpoint and loaded
+trust/security policy. Each use revalidates the saved peer certificate chain and
+performs fresh ECDHE. A server declining PSK continues normal full authentication
+on that connection. No early data, automatic reconnect, or request replay occurs.
+See the [resumption policy](docs/ADR_TLS13_RESUMPTION.md) and
+[compatibility details](docs/COMPATIBILITY.md).
 
 The wider roadmap (not implemented API) includes:
 
@@ -108,10 +119,6 @@ The wider roadmap (not implemented API) includes:
 close/2
 shutdown/2
 getopts/2
-peername/1
-sockname/1
-peercert/1
-connection_information/1,2
 getstat/1,2
 update_keys/2
 export_key_materials/4,5
@@ -278,7 +285,7 @@ The implementation uses OTP `:crypto` and `:public_key` for cryptographic primit
 The authenticated TLS 1.3 client, passive/active-once raw application traffic,
 STARTTLS, ownership transfer, public ALPN, KeyUpdate handling, and bounded
 multi-record writes are implemented. Development continues toward broader OTP
-API/options, active modes, packet modes, exporters/resumption, verified
+API/options, active modes, packet modes, exporters, verified
 real-world profiles, performance work, and independent security review.
 
 See:

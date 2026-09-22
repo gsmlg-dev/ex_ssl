@@ -19,11 +19,26 @@ defmodule SSL.Protocol.HandshakeMachine do
   }
 
   alias SSL.Protocol.ServerFlightVerifier.{Incremental, Input}
+  alias SSL.Protocol.Resumption
 
   @max_handshake_length 1_048_576
   @ccs <<20, 3, 3, 0, 1, 1>>
 
-  @derive {Inspect, except: [:key_pair, :read_state, :write_state, :verifier, :client_identity]}
+  @derive {Inspect,
+           except: [
+             :client_hello,
+             :client_ast,
+             :offer,
+             :key_pair,
+             :key_pairs,
+             :read_state,
+             :write_state,
+             :verifier,
+             :client_identity,
+             :ticket,
+             :resumption_master,
+             :pending_tickets
+           ]}
   defstruct [
     :client_hello,
     :client_ast,
@@ -37,11 +52,18 @@ defmodule SSL.Protocol.HandshakeMachine do
     :read_state,
     :write_state,
     :negotiated_protocol,
+    :verified_peer,
+    :ticket,
+    :resumption_master,
     :phase,
     :framer,
     :verifier,
     :hrr,
     :hrr_transcript,
+    resumed: false,
+    enable_tickets: false,
+    ticket_count: 0,
+    pending_tickets: [],
     options: []
   ]
 
@@ -55,8 +77,11 @@ defmodule SSL.Protocol.HandshakeMachine do
 
   def init(%Materialized{} = materialized, trust_source, identity, opts) when is_list(opts) do
     {client_identity, verifier_opts} = Keyword.pop(opts, :client_identity)
+    {ticket, verifier_opts} = Keyword.pop(verifier_opts, :ticket)
+    {enable_tickets, verifier_opts} = Keyword.pop(verifier_opts, :enable_tickets, false)
 
-    with {:ok, client_hello} <- encoded_client_hello(materialized, verifier_opts),
+    with {:ok, unsigned} <- encoded_client_hello(materialized, verifier_opts),
+         {:ok, client_hello} <- bind_hello(unsigned, ticket, <<>>),
          {:ok, offer} <- ClientOffer.from_client_hello(client_hello),
          {:ok, key_pairs} <- matching_key_pairs(materialized.key_pairs, offer),
          :ok <- validate_identity(identity) do
@@ -68,6 +93,8 @@ defmodule SSL.Protocol.HandshakeMachine do
         trust_source: trust_source,
         identity: identity,
         client_identity: client_identity,
+        ticket: ticket,
+        enable_tickets: enable_tickets,
         offer: offer,
         phase: :await_server_hello,
         framer: HandshakeFramer.new(),
@@ -241,21 +268,29 @@ defmodule SSL.Protocol.HandshakeMachine do
       fatal(:unexpected_message, :second_hello_retry_request)
     else
       with {:ok, ast, key_pair} <- retry_client_hello(state.client_ast, state.key_pair, hrr),
-           {:ok, encoded} <- Serializer.encode(ast),
-           {:ok, offer} <- ClientOffer.from_client_hello(encoded),
-           {:ok, _suite, hash} <- suite(hrr.cipher_suite) do
-        transcript =
-          Transcript.new(hash)
-          |> Transcript.append(state.client_hello)
-          |> Transcript.apply_hello_retry_request_rewrite()
-          |> Transcript.append(hrr.encoded)
-          |> Transcript.append(encoded)
+           {:ok, _suite, hash} <- suite(hrr.cipher_suite),
+           {ast, ticket} = retry_ticket(ast, state.ticket, hash),
+           prefix =
+             Transcript.new(hash)
+             |> Transcript.append(state.client_hello)
+             |> Transcript.apply_hello_retry_request_rewrite()
+             |> Transcript.append(hrr.encoded),
+           {:ok, unsigned} <- Serializer.encode(ast),
+           {:ok, encoded} <-
+             bind_hello(
+               unsigned,
+               ticket,
+               prefix.messages |> Enum.reverse() |> IO.iodata_to_binary()
+             ),
+           {:ok, offer} <- ClientOffer.from_client_hello(encoded) do
+        transcript = Transcript.append(prefix, encoded)
 
         {:ok,
          %{
            state
            | client_ast: ast,
              client_hello: encoded,
+             ticket: ticket,
              key_pair: key_pair,
              key_pairs: retry_key_pairs(state.key_pairs, hrr, key_pair),
              offer: offer,
@@ -279,7 +314,9 @@ defmodule SSL.Protocol.HandshakeMachine do
            records: [],
            trust_source: state.trust_source,
            identity: state.identity,
-           client_identity: state.client_identity
+           client_identity: state.client_identity,
+           ticket: state.ticket,
+           enable_tickets: state.enable_tickets
          },
          {:ok, %Incremental{} = verifier} <-
            start_verifier(input, verifier_options(state.options), state.hrr_transcript) do
@@ -311,11 +348,20 @@ defmodule SSL.Protocol.HandshakeMachine do
               | phase: :connected,
                 verifier: nil,
                 key_pair: nil,
+                key_pairs: [],
+                client_hello: nil,
+                client_ast: nil,
+                offer: nil,
                 client_identity: nil,
+                ticket: nil,
+                trust_source: nil,
+                resumption_master: result.resumption_master,
+                resumed: result.resumed,
                 hrr_transcript: nil,
                 read_state: result.server_application_state,
                 write_state: result.client_application_state,
-                negotiated_protocol: result.negotiated_protocol
+                negotiated_protocol: result.negotiated_protocol,
+                verified_peer: result.verified_peer
             }
 
             {:cont,
@@ -365,7 +411,8 @@ defmodule SSL.Protocol.HandshakeMachine do
                  %{state | read_state: read, framer: framer},
                  messages
                ) do
-          {:ok, next, records, []}
+          events = Enum.map(Enum.reverse(next.pending_tickets), &{:session_ticket, &1})
+          {:ok, %{next | pending_tickets: []}, records, events}
         else
           {:error, {:fatal_alert, _, _}} = error -> error
           {:error, reason} -> fatal(:decode_error, reason)
@@ -383,11 +430,21 @@ defmodule SSL.Protocol.HandshakeMachine do
     Enum.reduce_while(messages, {:ok, state, []}, fn
       # RFC 9846 §4.7.1: no resumption support means no ticket semantic decoding.
       # HandshakeFramer has already checked completeness and the global size bound.
-      <<4, _length::24, _body::binary>>, result ->
+      <<4, _length::24, _body::binary>>, {:ok, %{enable_tickets: false}, _} = result ->
+        {:cont, result}
+
+      <<4, _length::24, _body::binary>>, {:ok, %{ticket_count: count}, _} = result
+      when count >= 8 ->
         {:cont, result}
 
       message, {:ok, current, out} ->
         case ServerFlight.decode(message, hash: hash_for(current.write_state)) do
+          {:ok, %ServerFlight.NewSessionTicket{} = ticket, <<>>} ->
+            case receive_ticket(current, ticket) do
+              {:ok, next} -> {:cont, {:ok, next, out}}
+              {:error, _} = error -> {:halt, error}
+            end
+
           {:ok, %ServerFlight.KeyUpdate{request_update: request?}, <<>>} ->
             case apply_key_update(current, request?) do
               {:ok, next, records} -> {:cont, {:ok, next, out ++ records}}
@@ -402,6 +459,45 @@ defmodule SSL.Protocol.HandshakeMachine do
         end
     end)
   end
+
+  defp receive_ticket(state, %{ticket_lifetime: 0}), do: {:ok, state}
+
+  defp receive_ticket(state, ticket) do
+    hash = hash_for(state.write_state)
+
+    with {:ok, psk} <-
+           KeySchedule.resumption_secret(hash, state.resumption_master, ticket.ticket_nonce) do
+      material = %{
+        ticket: ticket.ticket,
+        psk: psk,
+        hash: hash,
+        age_add: ticket.ticket_age_add,
+        lifetime: ticket.ticket_lifetime,
+        peer: state.verified_peer,
+        alpn: state.negotiated_protocol
+      }
+
+      count = state.ticket_count + 1
+
+      {:ok,
+       %{
+         state
+         | pending_tickets: [material | state.pending_tickets],
+           ticket_count: count,
+           resumption_master: if(count == 8, do: nil, else: state.resumption_master)
+       }}
+    else
+      {:error, reason} -> fatal(:internal_error, reason)
+    end
+  end
+
+  defp bind_hello(encoded, nil, _prefix), do: {:ok, encoded}
+  defp bind_hello(encoded, ticket, prefix), do: Resumption.bind(encoded, ticket, prefix)
+  defp retry_ticket(ast, nil, _hash), do: {ast, nil}
+  defp retry_ticket(ast, %{hash: hash} = ticket, hash), do: {ast, ticket}
+
+  defp retry_ticket(ast, _ticket, _hash),
+    do: {%{ast | extensions: Enum.reject(ast.extensions, &(elem(&1, 0) == 41))}, nil}
 
   defp validate_post_handshake_epoch(messages, framer) do
     key_update_index = Enum.find_index(messages, &match?(<<24, _::binary>>, &1))

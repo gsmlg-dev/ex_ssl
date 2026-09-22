@@ -65,6 +65,26 @@ def exchange(connection, mode, delay_ms):
         announce("exchange", bytes=content_length)
 
 
+def make_context(args, versions):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = versions[args.min_version]
+    context.maximum_version = versions[args.max_version]
+    context.options |= ssl.OP_NO_COMPRESSION | ssl.OP_NO_RENEGOTIATION
+    context.load_cert_chain(args.certfile, args.keyfile)
+    context.set_ciphers(args.cipher)
+    if args.alpn:
+        context.set_alpn_protocols(args.alpn.split(","))
+    if args.verify != "none":
+        if not args.cafile:
+            raise ValueError("client verification needs a CA file")
+        context.load_verify_locations(cafile=args.cafile)
+        context.verify_mode = ssl.CERT_REQUIRED if args.verify == "required" else ssl.CERT_OPTIONAL
+
+    if args.group:
+        context.set_ecdh_curve(args.group)
+    return context
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--certfile", required=True)
@@ -78,6 +98,8 @@ def main():
     parser.add_argument("--mode", choices=["echo", "http1"], default="echo")
     parser.add_argument("--max-connections", type=int, default=1)
     parser.add_argument("--delay-ms", type=int, default=0)
+    parser.add_argument("--group")
+    parser.add_argument("--restart-context", default="false", choices=["false", "true"])
     args = parser.parse_args()
 
     if args.max_connections not in range(1, 33) or args.delay_ms not in range(0, 1001):
@@ -86,19 +108,7 @@ def main():
     if versions[args.min_version] > versions[args.max_version]:
         parser.error("invalid TLS version range")
 
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = versions[args.min_version]
-    context.maximum_version = versions[args.max_version]
-    context.options |= ssl.OP_NO_COMPRESSION | ssl.OP_NO_RENEGOTIATION
-    context.load_cert_chain(args.certfile, args.keyfile)
-    context.set_ciphers(args.cipher)
-    if args.alpn:
-        context.set_alpn_protocols(args.alpn.split(","))
-    if args.verify != "none":
-        if not args.cafile:
-            parser.error("client verification needs a CA file")
-        context.load_verify_locations(cafile=args.cafile)
-        context.verify_mode = ssl.CERT_REQUIRED if args.verify == "required" else ssl.CERT_OPTIONAL
+    context = make_context(args, versions)
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -116,12 +126,15 @@ def main():
             continue
         accepted += 1
         raw.settimeout(10)
+        if args.restart_context == "true" and accepted > 1:
+            context = make_context(args, versions)
         try:
             with context.wrap_socket(raw, server_side=True) as connection:
                 der = connection.getpeercert(binary_form=True)
                 announce(
                     "handshake",
                     version=connection.version(),
+                    resumed=connection.session_reused,
                     cipher=connection.cipher()[0],
                     alpn=connection.selected_alpn_protocol(),
                     client_der_b64=base64.b64encode(der).decode("ascii") if der else None,

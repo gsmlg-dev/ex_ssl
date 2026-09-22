@@ -231,3 +231,19 @@ containers and duplicate keys fail before fetch modifies ALPN or deadlines.
 IPv6 literals infer family and IPv6 local binds select IPv6 DNS. Raw active/packet
 controls and unsafe linger remain private/unsupported. The released0.3.0 package
 has not gained these features. See COMPATIBILITY.md for exact forms and limits.
+
+## Source candidate dual-version and resumption gates (Phases 4–5)
+
+The source candidate supports explicit TLS 1.2-only and mixed offers through the
+same shared adapter, retaining TLS 1.3-only as the library default and OTP as the
+consumer default. Independent OpenSSL package tests cover required mTLS HTTP/1.1,
+HTTP/2 ALPN with a 262,144-byte response crossing both flow-control windows, WSS
+and pinned EventSource reconnects. A capable mixed-version peer selects TLS 1.3.
+The safe TLS 1.2 subset requires EMS and secure-renegotiation indication; see the
+compatibility matrix for its four ECDHE AES-GCM suites and exclusions.
+
+`ssl: [versions: [:"tlsv1.3"], session_tickets: :auto]` enables the optional bounded
+TLS 1.3 cache without client credentials. Two fresh packaged HTTP/1.1 fetches
+prove actual OpenSSL session reuse. It does not change request retry semantics,
+backend selection, credentials across redirects, or the QUIC path. The published
+0.3.0 dependency remains separate from these unreleased source-candidate features.

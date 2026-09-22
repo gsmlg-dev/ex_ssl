@@ -9,6 +9,6 @@ defmodule SSL.Supervisor do
 
   @impl true
   def init(_opts) do
-    Supervisor.init([SSL.ConnectionSupervisor], strategy: :one_for_one)
+    Supervisor.init([SSL.TicketCache, SSL.ConnectionSupervisor], strategy: :one_for_one)
   end
 end

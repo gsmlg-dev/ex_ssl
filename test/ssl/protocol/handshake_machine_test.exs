@@ -93,6 +93,83 @@ defmodule SSL.Protocol.HandshakeMachineTest do
              HandshakeMachine.feed(machine, record)
   end
 
+  test "authenticated fragmented tickets derive distinct PSKs within an eight-ticket bound" do
+    machine = %{
+      connected_fixture_machine()
+      | enable_tickets: true,
+        resumption_master: :binary.copy(<<7>>, 48)
+    }
+
+    wire = <<4, 15::24, 60::32, 7::32, 1, 9, 1::16, 1, 0::16>>
+    <<first::binary-size(6), last::binary>> = wire
+    {:ok, record, server} = Record.encrypt(machine.read_state, :handshake, first)
+    assert {:ok, machine, [], []} = HandshakeMachine.feed(machine, record)
+    {:ok, record, _} = Record.encrypt(server, :handshake, last)
+
+    assert {:ok, machine, [], [{:session_ticket, material}]} =
+             HandshakeMachine.feed(machine, record)
+
+    assert material.lifetime == 60
+    assert material.ticket == <<1>>
+    assert byte_size(material.psk) == 48
+    assert material.peer == machine.verified_peer
+    assert machine.pending_tickets == []
+
+    final =
+      Enum.reduce(2..8, machine, fn nonce, current ->
+        ticket = <<4, 15::24, 60::32, 7::32, 1, nonce, 1::16, 1, 0::16>>
+        {:ok, record, _} = Record.encrypt(current.read_state, :handshake, ticket)
+
+        assert {:ok, next, [], [{:session_ticket, received}]} =
+                 HandshakeMachine.feed(current, record)
+
+        refute received.psk == material.psk
+        next
+      end)
+
+    assert final.ticket_count == 8
+    assert final.resumption_master == nil
+    {:ok, record, _} = Record.encrypt(final.read_state, :handshake, wire)
+    assert {:ok, _, [], []} = HandshakeMachine.feed(final, record)
+  end
+
+  test "enabled ticket parsing rejects malformed lifetime and unauthenticated records" do
+    machine = %{
+      connected_fixture_machine()
+      | enable_tickets: true,
+        resumption_master: :binary.copy(<<7>>, 48)
+    }
+
+    ticket = <<4, 15::24, 604_801::32, 7::32, 1, 9, 1::16, 1, 0::16>>
+    {:ok, record, _} = Record.encrypt(machine.read_state, :handshake, ticket)
+
+    assert {:error,
+            {:fatal_alert, :unexpected_message, {:invalid_new_session_ticket_lifetime, 604_801}}} =
+             HandshakeMachine.feed(machine, record)
+
+    <<head::binary-size(byte_size(^record) - 1), last>> = record
+    tampered = head <> <<Bitwise.bxor(last, 1)>>
+    assert {:error, {:fatal_alert, :bad_record_mac, _}} = HandshakeMachine.feed(machine, tampered)
+    zero = <<4, 15::24, 0::32, 7::32, 1, 9, 1::16, 1, 0::16>>
+    {:ok, record, _} = Record.encrypt(machine.read_state, :handshake, zero)
+    assert {:ok, unchanged, [], []} = HandshakeMachine.feed(machine, record)
+    assert unchanged.ticket_count == 0
+  end
+
+  test "runtime inspection omits ClientHello ticket bytes and resumption secrets" do
+    machine = %{
+      connected_fixture_machine()
+      | client_hello: "private-ticket-wire",
+        client_ast: %{ticket: "private-ticket-wire"},
+        offer: %{ticket: "private-ticket-wire"},
+        resumption_master: "private-resumption-master"
+    }
+
+    inspected = inspect(machine, limit: :infinity)
+    refute inspected =~ "private-ticket-wire"
+    refute inspected =~ "private-resumption-master"
+  end
+
   for {suite, hash, limit} <- [
         {:tls_aes_128_gcm_sha256, :sha256, 23_726_566},
         {:tls_aes_256_gcm_sha384, :sha384, 23_726_566},

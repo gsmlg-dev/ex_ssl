@@ -46,7 +46,6 @@ defmodule SSL.Protocol.Resumption do
       {:ok, <<partial::binary, byte_size(binder) + 1::16, byte_size(binder), binder::binary>>}
     else
       {:error, _} = error -> error
-      _ -> {:error, :invalid_binder_material}
     end
   end
 
@@ -77,11 +76,11 @@ defmodule SSL.Protocol.Resumption do
         encoded_size = byte_size(encoded)
 
         case encoded do
-          <<_head::binary-size(encoded_size - extension_size), 41::16, payload_size::16,
+          <<_head::binary-size(^encoded_size - ^extension_size), 41::16, payload_size::16,
             ^payload::binary-size(payload_size)>> ->
             case payload do
               <<identity_size::16, identity::binary-size(identity_size), binders_size::16,
-                ^binder_length, binder::binary-size(binder_length)>>
+                ^binder_length, binder::binary-size(^binder_length)>>
               when binders_size == binder_length + 1 ->
                 case identity do
                   <<ticket_size::16, offered::binary-size(ticket_size), _age::32>> ->

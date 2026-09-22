@@ -399,7 +399,7 @@ defmodule SSL.Protocol.TLS12 do
 
   defp plaintext_records(bytes) do
     size = min(byte_size(bytes), 16_384)
-    <<chunk::binary-size(size), rest::binary>> = bytes
+    <<chunk::binary-size(^size), rest::binary>> = bytes
     [<<22, 3, 3, size::16, chunk::binary>> | plaintext_records(rest)]
   end
 
