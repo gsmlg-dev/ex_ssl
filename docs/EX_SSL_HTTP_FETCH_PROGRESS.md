@@ -572,3 +572,74 @@ decodes to `:asn1_NOVALUE`; the test incorrectly assumed a list. The fixture
 assertion now treats absent extensions as empty while retaining all certificate
 signature policy assertions. Focused client authentication tests, seed110:
 8 tests, zero failures; formatting passed. GitHub validation is rerun before release.
+
+### REL-1 — ex_ssl 0.4.0 published
+
+Revision `8707baa` passed GitHub CI (35711013918), Test (35711013700),
+TLS interoperability (35711013898), and Caddy E2E (35711013853). Release workflow
+[35711198447](https://github.com/gsmlg-dev/ex_ssl/actions/runs/35711198447) succeeded,
+published Hex ex_ssl 0.4.0 and created GitHub tag/release v0.4.0 at `5b0353e`.
+The GitHub tar asset and Hex release report matching SHA-256
+`eeaa04e209ca644e01e3895c196809897b6524287a8e5912411bd6e744fdb61c`.
+Local main was fast-forwarded to the workflow-generated version commit.
+
+### REL-2 — http_fetch worktree integration
+
+All four worktrees were committed/merged and removed. Preserved draft commits:
+`25f8a92`, `03b487d`, `e102e52`; validated candidate merge: `18942a3`.
+Root revision `f4f71ee` passed 444 tests +20 doctests, formatting and test strict
+compilation; Credo reported no issues and Dialyzer passed with four pre-existing
+ignored diagnostics. Source-package smoke initially had one intermittent
+`econnreset` among 47 tests. Fixture-only commit `f4f71ee` adds a bounded HTTP/2
+reference-peer release barrier after the full 262144-byte response is consumed.
+The repaired full smoke passed 47 tests, zero failures; the TLS1.2 subset passed
+seven tests. Separate Phase 0 close-order regressions remain intact.
+Next: update the consumer to the now-published ex_ssl 0.4.0, validate the actual
+published dependency, merge PR14 and execute the http_fetch 0.12.0 release.
+
+Consumer adoption commit `4ff4d87` changes only the ex_ssl requirement/lock to
+`~> 0.4.0` / Hex 0.4.0, relevant compatibility docs, and release tests/harnesses.
+The version-specific private test probe was revalidated against the unchanged
+Connection fields and advanced to 0.4.0. Two initial unit failures reflected
+old 0.3 unsupported-option expectations (TLS1.2/nodelay); they now test valid
+acceptance and invalid-option rejection. The external smoke's old dependency
+metadata assertion was also corrected. Final validation against published Hex:
+
+- Full umbrella suite: 444 tests +20 doctests, zero failures.
+- Cross-record selection: 11 executed, 23 excluded, zero failures.
+- Packaged TLS feature suite: 47 tests, zero failures.
+- Separate cold consumer: transitive-only ex_ssl 0.4.0 resolution, package
+  metadata assertions and local TLS exchanges passed.
+- Strict test compilation, formatting, Credo and Dialyzer passed; Dialyzer
+  retained four existing ignored diagnostics, zero unnecessary skips.
+
+PR14 was updated and pushed at `4ff4d87`; exact-revision GitHub checks precede
+merge and release.
+
+### REL-3 — http_fetch 0.12.0 published; release work complete
+
+All 32 GitHub checks passed for `4ff4d87`: Test35712113039, E2E35712113076,
+PR CI35712113057 and push CI35712108393. PR14 merged as `97cf130`; its tree
+was verified identical to the tested PR head. Release workflow
+[35712510816](https://github.com/gsmlg-dev/http_fetch/actions/runs/35712510816)
+succeeded and created v0.12.0 at `90a0ca1`. Release-time checks included 444 unit
+tests +20 doctests, 58 E2E tests, formatting, strict compilation, Credo,
+Dialyzer (four existing ignored diagnostics, zero unnecessary skips), docs
+and all five package builds. Local main was fast-forwarded to the release commit.
+
+Hex API verification confirmed 0.12.0 for http_core, http_fetch, http_web_socket,
+http_event_source and http_web_transport. Published http_core requires ex_ssl
+`~> 0.4.0`; the other four require http_core `~> 0.12.0`. No unrelated dependency
+upgrade, backend fallback, uncertain-byte replay or default change was introduced.
+
+Both repositories have only their primary worktree remaining; all requested
+worktree changes are committed, merged and pushed. Release tags and GitHub releases:
+[ex_ssl v0.4.0](https://github.com/gsmlg-dev/ex_ssl/releases/tag/v0.4.0),
+[http_fetch v0.12.0](https://github.com/gsmlg-dev/http_fetch/releases/tag/v0.12.0).
+The final ledger/readiness update is documentation-only and follows those tags.
+
+Remaining implementation limits are unchanged. Next incomplete plan gate is
+**HUMAN-SECURITY-REVIEW**, plus the explicitly unverified platform/long-duration
+and protocol-subset items in the readiness report. The user separately authorized
+these releases; automated green checks and publication do not claim human security
+review or full OTP parity. OTP :ssl remains the default consumer backend.

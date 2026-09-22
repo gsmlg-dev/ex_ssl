@@ -1,4 +1,14 @@
-# ex_ssl / http_fetch source-candidate readiness
+# ex_ssl / http_fetch pre-release readiness snapshot
+
+Release update, 2026-09-22: the user subsequently authorized worktree integration,
+commit/push and minor releases. ex_ssl v0.4.0 (`5b0353e`) and http_fetch v0.12.0
+(`90a0ca1`) are published on GitHub and Hex; all release workflows succeeded.
+The remainder of this document preserves the earlier source-candidate evidence,
+including its then-current worktree paths and no-publication scope. Those status
+statements are historical. See the [progress ledger](EX_SSL_HTTP_FETCH_PROGRESS.md)
+REL-1 through REL-3 for integration failures, corrections, final validation and
+publication verification. Human security review remains incomplete; defaults and
+compatibility limits remain unchanged.
 
 Date: 2026-09-22. Recommendation: retain explicit opt-in use and the current
 OTP backend default. The implementation plan's automated gates have been exercised
