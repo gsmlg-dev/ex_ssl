@@ -27,7 +27,7 @@ Add the `ex_ssl` package to your dependencies:
 ```elixir
 def deps do
   [
-    {:ex_ssl, "~> 0.4.0"}
+    {:ex_ssl, "~> 0.5.0"}
   ]
 end
 ```
@@ -87,6 +87,10 @@ The supported runtime baselines are Elixir 1.18 on Erlang/OTP 28, Elixir 1.19 on
 Erlang/OTP 28, and Elixir 1.20 on Erlang/OTP 29. CI covers all three tuples. OTP 29
 remains the behavioral reference target for the implemented `:ssl`-compatible client
 feature subset.
+
+The [validation and security evidence map](docs/SECURITY_REVIEW_EVIDENCE.md)
+documents mandatory peer/runtime gates and the reproducible pinned downstream
+source-candidate/package check. Independent human security review remains incomplete.
 
 ## Compatibility target
 

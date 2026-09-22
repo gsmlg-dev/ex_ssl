@@ -1,5 +1,21 @@
 # http_fetch opt-in transport integration
 
+## Current reproducible candidate check
+
+Run `timeout 900 bash scripts/downstream_candidate.sh` from the ex_ssl root.
+It fetches the verified full-SHA consumer pin
+`6a6c93e5c852e2e2bbffcc2186bef9bf34a79cac` into a temporary checkout and calls
+the existing consumer smoke script from the umbrella root with explicit source
+mode. It prints both revisions and verifies the loaded ex_ssl source/path/version,
+then removes its temporary checkouts, overrides and builds. The same command
+checks the standalone candidate package/startup boundary without publishing.
+No edits to a companion checkout are required. See the
+[evidence map](SECURITY_REVIEW_EVIDENCE.md) and
+[current ledger](EX_SSL_HTTP_FETCH_PROGRESS.md) for executed results and gates.
+Source-candidate integration does not prove a published Hex artifact contains it.
+
+## Historical integration and release context
+
 Release note: the Phase 1–5 capabilities below ship in ex_ssl 0.4.0. Consumers
 must depend on `~> 0.4.0` to use them. References to the 0.3.0 dependency and
 source-candidate gates record the historical validation boundary; they are not

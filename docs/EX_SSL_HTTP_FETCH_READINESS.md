@@ -1,4 +1,36 @@
-# ex_ssl / http_fetch pre-release readiness snapshot
+# ex_ssl / http_fetch readiness
+
+Release authorization update: the user subsequently authorized commit/push and
+the **0.5.0** minor release. The validation scope below describes the completed
+implementation task before that authorization. No production TLS engine change
+or backend default switch is included; human security review remains incomplete.
+
+## Current validation candidate — 2026-09-22
+
+The clean starting checkout matched reviewed baseline
+`c93000d01c5321a6606092fb0113d8a56b9975b8`, version 0.4.0. This library-only
+validation change preserves protocol engines, public API, mandatory verification,
+TLS 1.3 defaults, and disabled-by-default resumption. It does not authorize a
+release, tag, merge, dependency promotion, remote workflow dispatch or default switch.
+
+The current work closes the continuous runtime-matrix integration gap and extends
+existing deterministic resumption/transport coverage. The
+[security review evidence map](SECURITY_REVIEW_EVIDENCE.md) links implementation,
+tests, supported peers and limitations. Current executed commands/counts are in
+the first section of the [progress ledger](EX_SSL_HTTP_FETCH_PROGRESS.md).
+
+`scripts/downstream_candidate.sh` verifies the immutable consumer revision
+`6a6c93e5c852e2e2bbffcc2186bef9bf34a79cac`, exercises its existing source smoke
+interface, and verifies standalone package startup. Source-candidate results are
+separate from published Hex dependency validation. Historical release results
+below must not be mistaken for execution of this candidate's remote CI.
+
+**HUMAN-SECURITY-REVIEW remains incomplete.** Other OS/provider combinations and
+long-duration deployment remain unverified. Bounded resource tests do not prove
+indefinite stability, security certification, full OTP parity or a speed advantage.
+Keep OTP as the default and ex_ssl explicitly opt-in.
+
+## Historical release and implementation snapshot
 
 Release update, 2026-09-22: the user subsequently authorized worktree integration,
 commit/push and minor releases. ex_ssl v0.4.0 (`5b0353e`) and http_fetch v0.12.0

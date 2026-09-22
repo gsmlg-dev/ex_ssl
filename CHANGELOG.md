@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.0] - 2026-09-22
+
+- Run mandatory integration coverage across all three supported Elixir/OTP tuples.
+- Add peer capability/version preflight, guarded nonempty test runs, isolated builds,
+  sanitized CI summaries, and scheduled resource campaigns.
+- Expand deterministic resumption isolation, ticket ordering, restart, ownership,
+  closure, cancellation, deadline, and blocked-write cleanup regressions.
+- Add an immutable http_fetch source-candidate check and standalone package startup
+  validation, plus an independent security-review evidence map.
+- Clarify the tested TLS 1.2 peer boundary and fix a resource-test termination race.
+
+This release changes validation, CI, and documentation; the production TLS engine
+is unchanged from 0.4.0. Existing consumers can retain 0.4.0. Mandatory verification,
+TLS 1.3 defaults, and disabled-by-default resumption are unchanged. Independent
+human security review remains incomplete.
+
 ## [0.4.0] - 2026-09-22
 
 - Add P-384 ECDHE/ECDSA, Ed25519 and RSA-PSS-PSS with runtime-filtered capabilities.

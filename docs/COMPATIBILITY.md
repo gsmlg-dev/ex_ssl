@@ -323,12 +323,14 @@ RSA-PSS and P256/P384 ECDSA; legacy RSA-PKCS1 handshake signatures and EdDSA cip
 authentication are not offered by the TLS1.2-only generated profile.
 
 Extended Master Secret and a valid initial secure-renegotiation indication are
-mandatory. Missing EMS fails explicitly, including the observed local OTP28
-TLS1.2 server: its ServerHello omitted extension23. This is a documented
-interoperability restriction, not a reason to derive a legacy master secret.
-OpenSSL3.6.3 independently proves the supported full/mTLS paths; OTP28 TLS1.2
-positive interoperability is unavailable under this policy. Other runtime
-matrix evidence remains pending. Static RSA, CBC, RC4, compression, TLS1.0/1.1,
+mandatory. Missing EMS fails explicitly. The repository's observed OTP28/OTP29
+TLS1.2 reference-server configurations omit extension23; their rejection is
+fixture-specific evidence, not a claim about every OTP server configuration.
+Positive full/mTLS interoperability uses capable independent OpenSSL peers;
+the [current ledger](EX_SSL_HTTP_FETCH_PROGRESS.md) records actual runtime and
+provider versions separately from configured CI. Missing capable peers fail
+the mandatory gate rather than weakening EMS or skipping positive scenarios.
+Static RSA, CBC, RC4, compression, TLS1.0/1.1,
 renegotiation and TLS1.2 session resumption remain unsupported. A nonempty echoed
 session ID rejects as unsupported resumption. Generated TLS1.2-only hellos use an
 empty session ID; mixed offers retain TLS1.3 compatibility behavior.

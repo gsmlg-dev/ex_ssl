@@ -1,5 +1,162 @@
 # ex_ssl / http_fetch implementation ledger
 
+Release authorization update: after completing the validation work below, the
+user authorized committing, pushing, and releasing the next minor version,
+**0.5.0**, through the existing Release workflow. The original no-release scope
+below records the preceding implementation task. Human security review remains
+incomplete, and publication does not change the experimental compatibility claim.
+
+## Current library validation candidate — 2026-09-22
+
+Starting checkout: clean `c93000d01c5321a6606092fb0113d8a56b9975b8`, matching
+the reviewed 0.4.0 baseline. Work is restricted to ex_ssl. No release, tag,
+merge, dependency promotion, backend default change or remote workflow dispatch
+is part of this task. The historical entries below describe earlier authorized
+work and must not be read as authorization or current evidence.
+
+Coverage and human review obligations are indexed in
+[SECURITY_REVIEW_EVIDENCE.md](SECURITY_REVIEW_EVIDENCE.md).
+**HUMAN-SECURITY-REVIEW: incomplete.**
+
+Fresh package/downstream evidence: `timeout 900 bash
+scripts/downstream_candidate.sh` exited 0 on Elixir 1.18.5 / OTP 28. The script
+fetched and verified http_fetch `6a6c93e5c852e2e2bbffcc2186bef9bf34a79cac`, used
+explicit source mode from its temporary umbrella root, and ran **48 tests,
+0 failures, no exclusions, seed 36** (47 consumer tests plus one loaded-source
+assertion). Loaded ex_ssl was version 0.4.0 with source
+`/home/gao/Workspace/gsmlg-dev/ex_ssl/lib/ssl.ex`; both production package and
+test consumer BEAM paths were under the script's temporary directory. No
+companion or installed dependency was edited. The package was built without
+publication and started in a fresh VM with no OTP `:ssl` application running.
+An initial harness check inside `mix run` correctly detected that Mix/Hex had
+already started `:ssl`; moving the startup assertion into a fresh Elixir VM
+isolated the actual package boundary. This was a harness correction, not a
+production dependency defect. Source validation is not published-Hex validation.
+
+Fresh independent fingerprint evidence: Docker build of `e2e/Dockerfile`,
+`mix deps.get`, strict compile and `mix test --seed 220 --trace` from `e2e`
+all exited 0: **1 test, 0 failures**. The existing Caddy/plugin pins were used;
+the temporary container exposed an allocated loopback port and was stopped on
+exit. Separate temporary build/dependency paths prevented build contamination.
+
+### Final local verification
+
+All final commands below exited **0**. The full suites explicitly included
+integration and each executed **552 tests + 19 properties**, with **0 failures,
+0 exclusions, 0 skips**. These are local runs; no candidate workflow was dispatched.
+
+| Runtime | Exact OTP / ERTS | Full-suite seed | Strict development/test compilation |
+| --- | --- | --- | --- |
+| Elixir 1.18.5 | OTP 28.5.0.5 / ERTS 16.4.0.5 | 224 | Both pass |
+| Elixir 1.19.6 | OTP 28.5.0.5 / ERTS 16.4.0.5 | 225 | Both pass |
+| Elixir 1.20.4 | OTP 29.0.5 / ERTS 17.0.5 | 226 | Both pass |
+
+Every runtime used an independent `mktemp` temporary root, separate development
+and test build paths, and its own summary directory. The common OS was NixOS
+26.05 (Yarara), Linux x86_64. OTP crypto reported **OpenSSL 3.6.3, 9 Jun 2026**;
+the CLI independently reported the same version. Python **3.13.15** independently
+reported its ssl binding as OpenSSL **3.6.3, 9 Jun 2026**. Equality here is an
+observation, not an assumption in the preflight. All three preflights passed.
+
+Executed commands (from the library root with the selected runtime on `PATH`):
+
+```sh
+mix deps.get
+mix format --check-formatted
+# Use a distinct work directory for every runtime process.
+work=$(mktemp -d)
+mkdir -p "$work/tmp" "$work/reports"
+export TMPDIR="$work/tmp" CI_REPORT_DIR="$work/reports"
+bash scripts/ci_preflight.sh
+MIX_BUILD_PATH="$work/build-dev" mix compile --warnings-as-errors
+MIX_ENV=test MIX_BUILD_PATH="$work/build-test" mix compile --warnings-as-errors
+MIX_BUILD_PATH="$work/build-test" bash scripts/ci_run_suite.sh \
+  --include integration --seed 224 test
+# Other tuples used seeds 225 and 226 respectively.
+bash -n scripts/ci_preflight.sh scripts/ci_run_suite.sh scripts/downstream_candidate.sh
+nix shell nixpkgs#actionlint -c actionlint .github/workflows/ci.yml \
+  .github/workflows/test.yml .github/workflows/interop.yml .github/workflows/e2e.yml
+git diff --check
+```
+
+Logs: `/tmp/exssl-elixir18-otp28-final.log`,
+`/tmp/exssl-elixir19-otp28-final.log`, `/tmp/exssl-elixir20-otp29-final.log`.
+The corresponding `-preflight.log`, `-dev.log` and `-compile.log` files record
+runtime/provider and strict-compilation evidence. These local paths are ephemeral;
+the commands and committed scripts are the reproducible interface.
+
+The final guarded Caddy run used `CI=true ../scripts/ci_run_suite.sh --trace
+--seed 107 test` from `e2e`: **1 executed, 0 failures/exclusions/skips**, exit 0.
+Package/source-candidate validation was also repeated on Elixir 1.20.4 / OTP
+29.0.5: **48 passed**, seed 36, exit 0; log `/tmp/exssl-downstream-otp29.log`.
+The actual standalone and source-consumer modules reported version **0.4.0**,
+with the latter's compiler source pointing to this checkout's `lib/ssl.ex`.
+
+The runner's negative harness verified: a nonzero execution exits 0; zero/all
+excluded results exit 1; a missing result after a previous passing run exits 1;
+a bounded timeout exits 124. A raw sentinel never reached `CI=true` output.
+The runner owns a separate process group and cleans up its peers on success,
+failure, interruption and timeout. Uploaded artifacts and CI console output use
+allowlisted count/status/peer metadata; raw failure reports stay local to the runner.
+
+### Findings and corrections
+
+No production TLS defect was demonstrated; `lib/`, `mix.exs` and `mix.lock`
+are unchanged, and their candidate contents match the local v0.4.0 tag.
+
+- Confirmed CI gap: baseline unit jobs excluded integration, while interoperability
+  ran on only 1.20/29. Unit/property and integration selections now partition the
+  full suite across all three tuples; each mandatory invocation rejects zero
+  executed tests. Extra seeds 104/105/106 run only in scheduled/manual campaigns.
+- The first OTP29 full run at seed 226 executed 571 cases and failed **1**:
+  `resumption_resource_test` asserted supervisor emptiness immediately after an
+  authentication failure reply. `SSL.Connection` replies before its termination
+  callback must finish. The test now monitors still-owned failed children before
+  asserting cleanup; no runtime synchronization semantics were changed. The
+  focused **2-test** rerun and all three final full runs passed.
+- Initial new closure tests had **3 failures**: two assumed graceful-style retained
+  buffering after abnormal TCP failure, and one used an incorrect private test
+  field name. The corrected fixture releases abrupt closure only after confirmed
+  data delivery, asserts `:econnreset`, and independently verifies retained data
+  drainage for authenticated close_notify. Resumed receive cancellation uses the
+  existing `recv` field. The **5-test** closure gate passed at seed 222 and in the
+  complete runtime matrix. The fail-closed production policy was preserved.
+- The preflight initially misread whitespace in `openssl ecparam` output and
+  rejected available P-384. The corrected matcher and exact capability checks
+  passed on all three runtimes. No missing capability was silently skipped.
+- Existing TLS1.2 coverage already exercised all four RSA/ECDSA AES-GCM suites,
+  full/mTLS, mixed offers and protocol/authentication negatives. This change adds
+  peer/version/protocol/suite evidence and narrows the OTP EMS wording to the
+  observed reference configuration rather than duplicating those tests.
+
+### Changed-file map and companion handoff
+
+- CI and reproducibility: `.github/workflows/{ci,test,interop,e2e}.yml`,
+  `scripts/ci_preflight.sh`, `scripts/ci_run_suite.sh`,
+  `scripts/downstream_candidate.sh`, `test/test_helper.exs`,
+  `e2e/test/test_helper.exs`.
+- Regression coverage: `test/ssl/{resumption_interop,resumption_resource,
+  resumption_cache_lifecycle,resumption_closure,resumption_blocked_write,
+  otp_reference,tls12_interop,tls12_machine}_test.exs`,
+  `test/ssl/protocol/handshake_machine_test.exs`, and
+  `test/support/{local_tls_peer.ex,openssl_peer.ex,openssl_peer.py}`.
+- Review/current-state documentation: `README.md`, `docs/COMPATIBILITY.md`,
+  `docs/HTTP_FETCH_INTEGRATION.md`, `docs/SECURITY_REVIEW_EVIDENCE.md`, this ledger,
+  and `docs/EX_SSL_HTTP_FETCH_READINESS.md`.
+
+The companion can keep its existing published **`ex_ssl ~> 0.4.0`** dependency:
+this task introduced no runtime fix that needs releasing first. The new source
+gate proves this candidate against the immutable consumer pin, not a fresh
+published-Hex artifact test. Keep OTP as default, preserve explicit ex_ssl opt-in,
+and make future consumer-pin changes deliberate and reviewable. No companion
+files, dependency metadata, release tags or remote repository settings changed.
+
+External gates remain **HUMAN-SECURITY-REVIEW incomplete**, candidate remote CI,
+other OS/providers and long-duration validation. Bounded resource tests are not
+proof of indefinite production stability. No release, merge or promotion is implied.
+
+## Historical implementation and release ledger
+
 Execution started 2026-09-22. The source plan is
 [ex_ssl-http_fetch-implementation-plan.md](ex_ssl-http_fetch-implementation-plan.md).
 Only commands recorded in this execution count as current evidence.
