@@ -34,10 +34,10 @@ have not been executed locally.
 | P1.2 algorithm expansion | ex_ssl `5463ad9` | verified | P-384 ECDHE/ECDSA, Ed25519, RSA-PSS-PSS; independent vectors, negatives and constrained peers. |
 | P1.3 negotiation evidence | ex_ssl `5463ad9`, http_fetch `93efee0` | verified | 327 library tests+15 properties; 12 external-candidate tests cover10 HTTP exchanges+5 identity negatives, zero failures. Other CI runtime tuples pending. |
 | P2.1 identity loading | ex_ssl `a9c5713` | verified | Internal loader, role-aware key matching, bounded DER/PEM and redaction. 78 tests+5 properties pass; public options remain unsupported until P2.2. |
-| P2.2 client authentication | ex_ssl (client-auth commit following `a9c5713`) | verified | Public identity options, authenticated request selection, fragmented client flight and original-deadline/cancellation cleanup. Seed53:240 tests+11 properties, zero failures. |
-| P2.3 HTTP mTLS | both | in_progress | Packaged HTTP/WSS/SSE mTLS and redirect origin scope. |
-| P3.1 policy/profile options | both | not_started | Ordered registry-backed configuration. |
-| P3.2 TCP allowlist | both | not_started | Validation and real socket behavior. |
+| P2.2 client authentication | ex_ssl `fc1319d` | verified | Public identity options, authenticated request selection, fragmented client flight and original-deadline/cancellation cleanup. Seed53:240 tests+11 properties, zero failures. |
+| P2.3 HTTP mTLS | ex_ssl `fc1319d`, http_fetch `cbbc2f6` | verified | 30 source-candidate tests;442 root consumer tests+20 doctests,zero failures. Exact identities, required/optional negatives, redirect scope, WSS and deterministic SSE reconnect. |
+| P3.1 policy/profile options | ex_ssl `fc1319d`, http_fetch `cbbc2f6` | in_progress | Ordered registry-backed configuration and enforced certificate-signature policy. |
+| P3.2 TCP allowlist | both | in_progress | Validation and real socket behavior; consumer adapter follows the library gate. |
 | P3.3 certificate policy | both | not_started | Explicit supported/unsupported matrix. |
 | P4.1 TLS 1.2 architecture | ex_ssl | not_started | ADR before protocol changes. |
 | P4.2 modern TLS 1.2 subset | ex_ssl | not_started | Independent ECDHE/AEAD/EMS implementation. |
@@ -266,3 +266,47 @@ policy. Documentation states these limits and late peer rejection semantics.
   interop workflow now includes both new mTLS suites; remote matrix not run.
 
 Next incomplete task: P2.3 packaged consumer mTLS and redirect-origin policy.
+
+
+### P2.3 packaged consumer mTLS and origin scope
+
+The existing SSL option path carries the validated identity to HTTP/1.1, HTTP/2,
+WSS and EventSource. The only production change is a redirect guard: ex_ssl client
+identities cannot cross the original scheme/normalized host/effective port during
+automatic redirect following. Same-origin and manually authorized new requests
+retain credentials; OTP behavior, defaults and QUIC are unchanged.
+
+- Packaged HTTP mTLS targeted run:11 tests,zero failures,seed36. Required RSA,
+  P256 and >16KiB identity over HTTP1/2; exact peer DER; optional noidentity;
+  missing/wrongCA/expired/purpose/scheme failures, pre-I/O mismatch and bad server
+  hostname. Initial fixture failures omitted explicit ALPN and accidentally
+  returned the helper's port-closure assertion instead of the HTTP response.
+  Log `/tmp/http-fetch-tls-plan-mtls.log`. Worker required three repair iterations;
+  parent reviewed the resulting code and included it in the combined gate.
+- Redirect red:4 tests,1 failure before guard. Intermediate guard run:4 tests,
+  1 failure because the old redirect error handler returned the302 response.
+  The new policy error now propagates specifically without changing existing
+  malformed-redirect behavior. Review added case-normalized origin comparison
+  isolated from OTP header handling and a same-origin DNS-case regression.
+- Combined `EX_SSL_SOURCE_DIR=/home/gao/Workspace/gsmlg-dev/ex_ssl/.trees/tls-backend-plan
+  bash scripts/ex_ssl_source_smoke.sh`: **30 tests,zero failures**,seed36.
+  All five fresh package artifacts compile with warnings as errors in an isolated
+  consumer; override exists only there. Includes12 prior algorithm tests,11 HTTP
+  mTLS tests,5 redirect tests,2 WSS/SSE tests.
+  Log `/tmp/http-fetch-tls-plan-candidate-p2.log`.
+- Follow-up review strengthened SSE with an explicit pre-EOF close barrier:
+  change the global backend to invalid before allowing the first socket to close,
+  then verify the pinned ex_ssl reconnect and exact identity. Targeted fresh
+  source smoke rerun: **2 tests,zero failures**,seed36. No production change.
+- Root scoped `MIX_ENV=test mix test apps/http_core/test apps/http_fetch/test
+  apps/http_web_socket/test apps/http_event_source/test apps/http_web_transport/test
+  --seed 54`: **442 tests+20 doctests,zero failures**,no exclusions.
+  Log `/tmp/http-fetch-tls-plan-p2-regression.log`.
+- Dev/test strict compile, format and diff checks pass. Configured `mix credo`
+  passes on116files. Additional `mix credo --strict` exited8 with five existing
+  low-priority apply/arity findings: QUIC transport line257 and HTTP2 test
+  lines91/1637/1648/1685; left unchanged. This extra strict run is not a pass.
+- Existing released-dependency smoke remains separate; package dependency metadata
+  still targets ex_ssl0.3.0. No source overrides, lock changes or upgrades committed.
+
+Next incomplete task: P3.1 ordered TLS policy/profile option support.

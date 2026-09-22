@@ -210,5 +210,14 @@ certificate; files must be unencrypted. Peer acceptance is observed through the
 HTTP result, because TLS 1.3 permits a client-identity rejection after the local
 client Finished write. No retry, backend fallback or weakened verification is
 performed. See the compatibility matrix for input forms, chain bounds and
-CertificateRequest selection constraints. The P2.3 consumer/origin-scope gate
-is still pending; the existing released dependency does not contain this feature.
+CertificateRequest selection constraints. For automatic ex_ssl redirects, a
+configured identity remains within its original scheme, case-insensitive hostname
+and effective port. A change returns `:client_identity_cross_origin_redirect`
+before connecting. `redirect: :manual` followed by a new, deliberate request
+permits broader reuse. OTP redirect behavior is unchanged.
+
+The P2.3 source gate verifies RSA/EC/large-certificate mTLS over HTTP/1.1 and
+HTTP/2, required/optional failures, same-origin/manual redirects, and WSS and
+EventSource reconnects with exact peer-observed client identities. The released
+0.3.0 dependency does not contain this feature. Source-candidate validation is
+separate from released-dependency packaging evidence.
