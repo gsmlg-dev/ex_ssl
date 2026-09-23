@@ -369,3 +369,15 @@ call accepts the large legal cookie while its limited call rejects the exact
  test/ssl/protocol/server_hello_test.exs`: exit 0, **49 passed** (2 properties,
 47 tests); `/tmp/ex_ssl-fix-final-decoder.log`. No production code changed after
 the full-suite/reference runs recorded above.
+
+
+### v0.7.0 GitHub release preparation
+
+Repair commit: `eea1621` (`fix(quic): enforce TLS negotiation and extension boundaries`).
+Version-only release preparation updates `mix.exs` and dates the changelog.
+`mix format --check-formatted`, `mix compile --warnings-as-errors`, and `mix test`
+all exit 0 on v0.7.0; the latter again passes **435 checks**
+(`/tmp/ex_ssl-v0.7.0-test.log`). `mix hex.build --output /tmp/ex_ssl-0.7.0.tar`
+exits 0; this builds a GitHub release attachment and does not publish to Hex.
+The package excludes the untracked repair prompt and test credentials. GitHub
+release notes carry the same baseline-failure and independent-HRR limitations.

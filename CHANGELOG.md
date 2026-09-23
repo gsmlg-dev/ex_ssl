@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.7.0] - 2026-09-23
+
 - Reject missing certificate/ECDHE key_share and supported_groups while accepting
   a present empty key_share vector for HRR, without restricting fingerprint observation.
 - Enforce the configured inbound extension budget on ServerHello and HRR before
