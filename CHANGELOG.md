@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.7.1] - 2026-09-23
+
 - Use equivalent block syntax and a local binding so all supported Elixir
   formatters accept the same source; retain the full compile/test matrices.
 
