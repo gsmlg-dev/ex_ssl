@@ -404,3 +404,15 @@ resumption is not separately certified by that gate.
 TCP or QUIC provenance, ordered unknown IDs, JA3 raw/hash and JA4 raw components
 and hash. It does not authenticate peers or constrain negotiation. See
 [FINGERPRINTS.md](FINGERPRINTS.md) for the contract and pinned reference vectors.
+
+
+## QUIC-TLS boundary validation
+
+The experimental `SSL.QUIC` API retains its existing signatures and role scope.
+Certificate/ECDHE offers require key_share/supported_groups presence; a legal
+empty share vector can cause HRR. Client ServerHello/HRR processing enforces the
+configured inbound extension budget before state advancement. EE and ticket
+errors preserve shared-core TLS alert categories. TCP defaults, authentication,
+resumption and fingerprint observation are unchanged. See
+[the interface](QUIC_TLS_INTERFACE.md) for precise inbound/outbound limit scope
+and [the ledger](QUIC_TLS_IMPLEMENTATION.md) for actual regression results.

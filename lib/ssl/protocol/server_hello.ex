@@ -57,15 +57,38 @@ defmodule SSL.Protocol.ServerHello do
 
   @spec decode(term(), term()) ::
           {:ok, t(), binary()} | {:more, non_neg_integer()} | {:error, term()}
-  def decode(input, expectations) do
+  @spec decode(term(), term(), keyword()) ::
+          {:ok, t(), binary()} | {:more, non_neg_integer()} | {:error, term()}
+  def decode(input, expectations, opts \\ []) do
     with {:ok, expectations} <- validate_expectations(expectations),
-         true <- is_binary(input) do
+         true <- is_binary(input),
+         :ok <- check_extension_limit(input, Keyword.get(opts, :max_extension_bytes, 65_535)) do
       decode_handshake(input, expectations)
     else
       false -> {:error, {:invalid_input, :not_binary}}
       {:error, _reason} = error -> error
     end
   end
+
+  @doc false
+  @spec check_extension_limit(binary(), non_neg_integer()) :: :ok | {:error, term()}
+  def check_extension_limit(_input, limit)
+      when not is_integer(limit) or limit < 0 or limit > 65_535,
+      do: {:error, {:invalid_limit, :max_extension_bytes}}
+
+  def check_extension_limit(
+        <<2, _body_length::24, _version::16, random::binary-size(32), sid_length, rest::binary>>,
+        limit
+      )
+      when sid_length <= 32 and byte_size(rest) >= sid_length + 5 do
+    <<_sid::binary-size(^sid_length), _cipher::16, _compression, length::16, _::binary>> = rest
+
+    if length > limit,
+      do: {:error, {:extension_length_exceeded, message_kind(random), length, limit}},
+      else: :ok
+  end
+
+  def check_extension_limit(_input, _limit), do: :ok
 
   defp decode_handshake(input, _expectations) when byte_size(input) < 4,
     do: {:more, 4 - byte_size(input)}

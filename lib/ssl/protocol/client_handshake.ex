@@ -247,10 +247,10 @@ defmodule SSL.Protocol.ClientHandshake do
   defp retry_ticket(ast, _ticket, _hash),
     do: {%{ast | extensions: Enum.reject(ast.extensions, &(elem(&1, 0) == 41))}, nil}
 
-  def decode_server_hello(encoded, offer, previous_hrr \\ nil) do
+  def decode_server_hello(encoded, offer, previous_hrr \\ nil, opts \\ []) do
     if repeated_retry?(encoded, previous_hrr),
       do: fatal(:unexpected_message, :second_hello_retry_request),
-      else: do_decode_server_hello(encoded, offer)
+      else: do_decode_server_hello(encoded, offer, opts)
   end
 
   defp repeated_retry?(
@@ -261,7 +261,7 @@ defmodule SSL.Protocol.ClientHandshake do
 
   defp repeated_retry?(_, _), do: false
 
-  defp do_decode_server_hello(encoded, offer) do
+  defp do_decode_server_hello(encoded, offer, opts) do
     expectations = %{
       legacy_session_id: offer.legacy_session_id,
       offered_ciphers: offer.cipher_suites,
@@ -273,9 +273,10 @@ defmodule SSL.Protocol.ClientHandshake do
       offered_psk_count: offer.psk_count
     }
 
-    case ServerHello.decode(encoded, expectations) do
+    case ServerHello.decode(encoded, expectations, opts) do
       {:ok, %ServerHello{} = hello, <<>>} -> {:ok, hello}
       {:ok, _, remainder} -> {:error, {:trailing_server_hello, byte_size(remainder)}}
+      {:error, {:extension_length_exceeded, _, _, _} = reason} -> fatal(:decode_error, reason)
       {:error, reason} -> {:error, {:fatal_alert, :illegal_parameter, reason}}
       other -> {:error, {:fatal_alert, :decode_error, other}}
     end

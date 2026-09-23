@@ -152,17 +152,18 @@ defmodule SSL.QUIC do
         fail(state, :tls, :decode_error, :handshake_budget_exceeded)
 
       true ->
-        case HandshakeFramer.feed(state.framer, bytes,
-               max_handshake_length: state.limits[:max_handshake_length]
-             ) do
-          {:ok, messages, framer} ->
-            consume(
-              %{state | framer: framer, total_bytes: state.total_bytes + byte_size(bytes)},
-              level,
-              messages,
-              []
-            )
-
+        with :ok <- hello_extension_limit(state, bytes),
+             {:ok, messages, framer} <-
+               HandshakeFramer.feed(state.framer, bytes,
+                 max_handshake_length: state.limits[:max_handshake_length]
+               ) do
+          consume(
+            %{state | framer: framer, total_bytes: state.total_bytes + byte_size(bytes)},
+            level,
+            messages,
+            []
+          )
+        else
           {:error, reason} ->
             fail(state, :tls, :decode_error, reason)
         end
@@ -170,6 +171,27 @@ defmodule SSL.QUIC do
   end
 
   def feed(%State{} = state, _, _), do: fail(state, :configuration, nil, :invalid_input)
+
+  # A valid ServerHello extension length is available in at most 76 bytes,
+  # including the largest legacy session ID. Inspect only that bounded prefix;
+  # do not flatten an accumulating payload on every fragmented feed.
+  defp hello_extension_limit(%State{role: :client, phase: :hello} = state, bytes) do
+    size = HandshakeFramer.buffered_size(state.framer)
+
+    if size < 76 do
+      prefix = HandshakeFramer.buffered_bytes(state.framer)
+      incoming = binary_part(bytes, 0, min(byte_size(bytes), 76 - size))
+
+      SSL.Protocol.ServerHello.check_extension_limit(
+        prefix <> incoming,
+        state.limits[:max_extension_bytes]
+      )
+    else
+      :ok
+    end
+  end
+
+  defp hello_extension_limit(_, _), do: :ok
 
   defp initialize(:server, config), do: {:ok, base(:server, config), []}
 
@@ -249,7 +271,12 @@ defmodule SSL.QUIC do
 
   defp step(%State{role: :client, phase: :hello} = state, <<2, _::binary>> = encoded) do
     with {:ok, hello} <-
-           ClientHandshake.decode_server_hello(encoded, state.hello.offer, state.hello.hrr) do
+           ClientHandshake.decode_server_hello(
+             encoded,
+             state.hello.offer,
+             state.hello.hrr,
+             max_extension_bytes: state.limits[:max_extension_bytes]
+           ) do
       case hello.kind do
         :hello_retry_request ->
           with {:ok, next, bytes} <- ClientHandshake.retry(state.hello, hello) do
@@ -403,7 +430,7 @@ defmodule SSL.QUIC do
            [hash: spec.hash] ++ Keyword.delete(state.limits, :max_total_handshake_bytes)
          ) do
       {:ok, %ServerFlight.NewSessionTicket{}, <<>>} -> {:ok, state, []}
-      {:error, reason} -> {:error, {:decode_error, reason}}
+      {:error, reason} -> HandshakeCore.decode_alert(reason)
       _ -> {:error, {:decode_error, :invalid_ticket}}
     end
   end
@@ -425,7 +452,7 @@ defmodule SSL.QUIC do
     else
       nil -> {:error, {:missing_extension, :quic_parameters_or_alpn}}
       false -> {:error, {:illegal_parameter, :unoffered_alpn}}
-      {:error, reason} -> {:error, {:decode_error, reason}}
+      {:error, reason} -> HandshakeCore.decode_alert(reason)
       _ -> {:error, {:unexpected_message, :expected_encrypted_extensions}}
     end
   end

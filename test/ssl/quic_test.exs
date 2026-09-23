@@ -471,8 +471,301 @@ defmodule SSL.QUICTest do
     {client, _, _, _} = drive(client, server, co, [], co, [])
     ticket = <<3600::32, 0::32, 0, 1::16, "x", 4::16, 57::16, 0::16>>
 
-    assert {:error, %{alert: :decode_error}, _, [_]} =
+    assert {:error, %{alert: :illegal_parameter, reason: :forbidden_extension}, _, [_]} =
              SSL.QUIC.feed(client, :application, <<4, byte_size(ticket)::24, ticket::binary>>)
+  end
+
+  test "R1 missing ECDHE extensions fail while observation remains permissive" do
+    {:ok, _, [{:emit, :initial, ch}]} = SSL.QUIC.new(:client, client_options())
+
+    for missing <- [[51], [10], [10, 51]] do
+      changed = rewrite_extensions(ch, &Enum.reject(&1, fn {id, _} -> id in missing end))
+      assert {:ok, _} = SSL.Fingerprint.client_hello(changed, :quic)
+
+      for fragmented <- [false, true] do
+        {:ok, server, []} = SSL.QUIC.new(:server, server_options())
+
+        assert_terminal(
+          feed_boundary(server, :initial, changed, fragmented),
+          :missing_extension,
+          :negotiation_extensions
+        )
+      end
+    end
+  end
+
+  test "R1 present empty shares produce HRR and malformed or duplicate shares fail" do
+    {:ok, _, [{:emit, :initial, ch}]} = SSL.QUIC.new(:client, client_options(groups: [29, 23]))
+    {:ok, server, []} = SSL.QUIC.new(:server, server_options(groups: [23]))
+    empty = rewrite_extensions(ch, &List.keyreplace(&1, 51, 0, {51, <<0::16>>}))
+    assert {:ok, _, [{:emit, :initial, hrr}]} = SSL.QUIC.feed(server, :initial, empty)
+    assert {:ok, offer} = SSL.Protocol.ClientOffer.from_client_hello(empty)
+
+    assert {:ok, %{kind: :hello_retry_request, extensions: extensions}} =
+             SSL.Protocol.ClientHandshake.decode_server_hello(hrr, offer)
+
+    assert {:selected_group, 23} in extensions
+
+    duplicate =
+      rewrite_extensions(ch, fn extensions ->
+        {51, <<size::16, share::binary>>} = List.keyfind(extensions, 51, 0)
+        List.keyreplace(extensions, 51, 0, {51, <<size * 2::16, share::binary, share::binary>>})
+      end)
+
+    assert_terminal(
+      SSL.QUIC.feed(server, :initial, duplicate),
+      :illegal_parameter,
+      :duplicate_key_share
+    )
+
+    malformed = rewrite_extensions(ch, &List.keyreplace(&1, 51, 0, {51, <<1::16>>}))
+
+    assert_terminal(
+      SSL.QUIC.feed(server, :initial, malformed),
+      :decode_error,
+      :malformed_client_hello_extension
+    )
+
+    unrelated = rewrite_extensions(ch, &List.keyreplace(&1, 10, 0, {10, <<2::16, 23::16>>}))
+
+    assert_terminal(
+      SSL.QUIC.feed(server, :initial, unrelated),
+      :illegal_parameter,
+      :key_share_groups
+    )
+  end
+
+  test "empty-share client profiles remain unsupported without fabricated key material" do
+    options = client_options()
+    {:ok, config} = SSL.QUIC.Config.build(:client, options)
+    profile = SSL.QUIC.Config.default_profile(config)
+
+    profile = %{
+      profile
+      | extensions: List.keyreplace(profile.extensions, :key_share, 0, {:key_share, []})
+    }
+
+    assert {:error, %{kind: :configuration}} =
+             SSL.QUIC.new(:client, Keyword.put(options, :profile, profile))
+  end
+
+  test "R2 oversized cookie HRR fails before CH2 for whole and fragmented input" do
+    for fragmented <- [false, true] do
+      {:ok, client, [{:emit, :initial, ch}]} =
+        SSL.QUIC.new(
+          :client,
+          client_options(ciphers: [0x1301], groups: [29, 23], limits: [max_extension_bytes: 1024])
+        )
+
+      assert byte_size(ch) < 1024
+      assert {:ok, offer} = SSL.Protocol.ClientOffer.from_client_hello(ch)
+
+      assert {:ok, %{kind: :hello_retry_request}} =
+               SSL.Protocol.ClientHandshake.decode_server_hello(cookie_hrr(2048), offer)
+
+      assert {:error,
+              {:fatal_alert, :decode_error,
+               {:extension_length_exceeded, :hello_retry_request, 2066, 1024}}} =
+               SSL.Protocol.ClientHandshake.decode_server_hello(cookie_hrr(2048), offer, nil,
+                 max_extension_bytes: 1024
+               )
+
+      assert_terminal(
+        feed_boundary(client, :initial, cookie_hrr(2048), fragmented),
+        :decode_error,
+        :extension_length_exceeded
+      )
+    end
+  end
+
+  test "R2 exact extension budget accepts HRR cookie and one byte over fails" do
+    # version (6), selected group (6), cookie header and vector (6) plus cookie bytes.
+    for cookie_size <- [1006, 1007], fragmented <- [false, true] do
+      {:ok, client, _} =
+        SSL.QUIC.new(
+          :client,
+          client_options(ciphers: [0x1301], groups: [29, 23], limits: [max_extension_bytes: 1024])
+        )
+
+      result = feed_boundary(client, :initial, cookie_hrr(cookie_size), fragmented)
+
+      if cookie_size == 1006 do
+        assert {:ok, _, [{:emit, :initial, ch2}]} = result
+        assert {:ok, offer} = SSL.Protocol.ClientOffer.from_client_hello(ch2)
+
+        assert {44, <<cookie_size::16, :binary.copy(<<7>>, cookie_size)::binary>>} in offer.extensions
+
+        assert [%{group: 23}] = offer.key_shares
+
+        assert Enum.sum(Enum.map(offer.extensions, fn {_, bytes} -> 4 + byte_size(bytes) end)) >
+                 1024
+      else
+        assert_terminal(result, :decode_error, :extension_length_exceeded)
+      end
+    end
+  end
+
+  test "R2 rejects declared hello extension length before its payload arrives" do
+    for encoded <- [cookie_hrr(2048), ordinary_hello()] do
+      {:ok, client, _} =
+        SSL.QUIC.new(
+          :client,
+          client_options(ciphers: [0x1301], groups: [29, 23], limits: [max_extension_bytes: 32])
+        )
+
+      # Empty session ID: vector length ends at offset 44, before extension payload.
+      <<prefix::binary-size(43), last_length_byte, _::binary>> = encoded
+      assert {:ok, client, []} = SSL.QUIC.feed(client, :initial, prefix)
+
+      assert_terminal(
+        SSL.QUIC.feed(client, :initial, <<last_length_byte>>),
+        :decode_error,
+        :extension_length_exceeded
+      )
+    end
+  end
+
+  test "R2 ordinary ServerHello also obeys the independent extension budget" do
+    for fragmented <- [false, true] do
+      {:ok, client, _} =
+        SSL.QUIC.new(
+          :client,
+          client_options(ciphers: [0x1301], groups: [29], limits: [max_extension_bytes: 45])
+        )
+
+      assert_terminal(
+        feed_boundary(client, :initial, ordinary_hello(), fragmented),
+        :decode_error,
+        :extension_length_exceeded
+      )
+    end
+  end
+
+  test "R3 EE errors retain shared core and TCP adapter classification" do
+    {:ok, client, co} = SSL.QUIC.new(:client, client_options())
+    {:ok, server, []} = SSL.QUIC.new(:server, server_options())
+    {_, out} = deliver(server, co)
+    [{:emit, :initial, sh}] = Enum.filter(out, &match?({:emit, :initial, _}, &1))
+    {:ok, client, _} = SSL.QUIC.feed(client, :initial, sh)
+    normal = [{16, <<5::16, 4, "test">>}, {57, <<2, 0>>}]
+
+    for {ee, alert, reason} <- [
+          {encrypted_extensions(normal ++ [{0, <<>>}]), :unsupported_extension,
+           :unsolicited_extension},
+          {encrypted_extensions(normal ++ [{51, <<29::16, 32::16, 0::256>>}]), :illegal_parameter,
+           :forbidden_extension},
+          {encrypted_extensions(normal ++ [{0xBABA, <<>>}]), :unsupported_extension,
+           :unsupported_extension},
+          {<<8, 2::24, 1::16>>, :decode_error, :malformed_extensions},
+          {<<8, 6::24, 4::16, 16::16, 7::16>>, :decode_error, :malformed_extension}
+        ] do
+      expected = SSL.Protocol.HandshakeCore.process_message(client.core, ee)
+      assert {:error, {:fatal_alert, ^alert, core_reason}} = expected
+      assert elem(core_reason, 0) == reason
+      tcp = %SSL.Protocol.ServerFlightVerifier.Incremental{core: client.core}
+      assert SSL.Protocol.ServerFlightVerifier.process_message(tcp, ee) == expected
+      assert_terminal(SSL.QUIC.feed(client, :handshake, ee), alert, reason)
+    end
+
+    assert_terminal(
+      SSL.QUIC.feed(client, :handshake, encrypted_extensions([{16, <<5::16, 4, "test">>}])),
+      :missing_extension,
+      :quic_parameters_or_alpn
+    )
+
+    assert_terminal(
+      SSL.QUIC.feed(
+        client,
+        :handshake,
+        encrypted_extensions([{16, <<6::16, 5, "other">>}, {57, <<>>}])
+      ),
+      :illegal_parameter,
+      :unoffered_alpn
+    )
+
+    # A later failure in the same feed must discard earlier parameter actions.
+    coalesced = encrypted_extensions(normal) <> encrypted_extensions(normal ++ [{0, <<>>}])
+
+    assert_terminal(
+      SSL.QUIC.feed(client, :handshake, coalesced),
+      :unsupported_extension,
+      :unsolicited_extension
+    )
+
+    assert {:ok, _, [{:peer_transport_parameters, <<2, 0>>, :unverified}]} =
+             SSL.QUIC.feed(client, :handshake, encrypted_extensions(normal))
+  end
+
+  test "R3 ticket preparse preserves forbidden-extension classification" do
+    {:ok, c, co} = SSL.QUIC.new(:client, client_options())
+    {:ok, s, []} = SSL.QUIC.new(:server, server_options())
+    {c, _, _, _} = drive(c, s, co, [], co, [])
+
+    for id <- [51, 57] do
+      body = <<3600::32, 0::32, 0, 1::16, "x", 4::16, id::16, 0::16>>
+
+      assert_terminal(
+        SSL.QUIC.feed(c, :application, <<4, byte_size(body)::24, body::binary>>),
+        :illegal_parameter,
+        :forbidden_extension,
+        true
+      )
+    end
+  end
+
+  defp assert_terminal(result, alert, reason, completed \\ false) do
+    assert {:error, %SSL.QUIC.Error{kind: :tls, alert: ^alert, reason: ^reason} = error, failed,
+            [{:error, error}]} = result
+
+    assert %{phase: :failed, handshake_complete: ^completed} = SSL.QUIC.info(failed)
+    assert failed.core == nil
+    assert failed.hello == nil
+    assert failed.config == nil
+    assert {:error, %{kind: :closed}, ^failed, []} = SSL.QUIC.feed(failed, :initial, <<>>)
+  end
+
+  defp feed_boundary(state, level, bytes, false), do: SSL.QUIC.feed(state, level, bytes)
+
+  defp feed_boundary(state, level, bytes, true) do
+    Enum.reduce_while(:binary.bin_to_list(bytes), {:ok, state, []}, fn byte, {:ok, state, []} ->
+      case SSL.QUIC.feed(state, level, <<byte>>) do
+        {:ok, next, actions} -> {:cont, {:ok, next, actions}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp cookie_hrr(size) do
+    random = Base.decode16!("CF21AD74E59A6111BE1D8C021E65B891C2A211167ABB8C5E079E09E2C8A8339C")
+
+    hello_message(random, [
+      {43, <<0x0304::16>>},
+      {51, <<23::16>>},
+      {44, <<size::16, :binary.copy(<<7>>, size)::binary>>}
+    ])
+  end
+
+  defp ordinary_hello do
+    hello_message(<<0::256>>, [{43, <<0x0304::16>>}, {51, <<29::16, 32::16, 9, 0::248>>}])
+  end
+
+  defp hello_message(random, extensions) do
+    raw = extension_bytes(extensions)
+    body = <<0x0303::16, random::binary, 0, 0x1301::16, 0, byte_size(raw)::16, raw::binary>>
+    <<2, byte_size(body)::24, body::binary>>
+  end
+
+  defp encrypted_extensions(extensions) do
+    raw = extension_bytes(extensions)
+    <<8, byte_size(raw) + 2::24, byte_size(raw)::16, raw::binary>>
+  end
+
+  defp extension_bytes(extensions) do
+    IO.iodata_to_binary(
+      Enum.map(extensions, fn {id, bytes} ->
+        <<id::16, byte_size(bytes)::16, bytes::binary>>
+      end)
+    )
   end
 
   defp flip(bytes) do

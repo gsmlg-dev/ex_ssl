@@ -27,6 +27,43 @@ defmodule SSL.Protocol.ServerHelloTest do
     offered_psk_key_exchange_modes: []
   }
 
+  test "extension budgets count encoded entries and reject at the declared length" do
+    hrr =
+      hello(
+        random: @hrr_random,
+        extensions: [
+          extension(43, <<0x0304::16>>),
+          extension(51, <<23::16>>),
+          extension(44, <<3::16, 1, 2, 3>>)
+        ]
+      )
+
+    for {encoded, kind, size} <- [
+          {@server_hello, :server_hello, 46},
+          {hrr, :hello_retry_request, 21}
+        ] do
+      assert {:ok, %{encoded: ^encoded}, <<>>} = ServerHello.decode(encoded, @expectations)
+
+      assert {:ok, _, <<>>} =
+               ServerHello.decode(encoded, @expectations, max_extension_bytes: size)
+
+      limit = size - 1
+      expected = {:error, {:extension_length_exceeded, kind, size, limit}}
+      assert ServerHello.decode(encoded, @expectations, max_extension_bytes: limit) == expected
+      # Fixture has a two-byte session ID; its extension payload starts at 46.
+      for split <- 0..byte_size(encoded) do
+        prefix = binary_part(encoded, 0, split)
+        result = ServerHello.decode(prefix, @expectations, max_extension_bytes: limit)
+        if split < 46, do: assert(match?({:more, _}, result)), else: assert(result == expected)
+      end
+    end
+
+    for limit <- [-1, nil, 65_536] do
+      assert {:error, {:invalid_limit, :max_extension_bytes}} =
+               ServerHello.decode(@server_hello, @expectations, max_extension_bytes: limit)
+    end
+  end
+
   test "decodes and preserves an exact ServerHello fixture" do
     assert {:ok, server_hello, <<>>} = ServerHello.decode(@server_hello, @expectations)
 

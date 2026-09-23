@@ -37,3 +37,11 @@ The `QUIC TLS reference` GitHub Actions workflow runs the same command separatel
 
 Local result (OTP 29.0.2, Elixir 1.20.1): **13/13 passed**. This establishes
 independent QUIC-TLS boundary interoperability, **not full QUIC network interop**.
+
+HRR coverage limitation (aioquic 1.2.0): its `tls.Context` has no HRR state or
+transcript-rewrite path. `_client_handle_hello` always decodes a ServerHello key
+share as a full peer public key; `_server_handle_hello` selects an existing share
+and asserts that a shared key was found. It cannot supply the forced-HRR
+comparison required here. The 13 existing scenarios remain intact; HRR,
+empty-share negotiation and cookie-budget boundaries are tested by exact protocol
+unit tests, not claimed as independent HRR interoperability.

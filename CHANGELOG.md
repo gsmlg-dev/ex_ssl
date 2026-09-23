@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Reject missing certificate/ECDHE key_share and supported_groups while accepting
+  a present empty key_share vector for HRR, without restricting fingerprint observation.
+- Enforce the configured inbound extension budget on ServerHello and HRR before
+  processing cookies or emitting CH2, including fragmented length declarations.
+- Preserve shared TLS alert classification in QUIC EncryptedExtensions and ticket
+  parsing; retain terminal action atomicity and existing TCP behavior.
+
+## [0.6.0] - 2026-09-23
+
 - Extract the TLS 1.3 client authentication and traffic-secret core from its TCP
   record adapter; preserve client identity and resumption processing.
 - Share ClientHello/HRR orchestration with the new experimental `SSL.QUIC`

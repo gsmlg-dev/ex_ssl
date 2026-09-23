@@ -211,7 +211,8 @@ defmodule SSL.Protocol.ServerHandshake do
       offer.legacy_session_id != <<>> ->
         {:error, {:quic, :quic_session_id}}
 
-      offer.signature_schemes == [] or offer.supported_groups == [] ->
+      51 not in offer.extension_ids or 10 not in offer.extension_ids or
+        offer.signature_schemes == [] or offer.supported_groups == [] ->
         {:error, {:missing_extension, :negotiation_extensions}}
 
       shares != Enum.uniq(shares) ->

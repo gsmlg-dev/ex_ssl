@@ -74,6 +74,23 @@ has its existing key/certificate bounds. Local parameter payloads are at most
 65,000 bytes and within the configured extension bound, leaving space for TLS
 extension overhead. No QUIC parameter-item decoder is present.
 
+`max_extension_bytes` is an **inbound** encoded extension-vector budget: each
+entry's four-byte type/length header and payload count; the outer vector length
+and handshake header do not. It covers server-received ClientHello and
+client-received ServerHello/HRR, EncryptedExtensions, CertificateRequest,
+certificate-entry extensions (also cumulatively across the chain), and
+NewSessionTicket. ServerHello/HRR declared extension lengths are rejected as soon
+as the fixed prefix and vector length arrive, even before the payload. Rejection
+precedes retry key generation, CH2 serialization and secret actions, with
+`kind: :tls, alert: :decode_error, reason: :extension_length_exceeded`.
+The independent per-message and cumulative handshake limits still apply.
+
+Outbound messages retain their per-message/cumulative handshake budgets and local
+parameter-payload checks. The configured extension budget is **not** a total
+outbound extension-vector cap: an accepted HRR cookie can make CH2's extensions
+larger than the receive budget. This change closes the inbound Initial-message
+gap; it does not add an outbound extension-vector policy.
+
 ## Ordered actions and authentication
 
 Actions form one list, processed from left to right:
@@ -143,6 +160,24 @@ present-empty differ. TLS validates envelope length, duplicates, placement and
 resource limits, retaining raw bytes. The caller validates QUIC parameter IDs,
 duplicate parameter IDs, CID, flow control and version-specific semantics.
 Ordinary TCP profiles cannot emit this extension accidentally.
+
+Certificate/ECDHE negotiation requires both supported_groups and key_share.
+A missing extension fails with `missing_extension` / `negotiation_extensions`;
+a present, correctly encoded empty client_shares vector can trigger HRR.
+Duplicate shares and invalid group relationships remain `illegal_parameter`,
+and malformed vectors remain `decode_error`. These are negotiation checks;
+fingerprint observation still accepts syntactically valid offers without these
+capabilities. The client currently requires a matching real initial key share:
+an explicit empty-share profile cannot initiate a connection. Accepting an empty
+peer share list does not change that client limitation or the nonempty default.
+
+EE and post-handshake ticket decoding use the shared TLS core's classification:
+unoffered/unsupported extensions produce `unsupported_extension`, known
+extensions in forbidden positions produce `illegal_parameter`, and malformed
+encoding/lengths produce `decode_error`. Missing QUIC parameters remain
+`missing_extension`; selecting an unoffered ALPN remains `illegal_parameter`.
+The `SSL.QUIC` function signatures, ordered-action contract and error domains
+are unchanged; callers need no migration, but now receive the corrected alerts.
 
 Local resumption, 0-RTT and server-mTLS requests are unsupported configuration.
 A legal peer PSK/early-data proposal can be declined for a certificate handshake;

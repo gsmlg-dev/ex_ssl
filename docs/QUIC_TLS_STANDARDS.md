@@ -66,3 +66,18 @@ retains its optional signing identity until its own authentication flight, then
 clears it. Completion, failure and abort release obsolete core/config references.
 Older immutable states and returned secrets are the caller's responsibility;
 BEAM memory zeroization is not claimed.
+
+## 2026-09-23 boundary corrections
+
+- RFC 9846 section 9.2 and key_share semantics: certificate/ECDHE negotiation
+  requires extension presence separately from the legal empty client_shares
+  vector. The server may decline a valid PSK offer for certificate authentication;
+  no PSK capability was added. Observation remains distinct from negotiation.
+- ServerHello/HRR extension limits count the actual encoded vector entries.
+  The shared decoder checks declared length before parsing the payload or
+  advancing HRR. This is an independently configurable receive budget, not a
+  claim that prior memory use was unbounded.
+- RFC 9846 extension response/placement rules and the existing shared-core
+  mapping distinguish unsupported/unoffered extensions, forbidden positions,
+  and malformed encoding. QUIC pre-parsing now preserves that mapping, including
+  NewSessionTicket. No TLS-to-QUIC CONNECTION_CLOSE encoder is added.

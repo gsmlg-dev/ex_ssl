@@ -252,3 +252,120 @@ new-regression repair scope in task section 8A. Thus delivery of the requested
 TLS/fingerprint boundary is complete, while the repository-wide integration
 suite is **not green**. The transient lifecycle observation remains a documented
 validation risk, not a resolved defect or a proven baseline defect.
+
+
+## R1–R3 boundary repair — 2026-09-23
+
+This section records the new repair, not a reinterpretation of the historical
+runs above. Starting branch/HEAD: `main`,
+`29907a396ef025532454dec13cd3a787b600e44e` (v0.6.0). The only pre-existing working
+file was the untracked `CODEX-FIX-PROMPT.md`; it is preserved. The user subsequently
+authorized conventional commits, push, and the next minor GitHub release (v0.7.0),
+superseding the repair prompt's original no-publication instruction. No ex_quic
+or Abyss files, production dependencies, or TCP runtime code are changed.
+Runtime: Elixir 1.20.1, Erlang/OTP 29.0.2 (ERTS 17.0.2), macOS;
+Python reference environment `/tmp/ex_ssl-quic-reference-venv` with pinned aioquic
+1.2.0. `unbuffer` is unavailable; commands used ordinary `mix` with captured logs.
+
+### Reproduction and correction
+
+Before production edits, `mix test test/ssl/quic_test.exs
+ test/ssl/fingerprint_test.exs` passed **28 checks** (exit 0;
+`/tmp/ex_ssl-fix-baseline.log`). After adding R1–R3 regressions,
+`mix test test/ssl/quic_test.exs` failed **7 of 31 checks** (exit 2, seed 287963;
+`/tmp/ex_ssl-fix-red.log`):
+
+| Item | Observed red behavior | Minimal correction and coverage |
+| --- | --- | --- |
+| R1 | Removing extension 51 emitted HRR | `ServerHandshake.validate_offer/1` requires key_share/supported_groups presence for certificate/ECDHE; the observer stays permissive. Whole/bytewise missing-extension failures emit only terminal error; present-empty produces a decoded valid HRR; duplicate/malformed/unrelated groups reject; normal duplex and legal declined PSK still pass. |
+| R2 | 2048-byte cookie under a 1024-byte budget emitted CH2; 1025-byte vector was also accepted; low-budget SH exported secrets | `ServerHello` shares a declared-length check with QUIC's bounded (at most 76-byte) Initial prefix check; `ClientHandshake` accepts optional decoder limits while old arities retain defaults. Exact 1024-byte vector succeeds, 1025 fails; length/payload split and bytewise feeds reject before retry/secret output; ordinary SH, shared decoder defaults and TCP HRR remain tested. |
+| R3 | Unoffered SNI EE and forbidden ticket extensions became decode_error | QUIC EE/NST pre-parsing reuses `HandshakeCore.decode_alert/1`. Tests compare actual core/TCP adapter/QUIC processing for unoffered, unsupported, forbidden and malformed EE; missing TP/unoffered ALPN retain their distinct errors. Coalesced failure discards earlier uncommitted parameter actions. |
+
+The first green attempt exposed a test-helper assumption: a post-handshake ticket
+failure retains the documented historical `handshake_complete: true` fact.
+The helper now checks that historical value explicitly for tickets while checking
+false for handshake failures. Production completion semantics were not changed.
+An existing ticket test's generic decode_error expectation was replaced with the
+specific illegal_parameter/forbidden_extension assertion required by R3; no
+rejection assertion was removed or relaxed.
+
+The public `SSL.QUIC` API needs no migration. The internal decoder adds optional
+limits, and the existing core error mapping becomes reusable within the protocol
+implementation. Exact transcript bytes, fresh keys, authentication checks,
+ordered actions, both roles and fingerprint APIs are retained. The interface
+now explicitly documents inbound vector budgeting versus the existing outbound
+message/cumulative budgets, and the unsupported empty-share client profile.
+
+### Executed validation
+
+| Command | Result |
+| --- | --- |
+| `mix format --check-formatted` | Exit 0 |
+| `mix compile --warnings-as-errors` | Exit 0 |
+| `mix test test/ssl/quic_test.exs test/ssl/fingerprint_test.exs` | Exit 0; **37 passed**, 1 property and 36 tests |
+| Focused protocol command below | Exit 0; **143 passed**, 6 properties and 137 tests (before the final empty-profile test and additional assertions) |
+| `mix test` | Exit 0; **435 passed**, 20 properties and 415 tests; normal default excludes 177 integration tests |
+| `mix test --include integration --seed 449482` | Exit 2; **610/612 passed**, precisely the two baseline TCP failures below |
+| `git diff --check` | Exit 0 |
+| `/tmp/ex_ssl-quic-reference-venv/bin/pip install -r e2e/quic_tls/requirements.txt` | Exit 0; pinned dependencies present |
+| `QUIC_TLS_PYTHON=/tmp/ex_ssl-quic-reference-venv/bin/python mix run e2e/quic_tls/run.exs` | Exit 0; **13/13 PASS**, both roles, suites, ECDSA/RSA and client identity |
+
+Focused command (includes ClientHandshake coverage through HandshakeMachine):
+
+```sh
+mix test test/ssl/quic_test.exs test/ssl/fingerprint_test.exs \
+  test/ssl/protocol/server_hello_test.exs \
+  test/ssl/protocol/handshake_machine_test.exs \
+  test/ssl/protocol/server_flight_verifier_test.exs \
+  test/ssl/protocol/server_flight_test.exs \
+  test/ssl/protocol/resumption_hrr_test.exs \
+  test/ssl/protocol/resumption_verifier_test.exs \
+  test/ssl/protocol/client_authentication_test.exs
+```
+
+Local logs: `/tmp/ex_ssl-fix-focused.log`, `/tmp/ex_ssl-fix-independent.log`,
+`/tmp/ex_ssl-fix-reference-install.log`, and
+`/tmp/ex_ssl-fix-final-{format,compile,api,default,integration,diff}.log`.
+Per-command exit codes are captured in `/tmp/ex_ssl-fix-final-results.json`.
+The initial changed-tree full integration run was **609/611** before the final
+empty-profile test; its failures were identical (`/tmp/ex_ssl-fix-integration.log`).
+
+### Baseline attribution and acceptance
+
+Created a clean detached worktree at `.trees/quic-fix-baseline`, exact commit
+`29907a396ef025532454dec13cd3a787b600e44e`. Ran `mix deps.get` (exit 0), then the
+same `mix test --include integration --seed 449482`, same host/runtime/default
+24 max_cases, without filtering tests. Result: exit 2, **600/602 passed**;
+`/tmp/ex_ssl-fix-clean-integration.log`. Its tracked working tree remained clean.
+Both baseline and changed trees fail these exact assertions:
+
+1. `input_ordering_regression_test.exs:325`: reference peer expects
+   `{:error, :closed}`, receives `{:ok, "pending-output"}` at line 336.
+2. `connection_backpressure_test.exs:9`: `KeyUpdate was not queued behind output`
+   at line 49.
+
+These are reproduced baseline defects, not passing checks, and were not repaired
+by expanding the task into TCP runtime changes. No new TCP failure appeared in
+these runs; lifecycle tests passed. Historical intermittent observations above
+are not reclassified or claimed resolved. The full integration gate remains
+**failed**, and no exclusion, timeout increase or retry was used to hide it.
+
+The prior independent CI is verified successful: `gh run view 35819480101`
+reports `success`, head `33a3637c9ec972dd1db9b173f38686286445c9a6`.
+That supersedes the historical pre-dispatch wording above. The current local
+13-scenario reference also passes. Pinned aioquic 1.2.0 cannot process/generate
+HRR (see the harness README); no independent HRR pass is claimed.
+
+R1–R3 and the existing independent reference pass, with no new observed TCP
+regression. These three defects no longer block ex_quic from using the documented
+experimental record-free API. The known TCP failures, inbound-only extension
+budget scope, unavailable independent HRR coverage, and absence of production
+security certification remain explicit limitations. This is not full QUIC
+network interoperability or an assurance that all CI/runtime matrices pass.
+
+Final decoder assertions additionally verify the default shared ClientHandshake
+call accepts the large legal cookie while its limited call rejects the exact
+2066-byte vector. `mix test test/ssl/quic_test.exs
+ test/ssl/protocol/server_hello_test.exs`: exit 0, **49 passed** (2 properties,
+47 tests); `/tmp/ex_ssl-fix-final-decoder.log`. No production code changed after
+the full-suite/reference runs recorded above.

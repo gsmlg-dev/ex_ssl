@@ -704,19 +704,21 @@ defmodule SSL.Protocol.HandshakeCore do
   defp certificate_extension_id({:signed_certificate_timestamps, _timestamps}), do: 18
   defp certificate_extension_id(_extension), do: nil
 
-  defp decode_alert({:extension_not_offered, id}),
+  @doc false
+  @spec decode_alert(term()) :: {:error, {:fatal_alert, atom(), term()}}
+  def decode_alert({:extension_not_offered, id}),
     do: alert(:unsupported_extension, {:unsolicited_extension, id})
 
-  defp decode_alert({:unsupported_extension, context, id}),
+  def decode_alert({:unsupported_extension, context, id}),
     do: alert(:unsupported_extension, {:unsupported_extension, context, id})
 
-  defp decode_alert({:forbidden_extension, context, id}),
+  def decode_alert({:forbidden_extension, context, id}),
     do: alert(:illegal_parameter, {:forbidden_extension, context, id})
 
-  defp decode_alert({:signature_scheme_not_allowed, scheme}),
+  def decode_alert({:signature_scheme_not_allowed, scheme}),
     do: alert(:illegal_parameter, {:signature_scheme_not_offered, scheme})
 
-  defp decode_alert(reason), do: alert(:decode_error, reason)
+  def decode_alert(reason), do: alert(:decode_error, reason)
 
   defp verify_peer(%Certificate{entries: entries}, input, config) do
     chain = Enum.map(entries, & &1.der)
