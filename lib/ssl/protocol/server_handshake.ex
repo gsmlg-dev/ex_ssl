@@ -108,7 +108,8 @@ defmodule SSL.Protocol.ServerHandshake do
       )
 
     with {:ok, secrets} <- HandshakeCore.derive_secrets(pair, public, spec.name, transcript),
-         {:ok, certificate} <- ServerFlight.encode_client_certificate(<<>>, config.identity.chain),
+         chain = config.identity.chain,
+         {:ok, certificate} <- ServerFlight.encode_client_certificate(<<>>, chain),
          transcript = transcript |> Transcript.append(ee) |> Transcript.append(certificate),
          {:ok, signature} <-
            Signature.sign_server(

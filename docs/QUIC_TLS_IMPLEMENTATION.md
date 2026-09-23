@@ -381,3 +381,45 @@ all exit 0 on v0.7.0; the latter again passes **435 checks**
 exits 0; this builds a GitHub release attachment and does not publish to Hex.
 The package excludes the untracked repair prompt and test credentials. GitHub
 release notes carry the same baseline-failure and independent-HRR limitations.
+
+## F1 cross-version formatting — 2026-09-23
+
+Baseline: `606087058e912b08ce20e145bcd8505744be8a78` (v0.7.0).
+This follow-up changes only four expressions in three files: explicit `do/end`
+for two config conditionals and the retry guard, plus a `chain` binding immediately
+after successful secret derivation and before certificate encoding. Conditions,
+short-circuiting, return values, field-access timing and handshake actions are
+unchanged. Parsed ASTs for Config and ClientHandshake are identical after removing
+source metadata; the new server binding is used only by the original next call.
+No protocol tests, interfaces, dependencies, minimum Elixir requirement or CI
+matrix/check names were changed. R1–R3 remain intact.
+
+Elixir 1.18.5 reproduced the original four formatting differences (exit 1;
+`/tmp/ex_ssl-f1-red.log`). After the edit, full-repository
+`mix format --check-formatted` exits 0 on **1.18.5, 1.19.5 and 1.20.1**;
+all three accept the same bytes without formatter rewrites. Local runtimes use
+OTP 29.0.2; this is formatter evidence, not local OTP28 compatibility evidence.
+The 1.18.5 distribution is built for OTP27, as in the original CI; an attempted
+OTP28 distribution download returned 404 before the correct artifact was selected.
+There is no need for a new format job or a branch-protection change.
+
+Local Elixir 1.20.1 / OTP29.0.2 validation (all exit 0):
+
+- `mix compile --warnings-as-errors`.
+- `mix test test/ssl/quic_test.exs test/ssl/fingerprint_test.exs test/ssl/protocol/server_hello_test.exs`:
+  **54 passed**, including 2 properties.
+- `mix test`: **435 passed**, including 20 properties; 177 integration tests
+  excluded by the unchanged default policy.
+- `QUIC_TLS_PYTHON=/tmp/ex_ssl-quic-reference-venv/bin/python mix run e2e/quic_tls/run.exs`:
+  **13/13 PASS**, unchanged pinned aioquic 1.2.0 scenarios.
+- `git diff --check`.
+
+Logs: `/tmp/ex_ssl-f1-{compile,focused,default,reference,diff}.log` and
+`/tmp/ex_ssl-f1-results.json`. The Linux suite wrapper is not run locally because
+`setsid` and `timeout` are unavailable. The existing GitHub `Test` matrix executes
+`./scripts/ci_run_suite.sh --seed 101 test` for 1.18/28, 1.19/28 and 1.20/29;
+release notes record the actual remote run/job results before publication.
+The optional full local integration command is not rerun for this syntax-only
+change. Earlier macOS TCP failures above remain historical evidence, not current
+passes or formatter failures. The user's final instruction explicitly authorizes
+commit/push and the v0.7.1 GitHub patch release.

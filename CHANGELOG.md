@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Use equivalent block syntax and a local binding so all supported Elixir
+  formatters accept the same source; retain the full compile/test matrices.
+
 ## [0.7.0] - 2026-09-23
 
 - Reject missing certificate/ECDHE key_share and supported_groups while accepting

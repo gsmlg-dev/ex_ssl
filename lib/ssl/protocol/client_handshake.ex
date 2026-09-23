@@ -257,7 +257,9 @@ defmodule SSL.Protocol.ClientHandshake do
          <<2, size::24, 0x0303::16, random::binary-size(32), _::binary>> = encoded,
          %ServerHello{random: random}
        )
-       when byte_size(encoded) == size + 4, do: true
+       when byte_size(encoded) == size + 4 do
+    true
+  end
 
   defp repeated_retry?(_, _), do: false
 

@@ -192,7 +192,11 @@ defmodule SSL.QUIC.Config do
     if Enum.any?(
          [:cacerts, :reference_identity, :server_name, :depth, :customize_hostname_check],
          &Keyword.has_key?(opts, &1)
-       ), do: {:error, :unsupported_server_authentication}, else: :ok
+       ) do
+      {:error, :unsupported_server_authentication}
+    else
+      :ok
+    end
   end
 
   defp client_trust(:client, opts) do
@@ -214,7 +218,11 @@ defmodule SSL.QUIC.Config do
          Enum.all?(opts, fn {key, value} ->
            key in Keyword.keys(@limits) and is_integer(value) and value > 0 and
              value <= @limits[key]
-         end), do: {:ok, Keyword.merge(@limits, opts)}, else: {:error, :invalid_limits}
+         end) do
+      {:ok, Keyword.merge(@limits, opts)}
+    else
+      {:error, :invalid_limits}
+    end
   end
 
   defp limits(_), do: {:error, :invalid_limits}
