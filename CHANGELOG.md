@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Extract the TLS 1.3 client authentication and traffic-secret core from its TCP
+  record adapter; preserve client identity and resumption processing.
+- Share ClientHello/HRR orchestration with the new experimental `SSL.QUIC`
+  caller-owned client/server certificate-handshake API, including ordered traffic
+  secrets, raw transport parameters, limits and redacted state/actions.
+- Add actual duplex/HRR, cipher/group, fragmentation and authentication-negative
+  checks, bounded malformed-input properties and explicit RFC 9001 error domains.
+- Add `SSL.Fingerprint` for record-free JA3/JA4 observation of actual ClientHello
+  bytes, with explicit TCP/QUIC context and pinned official/reference fixtures.
+- Add a pinned aioquic TLS-only comparison and CI job covering both roles,
+  all three suites, ECDSA/RSA identities and client CertificateRequest handling.
+
 ## [0.5.0] - 2026-09-22
 
 - Run mandatory integration coverage across all three supported Elixir/OTP tuples.

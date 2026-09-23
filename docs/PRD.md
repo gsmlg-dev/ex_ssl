@@ -65,6 +65,11 @@ Compute JA3, JA4, and exact-wire diagnostics from the same ClientHello represent
 
 ## 5. Non-goals for initial release
 
+The current record-free TLS integration is an explicit scope extension described
+in [ADR_QUIC_TLS_CORE.md](ADR_QUIC_TLS_CORE.md). It adds a handshake engine for a
+future QUIC caller, not QUIC networking, HTTP/3, or TCP server APIs. The following
+list describes the historical initial release.
+
 The initial release does not aim to provide:
 
 - TLS server APIs;

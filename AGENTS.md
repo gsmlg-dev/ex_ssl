@@ -93,6 +93,12 @@ Do not create an Erlang module named `:ssl`; it would conflict with OTP.
 
 ## Architecture rules
 
+The record-free TLS 1.3 integration follows `docs/ADR_QUIC_TLS_CORE.md`.
+Share handshake authentication and secret derivation between TCP and `SSL.QUIC`;
+keep TLS record keys/encryption in the TCP adapter. QUIC networking and TCP server
+APIs remain outside this task. Track actual implementation and verification in
+`docs/QUIC_TLS_IMPLEMENTATION.md`; a contract document is not a support claim.
+
 ### Public layer
 
 `SSL` translates OTP-compatible calls/options/results into the internal implementation.

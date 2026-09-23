@@ -238,12 +238,16 @@ inspection.
 
 ## Remaining limitations
 
-Server TLS, DTLS, QUIC/HTTP/3, TLS 1.2/mTLS resumption,
+The experimental `SSL.QUIC` record-free TLS integration has its own
+[role/transport matrix](QUIC_TLS_IMPLEMENTATION.md) and
+[public interface](QUIC_TLS_INTERFACE.md). It does not broaden TCP socket support.
+
+TCP server TLS, DTLS, QUIC networking/HTTP/3, TLS 1.2/mTLS resumption,
 0-RTT, post-handshake authentication, active true/active-N, packet framing,
 exporters, and full OTP API parity are out of scope. ALPN negotiation alone is
 not evidence of an HTTP/2 request. See
 [HTTP_FETCH_INTEGRATION.md](HTTP_FETCH_INTEGRATION.md) for the opt-in consumer
-integration and its remaining acceptance gates.
+integration and its executed evidence and validation limitations.
 
 ## Initial-handshake client authentication
 
@@ -393,3 +397,10 @@ Independent OpenSSL peers prove full/resumed exchanges, P384 HRR resumption,
 server ticket-key restart, disabled mode and authentication-policy rejection.
 The source-package consumer gate proves HTTP/1.1 resumption; HTTP/2/WSS/SSE
 resumption is not separately certified by that gate.
+
+## Naked ClientHello analysis
+
+`SSL.Fingerprint` supports bounded direct/fragmented observation with explicit
+TCP or QUIC provenance, ordered unknown IDs, JA3 raw/hash and JA4 raw components
+and hash. It does not authenticate peers or constrain negotiation. See
+[FINGERPRINTS.md](FINGERPRINTS.md) for the contract and pinned reference vectors.

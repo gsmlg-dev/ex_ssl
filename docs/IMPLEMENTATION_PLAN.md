@@ -5,6 +5,10 @@ The cross-repository TCP TLS expansion follows
 with current evidence in [EX_SSL_HTTP_FETCH_PROGRESS.md](EX_SSL_HTTP_FETCH_PROGRESS.md).
 The historical roadmap below is retained.
 
+The active record-free TLS task is defined in root `CODEX-PROMPT.md`, with the
+accepted boundary in [ADR_QUIC_TLS_CORE.md](ADR_QUIC_TLS_CORE.md) and executed
+evidence/remaining gates in [QUIC_TLS_IMPLEMENTATION.md](QUIC_TLS_IMPLEMENTATION.md).
+
 ## 1. Delivery strategy
 
 The current implementation cycle targets the restricted Manifold client subset

@@ -153,7 +153,9 @@ The active message contract targets OTP forms:
 
 ## Protocol scope
 
-The first protocol target is **TLS 1.3 client only**, using RFC 9846 as the normative specification.
+The TCP protocol target is a **TLS client**, using RFC 9846 as the normative
+TLS 1.3 specification. The separate `SSL.QUIC` engine also implements the
+record-free TLS 1.3 server role; its acceptance status is documented separately.
 
 Initial target features:
 
@@ -196,6 +198,19 @@ RSA-PSS-PSS SHA-256/384/512, with strict key and parameter checks. See
 certificates and explicit bounded TLS 1.2 are implemented in version 0.4.
 
 ## Architecture
+
+`SSL.QUIC` provides an experimental record-free TLS 1.3 client/server handshake
+API with caller-owned state and ordered traffic-secret actions. The TCP client
+shares its ClientHello/HRR and authentication core. This adds neither QUIC
+networking nor TCP server APIs. See the [interface](docs/QUIC_TLS_INTERFACE.md)
+and [implementation ledger](docs/QUIC_TLS_IMPLEMENTATION.md). The pinned
+[aioquic comparison](e2e/quic_tls/README.md) exercises both roles and compares
+traffic secrets without QUIC networking.
+
+`SSL.Fingerprint.client_hello(bytes, :tcp | :quic)` computes JA3/JA4 from actual
+naked ClientHello bytes; `new/1` and `feed/2` support bounded fragmented
+observation. Unknown IDs and wire ordering remain available separately from the
+analytical projections. See [fingerprint API and references](docs/FINGERPRINTS.md).
 
 ```text
 Application

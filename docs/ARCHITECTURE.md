@@ -63,7 +63,10 @@ OTP processes coordinate lifecycle and I/O; they should not contain ad-hoc proto
 
 ### 3.3 One connection, one owner of cryptographic state
 
-Handshake secrets, traffic secrets, sequence numbers, transcripts, plaintext buffers, ciphertext buffers, and socket ownership live in a single connection process.
+For TCP, handshake secrets, traffic secrets, sequence numbers, transcripts,
+plaintext buffers, ciphertext buffers, and socket ownership live in a single
+connection process. The record-free integration instead has one caller-owned
+immutable handshake state; see [ADR_QUIC_TLS_CORE.md](ADR_QUIC_TLS_CORE.md).
 
 No global process may hold per-connection traffic keys.
 
@@ -350,6 +353,14 @@ The decoded handshake representation is semantic, but each message also retains 
 
 ### 10.3 Handshake machine
 
+`SSL.Protocol.HandshakeCore` now owns the existing client's post-ServerHello
+authentication, transcript and traffic-secret derivation. The TCP
+`ServerFlightVerifier` adapts this core to records. `ClientHandshake` shares
+ClientHello/HRR orchestration between TCP and `SSL.QUIC`; `ServerHandshake`
+implements the record-free certificate server role using shared cryptographic
+primitives. Remaining verification gates are tracked in
+[QUIC_TLS_IMPLEMENTATION.md](QUIC_TLS_IMPLEMENTATION.md).
+
 `SSL.Protocol.HandshakeMachine` is a pure transition engine where practical.
 
 Conceptual contract:
@@ -561,15 +572,12 @@ This matters when reproducing modern browser profiles that commonly advertise bo
 
 ## 15. Fingerprint subsystem
 
-Modules:
-
-```text
-SSL.Fingerprint.ClientHello
-SSL.Fingerprint.JA3
-SSL.Fingerprint.JA4
-```
-
-Fingerprint analyzers accept a parsed/built ClientHello and return projections.
+The public `SSL.Fingerprint` module accepts exact naked ClientHello bytes with
+explicit TCP/QUIC context and returns an ordered observation plus JA3/JA4
+projections. `new/1` and `feed/2` provide a bounded one-hello stream observer.
+The wire envelope parser is shared with `ClientOffer`; fingerprint observation
+does not apply the negotiation capability restrictions. See
+[FINGERPRINTS.md](FINGERPRINTS.md) for the implemented contract and references.
 
 They do not influence key negotiation or handshake correctness.
 
@@ -811,7 +819,9 @@ TLS 1.2 becomes necessary for faithful profiles that legitimately advertise TLS 
 - passive ClientHello analyzer;
 - additional fingerprint formats.
 
-DTLS and QUIC are not implicit extensions of this architecture. QUIC embeds TLS differently and belongs in a separate transport/integration design.
+DTLS and QUIC networking are not implicit extensions of this architecture.
+The explicit record-free TLS integration is defined in
+[ADR_QUIC_TLS_CORE.md](ADR_QUIC_TLS_CORE.md); it does not add a QUIC stack.
 
 ## 25. Dependency direction
 

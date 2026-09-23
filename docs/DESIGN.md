@@ -58,6 +58,11 @@ Utility compatibility functions such as cipher-suite conversion/listing may be a
 
 Server APIs are deliberately deferred.
 
+The separate record-free TLS 1.3 client/server engine follows
+[ADR_QUIC_TLS_CORE.md](ADR_QUIC_TLS_CORE.md). It does not add server socket APIs.
+The public boundary is specified in [QUIC_TLS_INTERFACE.md](QUIC_TLS_INTERFACE.md),
+with implementation status distinguished in its ledger.
+
 ### 2.2 API compatibility rule
 
 For every implemented OTP function, create an explicit compatibility test covering:
@@ -452,12 +457,14 @@ Validation checks at minimum:
 
 ### 15.1 JA3
 
-Input: parsed/materialized ClientHello AST.
+Input: actual naked ClientHello handshake bytes and explicit `:tcp`/`:quic`
+context via `SSL.Fingerprint.client_hello/2`; observation retains original IDs
+and extension bytes. See [FINGERPRINTS.md](FINGERPRINTS.md).
 
 Output structure should expose both canonical string and digest, for example conceptually:
 
 ```text
-%{raw: "...", md5: "..."}
+%{raw: "...", hash: "..."}
 ```
 
 JA3 implementation strips GREASE values where required by the algorithm.
