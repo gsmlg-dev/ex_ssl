@@ -1,25 +1,21 @@
 defmodule SSL.Protocol.HandshakeMachine do
   @moduledoc "Pure TLS client coordinator consuming one complete record at a time."
 
-  alias SSL.ClientHello.{Extension, Serializer}
   alias SSL.ClientHello.Materializer.Materialized
-  alias SSL.Crypto.{KeyExchange, KeySchedule, TrafficState}
-  alias SSL.Crypto.KeyExchange.KeyPair
+  alias SSL.Crypto.{KeySchedule, TrafficState}
 
   alias SSL.Protocol.{
-    ClientOffer,
+    ClientHandshake,
     HandshakeFramer,
     Record,
     ServerFlight,
     ServerFlightVerifier,
     ServerHello,
     TLS12,
-    TLS12Codec,
-    Transcript
+    TLS12Codec
   }
 
   alias SSL.Protocol.ServerFlightVerifier.{Incremental, Input}
-  alias SSL.Protocol.Resumption
 
   @max_handshake_length 1_048_576
   @ccs <<20, 3, 3, 0, 1, 1>>
@@ -76,32 +72,10 @@ defmodule SSL.Protocol.HandshakeMachine do
   def init(materialized, trust_source, identity, opts \\ [])
 
   def init(%Materialized{} = materialized, trust_source, identity, opts) when is_list(opts) do
-    {client_identity, verifier_opts} = Keyword.pop(opts, :client_identity)
-    {ticket, verifier_opts} = Keyword.pop(verifier_opts, :ticket)
-    {enable_tickets, verifier_opts} = Keyword.pop(verifier_opts, :enable_tickets, false)
-
-    with {:ok, unsigned} <- encoded_client_hello(materialized, verifier_opts),
-         {:ok, client_hello} <- bind_hello(unsigned, ticket, <<>>),
-         {:ok, offer} <- ClientOffer.from_client_hello(client_hello),
-         {:ok, key_pairs} <- matching_key_pairs(materialized.key_pairs, offer),
-         :ok <- validate_identity(identity) do
-      state = %__MODULE__{
-        client_hello: client_hello,
-        client_ast: materialized.client_hello,
-        key_pair: List.first(key_pairs),
-        key_pairs: key_pairs,
-        trust_source: trust_source,
-        identity: identity,
-        client_identity: client_identity,
-        ticket: ticket,
-        enable_tickets: enable_tickets,
-        offer: offer,
-        phase: :await_server_hello,
-        framer: HandshakeFramer.new(),
-        options: verifier_opts
-      }
-
-      {:ok, state, plaintext_handshake_records(client_hello)}
+    with {:ok, fields, bytes} <-
+           ClientHandshake.prepare(materialized, trust_source, identity, opts) do
+      state = struct!(__MODULE__, Map.put(fields, :framer, HandshakeFramer.new()))
+      {:ok, state, plaintext_handshake_records(bytes)}
     end
   end
 
@@ -205,9 +179,10 @@ defmodule SSL.Protocol.HandshakeMachine do
 
   defp accept_initial_tls13(state, [handshake], framer) do
     if HandshakeFramer.buffered_size(framer) == 0 do
-      with {:ok, hello} <- decode_server_hello(handshake, state.offer) do
+      with {:ok, hello} <- ClientHandshake.decode_server_hello(handshake, state.offer, state.hrr) do
         accept_server_hello(%{state | framer: HandshakeFramer.new()}, hello)
       else
+        {:error, {:fatal_alert, _, _}} = error -> error
         {:error, reason} -> fatal(:illegal_parameter, reason)
       end
     else
@@ -264,49 +239,15 @@ defmodule SSL.Protocol.HandshakeMachine do
   def encrypt(_, _, _), do: {:error, :not_connected}
 
   defp accept_server_hello(state, %ServerHello{kind: :hello_retry_request} = hrr) do
-    if state.phase == :await_server_hello_after_retry do
-      fatal(:unexpected_message, :second_hello_retry_request)
-    else
-      with {:ok, ast, key_pair} <- retry_client_hello(state.client_ast, state.key_pair, hrr),
-           {:ok, _suite, hash} <- suite(hrr.cipher_suite),
-           {ast, ticket} = retry_ticket(ast, state.ticket, hash),
-           prefix =
-             Transcript.new(hash)
-             |> Transcript.append(state.client_hello)
-             |> Transcript.apply_hello_retry_request_rewrite()
-             |> Transcript.append(hrr.encoded),
-           {:ok, unsigned} <- Serializer.encode(ast),
-           {:ok, encoded} <-
-             bind_hello(
-               unsigned,
-               ticket,
-               prefix.messages |> Enum.reverse() |> IO.iodata_to_binary()
-             ),
-           {:ok, offer} <- ClientOffer.from_client_hello(encoded) do
-        transcript = Transcript.append(prefix, encoded)
-
-        {:ok,
-         %{
-           state
-           | client_ast: ast,
-             client_hello: encoded,
-             ticket: ticket,
-             key_pair: key_pair,
-             key_pairs: retry_key_pairs(state.key_pairs, hrr, key_pair),
-             offer: offer,
-             phase: :await_server_hello_after_retry,
-             hrr: hrr,
-             hrr_transcript: transcript
-         }, plaintext_handshake_records(encoded), []}
-      else
-        {:error, reason} -> fatal(:illegal_parameter, reason)
-      end
+    with {:ok, next, bytes} <- ClientHandshake.retry(state, hrr) do
+      {:ok, next, plaintext_handshake_records(bytes), []}
     end
   end
 
   defp accept_server_hello(state, %ServerHello{kind: :server_hello} = hello) do
-    with :ok <- validate_hrr_selection(state.hrr, hello),
-         {:ok, key_pair} <- selected_key_pair(state.key_pairs, state.key_pair, hello),
+    with :ok <- ClientHandshake.validate_hrr_selection(state.hrr, hello),
+         {:ok, key_pair} <-
+           ClientHandshake.selected_key_pair(state.key_pairs, state.key_pair, hello),
          input = %Input{
            client_hello: state.client_hello,
            server_hello: hello,
@@ -491,14 +432,6 @@ defmodule SSL.Protocol.HandshakeMachine do
     end
   end
 
-  defp bind_hello(encoded, nil, _prefix), do: {:ok, encoded}
-  defp bind_hello(encoded, ticket, prefix), do: Resumption.bind(encoded, ticket, prefix)
-  defp retry_ticket(ast, nil, _hash), do: {ast, nil}
-  defp retry_ticket(ast, %{hash: hash} = ticket, hash), do: {ast, ticket}
-
-  defp retry_ticket(ast, _ticket, _hash),
-    do: {%{ast | extensions: Enum.reject(ast.extensions, &(elem(&1, 0) == 41))}, nil}
-
   defp validate_post_handshake_epoch(messages, framer) do
     key_update_index = Enum.find_index(messages, &match?(<<24, _::binary>>, &1))
 
@@ -542,163 +475,6 @@ defmodule SSL.Protocol.HandshakeMachine do
     end
   end
 
-  defp retry_client_hello(ast, current_pair, hrr) do
-    selected =
-      Enum.find_value(hrr.extensions, fn
-        {:selected_group, group} -> group
-        _ -> nil
-      end)
-
-    cookie =
-      Enum.find_value(hrr.extensions, fn
-        {:cookie, value} -> value
-        _ -> nil
-      end)
-
-    with {:ok, pair} <- retry_key_pair(selected, current_pair),
-         {:ok, extensions} <- retry_extensions(ast.extensions, selected, pair, cookie) do
-      {:ok, %{ast | extensions: extensions}, pair}
-    end
-  end
-
-  defp retry_key_pair(nil, pair), do: {:ok, pair}
-
-  defp retry_key_pair(group, _pair) do
-    case SSL.Capabilities.resolve(:group, group) do
-      %{name: name} -> KeyExchange.generate(name)
-      nil -> {:error, {:unsupported_selected_group, group}}
-    end
-  end
-
-  defp retry_key_pairs(key_pairs, hrr, pair) do
-    if Enum.any?(hrr.extensions, &match?({:selected_group, _}, &1)),
-      do: [pair],
-      else: key_pairs
-  end
-
-  defp retry_extensions(extensions, selected, pair, cookie) do
-    with {:ok, key_share} <- retry_key_share_extension(selected, pair),
-         {:ok, cookie_extension} <- retry_cookie_extension(cookie) do
-      replaced =
-        extensions
-        |> Enum.map(fn
-          {51, _} when not is_nil(key_share) -> key_share
-          {42, _} -> nil
-          extension -> extension
-        end)
-        |> Enum.reject(&is_nil/1)
-
-      {:ok, insert_cookie(replaced, cookie_extension)}
-    end
-  end
-
-  defp retry_key_share_extension(nil, _pair), do: {:ok, nil}
-
-  defp retry_key_share_extension(_selected, pair),
-    do: Extension.encode({:key_share, [{group_id(pair.group), pair.public_key}]})
-
-  defp retry_cookie_extension(nil), do: {:ok, nil}
-
-  defp retry_cookie_extension(cookie) when byte_size(cookie) <= 65_533,
-    do: {:ok, {44, <<byte_size(cookie)::16, cookie::binary>>}}
-
-  defp insert_cookie(extensions, nil), do: extensions
-
-  defp insert_cookie(extensions, cookie) do
-    {before_psk, psk} = Enum.split_while(extensions, &(elem(&1, 0) != 41))
-    before_psk ++ [cookie] ++ psk
-  end
-
-  defp encoded_client_hello(%Materialized{client_hello: ast}, opts) do
-    case Keyword.fetch(opts, :encoded_client_hello) do
-      {:ok, encoded} when is_binary(encoded) -> {:ok, encoded}
-      :error -> Serializer.encode(ast)
-      {:ok, _} -> {:error, :invalid_encoded_client_hello}
-    end
-  end
-
-  defp matching_key_pairs(key_pairs, offer) when is_list(key_pairs) do
-    matching =
-      Enum.filter(key_pairs, fn
-        %KeyPair{group: group, public_key: public} ->
-          Enum.any?(
-            offer.key_shares,
-            &(&1.group == group_id(group) and :crypto.hash_equals(&1.key_exchange, public))
-          )
-
-        _ ->
-          false
-      end)
-
-    cond do
-      matching == [] and offer.key_shares == [] and 0x0303 in offer.offered_versions and
-        0x0304 not in offer.offered_versions and key_pairs == [] ->
-        {:ok, []}
-
-      matching == [] ->
-        {:error, :no_matching_client_key_share}
-
-      true ->
-        Enum.reduce_while(matching, {:ok, []}, fn pair, {:ok, valid} ->
-          case KeyExchange.validate_key_pair(pair) do
-            :ok -> {:cont, {:ok, [pair | valid]}}
-            {:error, _} = error -> {:halt, error}
-          end
-        end)
-        |> case do
-          {:ok, valid} -> {:ok, Enum.reverse(valid)}
-          error -> error
-        end
-    end
-  end
-
-  defp matching_key_pairs(_, _), do: {:error, :invalid_key_pairs}
-
-  defp selected_key_pair(key_pairs, fallback, hello) do
-    selected_group =
-      Enum.find_value(hello.extensions, fn
-        {:key_share, %{group: group}} -> group
-        _ -> nil
-      end)
-
-    case Enum.find(key_pairs || [], &(group_id(&1.group) == selected_group)) do
-      %KeyPair{} = pair ->
-        {:ok, pair}
-
-      nil ->
-        if group_id(fallback.group) == selected_group,
-          do: {:ok, fallback},
-          else: {:error, {:missing_key_pair_for_selected_group, selected_group}}
-    end
-  end
-
-  defp validate_hrr_selection(nil, _hello), do: :ok
-
-  defp validate_hrr_selection(hrr, hello) do
-    selected_group =
-      Enum.find_value(hrr.extensions, fn
-        {:selected_group, group} -> group
-        _ -> nil
-      end)
-
-    final_group =
-      Enum.find_value(hello.extensions, fn
-        {:key_share, %{group: group}} -> group
-        _ -> nil
-      end)
-
-    cond do
-      hello.cipher_suite != hrr.cipher_suite ->
-        {:error, :hello_retry_request_cipher_changed}
-
-      not is_nil(selected_group) and final_group != selected_group ->
-        {:error, :hello_retry_request_group_changed}
-
-      true ->
-        :ok
-    end
-  end
-
   defp plaintext_handshake_payload(<<22, 3, 3, length::16, bytes::binary-size(length)>>),
     do:
       if(length <= 16_384,
@@ -719,25 +495,6 @@ defmodule SSL.Protocol.HandshakeMachine do
 
   defp plaintext_handshake_record(chunk),
     do: <<22, 3, 3, byte_size(chunk)::16, chunk::binary>>
-
-  defp decode_server_hello(encoded, offer) do
-    expectations = %{
-      legacy_session_id: offer.legacy_session_id,
-      offered_ciphers: offer.cipher_suites,
-      offered_versions: offer.offered_versions,
-      offered_groups: offer.supported_groups,
-      offered_key_share_groups: Enum.map(offer.key_shares, & &1.group),
-      offered_extension_ids: offer.extension_ids,
-      offered_psk_key_exchange_modes: offer.psk_key_exchange_modes,
-      offered_psk_count: offer.psk_count
-    }
-
-    case ServerHello.decode(encoded, expectations) do
-      {:ok, %ServerHello{} = hello, <<>>} -> {:ok, hello}
-      {:ok, _, remainder} -> {:error, {:trailing_server_hello, byte_size(remainder)}}
-      other -> {:error, other}
-    end
-  end
 
   defp decrypt_handshake(read, record) do
     case Record.decrypt(read, record) do
@@ -778,19 +535,7 @@ defmodule SSL.Protocol.HandshakeMachine do
   defp start_verifier(input, options, transcript),
     do: ServerFlightVerifier.start_incremental(input, options, transcript)
 
-  defp suite(value) do
-    case SSL.Capabilities.resolve(:cipher_suite, value) do
-      %{version: 0x0304, name: name, hash: hash} -> {:ok, name, hash}
-      _ -> {:error, {:unsupported_cipher_suite, value}}
-    end
-  end
-
   defp hash_for(%{cipher_suite: suite}), do: SSL.Capabilities.resolve(:cipher_suite, suite).hash
-  defp group_id(group), do: SSL.Capabilities.resolve(:group, group).id
-
-  defp validate_identity({:dns_id, name}) when is_binary(name), do: :ok
-  defp validate_identity({:ip, _}), do: :ok
-  defp validate_identity(_), do: {:error, :invalid_identity}
 
   defp record_error(reason) when reason in [:authentication_failed, :decryption_failed],
     do: fatal(:bad_record_mac, reason)

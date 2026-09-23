@@ -277,6 +277,19 @@ defmodule SSL.Capabilities do
     end
   end
 
+  @doc "Implemented TLS algorithms with separately reported runtime availability."
+  @spec describe(atom()) :: [map()]
+  def describe(kind) do
+    runtime = runtime()
+
+    Enum.map(entries(kind), fn entry ->
+      entry
+      |> Map.drop([:needs, :verify_options])
+      |> Map.put(:implemented, true)
+      |> Map.put(:available, available?(entry, runtime))
+    end)
+  end
+
   @spec identifiers(atom(), map()) :: [atom() | non_neg_integer()]
   def identifiers(kind, runtime \\ runtime()) do
     kind

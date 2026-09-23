@@ -42,7 +42,7 @@ defmodule SSL.ClientHello.Profile do
   @spec validate(WireProfile.t(), capabilities()) :: {:ok, WireProfile.t()} | {:error, term()}
   def validate(%WireProfile{} = profile, capabilities) do
     with :ok <- validate_capabilities(capabilities),
-         :ok <- validate_profile_shape(profile),
+         :ok <- validate_profile_shape(profile, capabilities),
          :ok <- validate_extension_shapes(profile.extensions),
          :ok <- validate_duplicate_extensions(profile.extensions),
          :ok <- validate_pre_shared_key_position(profile.extensions),
@@ -131,14 +131,19 @@ defmodule SSL.ClientHello.Profile do
     end
   end
 
-  defp validate_profile_shape(%WireProfile{} = profile) do
+  defp validate_profile_shape(%WireProfile{} = profile, capabilities) do
     with :ok <- require_profile(profile.legacy_version == 0x0303, :legacy_version),
          :ok <- require_profile(valid_session_id?(profile.session_id), :session_id),
          :ok <- require_profile(valid_cipher_suites?(profile.cipher_suites), :cipher_suites),
          :ok <- require_profile(profile.compression_methods == [0], :compression_methods),
          :ok <- require_profile(is_list(profile.extensions), :extensions),
          :ok <- require_profile(valid_grease_policy?(profile.grease), :grease),
-         :ok <- require_profile(profile.record == %RecordPolicy{mode: :default}, :record) do
+         :ok <-
+           require_profile(
+             match?(%RecordPolicy{}, profile.record) and
+               profile.record.mode in Map.get(capabilities, :record_modes, [:default]),
+             :record
+           ) do
       :ok
     end
   end

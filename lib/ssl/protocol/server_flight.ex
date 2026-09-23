@@ -86,7 +86,7 @@ defmodule SSL.Protocol.ServerFlight do
   @default_max_extension_bytes 65_535
   @default_max_signature_bytes 16_384
 
-  @encrypted_extension_ids [0, 1, 10, 16, 19, 20, 28, 42]
+  @encrypted_extension_ids [0, 1, 10, 16, 19, 20, 28, 42, 57]
   @certificate_extension_ids [5, 18]
   # RFC 9846 permits these extensions in CertificateRequest. Unknown extensions
   # remain opaque, while the known selection constraints are decoded and bounded.
@@ -613,6 +613,8 @@ defmodule SSL.Protocol.ServerFlight do
       do: :ok,
       else: {:error, {:extension_not_offered, extension_id}}
   end
+
+  defp decode_encrypted_extension(57, payload), do: {:ok, {:quic_transport_parameters, payload}}
 
   defp decode_encrypted_extension(0, <<>>), do: {:ok, {:server_name_ack}}
 

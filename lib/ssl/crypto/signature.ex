@@ -112,8 +112,27 @@ defmodule SSL.Crypto.Signature do
   @spec sign_client(term(), term(), atom(), term()) ::
           {:ok, binary()} | {:error, error_reason()}
   def sign_client(signature_scheme, private_key, transcript_hash_algorithm, transcript_digest) do
+    sign_role(
+      :client,
+      signature_scheme,
+      private_key,
+      transcript_hash_algorithm,
+      transcript_digest
+    )
+  end
+
+  @spec sign_server(term(), term(), atom(), term()) :: {:ok, binary()} | {:error, error_reason()}
+  def sign_server(scheme, key, hash, digest), do: sign_role(:server, scheme, key, hash, digest)
+
+  defp sign_role(
+         role,
+         signature_scheme,
+         private_key,
+         transcript_hash_algorithm,
+         transcript_digest
+       ) do
     with {:ok, scheme} <- signature_scheme(signature_scheme),
-         {:ok, content} <- client_signed_content(transcript_hash_algorithm, transcript_digest),
+         {:ok, content} <- signed_content(role, transcript_hash_algorithm, transcript_digest),
          {:ok, signing_key} <- validate_private_key(scheme, private_key) do
       try do
         {:ok, :public_key.sign(content, scheme.hash, signing_key, scheme.verify_options)}

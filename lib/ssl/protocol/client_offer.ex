@@ -38,7 +38,7 @@ defmodule SSL.Protocol.ClientOffer do
           signature_schemes: [0..0xFFFF],
           certificate_signature_schemes: [0..0xFFFF] | nil,
           alpn_protocols: [binary()],
-          psk_key_exchange_modes: [0 | 1],
+          psk_key_exchange_modes: [byte()],
           psk_count: non_neg_integer()
         }
 
@@ -57,8 +57,35 @@ defmodule SSL.Protocol.ClientOffer do
 
   def from_client_hello(_input), do: {:error, {:invalid_input, :client_hello}}
 
-  defp parse_body(
-         <<0x0303::16, _random::binary-size(32), session_id_length, rest::binary>>,
+  @doc false
+  @spec observe(term()) :: {:ok, map()} | {:error, term()}
+  def observe(<<1, length::24, body::binary-size(length)>> = encoded)
+      when length <= @maximum_body_length do
+    observe_body(body, encoded)
+  end
+
+  def observe(_), do: {:error, {:malformed_client_hello, :handshake_length}}
+
+  defp parse_body(body, encoded) do
+    with {:ok, observed} <- observe_body(body, encoded),
+         :ok <- validate_legacy_version(observed.legacy_version),
+         :ok <- validate_compression_methods(observed.compression_methods),
+         {:ok, fields} <- extract_fields(observed.extensions) do
+      {:ok,
+       struct!(
+         __MODULE__,
+         Map.merge(fields, Map.drop(observed, [:legacy_version, :compression_methods]))
+       )}
+    end
+  end
+
+  defp validate_legacy_version(0x0303), do: :ok
+
+  defp validate_legacy_version(version),
+    do: {:error, {:invalid_client_hello_legacy_version, version}}
+
+  defp observe_body(
+         <<version::16, _random::binary-size(32), session_id_length, rest::binary>>,
          encoded
        )
        when session_id_length <= 32 do
@@ -66,32 +93,25 @@ defmodule SSL.Protocol.ClientOffer do
          {:ok, cipher_bytes, rest} <- take_vector16(rest, :cipher_suites),
          {:ok, cipher_suites} <- parse_uint16_list(cipher_bytes, :cipher_suites, false),
          {:ok, compression_methods, rest} <- take_vector8(rest, :compression_methods),
-         :ok <- validate_compression_methods(compression_methods),
-         {:ok, extension_bytes, <<>>} <- take_vector16(rest, :extensions),
-         {:ok, extensions} <- parse_extensions(extension_bytes),
-         {:ok, fields} <- extract_fields(extensions) do
+         {:ok, extension_bytes} <- observation_extensions(rest),
+         {:ok, extensions} <- parse_extensions(extension_bytes) do
       {:ok,
-       struct!(
-         __MODULE__,
-         Map.merge(fields, %{
-           encoded: encoded,
-           legacy_session_id: session_id,
-           cipher_suites: cipher_suites,
-           extension_ids: Enum.map(extensions, &elem(&1, 0)),
-           extensions: extensions
-         })
-       )}
-    else
-      {:ok, _extensions, _remainder} -> {:error, {:malformed_client_hello, :trailing_data}}
-      {:error, _reason} = error -> error
+       %{
+         encoded: encoded,
+         legacy_version: version,
+         compression_methods: compression_methods,
+         legacy_session_id: session_id,
+         cipher_suites: cipher_suites,
+         extension_ids: Enum.map(extensions, &elem(&1, 0)),
+         extensions: extensions
+       }}
     end
   end
 
-  defp parse_body(<<legacy_version::16, _rest::binary>>, _encoded)
-       when legacy_version != 0x0303,
-       do: {:error, {:invalid_client_hello_legacy_version, legacy_version}}
-
-  defp parse_body(_body, _encoded), do: {:error, {:malformed_client_hello, :fixed_fields}}
+  defp observe_body(_, _), do: {:error, {:malformed_client_hello, :fixed_fields}}
+  defp observation_extensions(<<>>), do: {:ok, <<>>}
+  defp observation_extensions(<<length::16, bytes::binary-size(length)>>), do: {:ok, bytes}
+  defp observation_extensions(_), do: {:error, {:malformed_client_hello, :extensions}}
 
   defp parse_extensions(bytes), do: parse_extensions(bytes, MapSet.new(), [])
   defp parse_extensions(<<>>, _seen, extensions), do: {:ok, Enum.reverse(extensions)}
@@ -131,6 +151,27 @@ defmodule SSL.Protocol.ClientOffer do
         {:error, _reason} = error -> {:halt, error}
       end
     end)
+  end
+
+  defp extract_field({0, <<length::16, names::binary-size(length)>>}, fields)
+       when length > 0 do
+    with :ok <- server_names(names, MapSet.new()) do
+      {:ok, fields}
+    end
+  end
+
+  defp extract_field({0, _}, _),
+    do: {:error, {:malformed_client_hello_extension, 0, :server_name}}
+
+  defp extract_field({49, <<>>}, fields), do: {:ok, fields}
+
+  defp extract_field({49, _}, _),
+    do: {:error, {:malformed_client_hello_extension, 49, :post_handshake_auth}}
+
+  defp extract_field({21, bytes}, fields) do
+    if bytes == :binary.copy(<<0>>, byte_size(bytes)),
+      do: {:ok, fields},
+      else: {:error, {:malformed_client_hello_extension, 21, :padding}}
   end
 
   defp extract_field({43, <<length, versions::binary>>}, fields)
@@ -182,11 +223,9 @@ defmodule SSL.Protocol.ClientOffer do
        when length == byte_size(modes) and length > 0 do
     values = :binary.bin_to_list(modes)
 
-    if Enum.all?(values, &(&1 in [0, 1])) do
-      {:ok, %{fields | psk_key_exchange_modes: values}}
-    else
-      {:error, {:malformed_client_hello_extension, 45, :psk_key_exchange_modes}}
-    end
+    # Unknown modes are legal offers to ignore (including GREASE). Selection
+    # validation is a separate concern owned by the handshake engine.
+    {:ok, %{fields | psk_key_exchange_modes: values}}
   end
 
   defp extract_field({45, _payload}, _fields),
@@ -207,6 +246,17 @@ defmodule SSL.Protocol.ClientOffer do
   end
 
   defp extract_field({_unknown, _payload}, fields), do: {:ok, fields}
+
+  defp server_names(<<>>, _seen), do: :ok
+
+  defp server_names(<<0, length::16, name::binary-size(length), rest::binary>>, seen)
+       when length > 0 do
+    if MapSet.member?(seen, 0) or :binary.match(name, <<0>>) != :nomatch,
+      do: {:error, {:malformed_client_hello_extension, 0, :server_name}},
+      else: server_names(rest, MapSet.put(seen, 0))
+  end
+
+  defp server_names(_, _), do: {:error, {:malformed_client_hello_extension, 0, :server_name}}
 
   defp parse_key_shares(<<>>, shares), do: {:ok, Enum.reverse(shares)}
 

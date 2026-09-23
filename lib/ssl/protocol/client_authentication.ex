@@ -13,21 +13,34 @@ defmodule SSL.Protocol.ClientAuthentication do
 
   @spec emit(CertificateRequest.t() | nil, ClientIdentity.t() | nil, Transcript.t(), term()) ::
           {:ok, Transcript.t(), term(), [binary()]} | {:error, term()}
-  def emit(nil, _identity, transcript, state), do: {:ok, transcript, state, []}
-
-  def emit(%CertificateRequest{} = request, identity, transcript, state) do
-    with {:ok, selection} <- select(request, identity),
-         {:ok, certificate} <-
-           ServerFlight.encode_client_certificate(request.request_context, chain(selection)),
-         {:ok, certificate_records, state} <- encrypt_message(state, certificate),
-         transcript = Transcript.append(transcript, certificate),
-         {:ok, transcript, state, verify_records} <-
-           maybe_certificate_verify(selection, transcript, state) do
-      {:ok, transcript, state, certificate_records ++ verify_records}
+  def emit(request, identity, transcript, state) do
+    with {:ok, transcript, messages} <- messages(request, identity, transcript) do
+      Enum.reduce_while(messages, {:ok, transcript, state, []}, fn message,
+                                                                   {:ok, transcript, write, out} ->
+        case encrypt_message(write, message) do
+          {:ok, records, next} -> {:cont, {:ok, transcript, next, out ++ records}}
+          error -> {:halt, error}
+        end
+      end)
     end
   end
 
-  def emit(_, _, _, _), do: {:error, :invalid_client_authentication}
+  @doc "Generates exact client authentication messages without TLS records."
+  @spec messages(CertificateRequest.t() | nil, ClientIdentity.t() | nil, Transcript.t()) ::
+          {:ok, Transcript.t(), [binary()]} | {:error, term()}
+  def messages(nil, _identity, transcript), do: {:ok, transcript, []}
+
+  def messages(%CertificateRequest{} = request, identity, transcript) do
+    with {:ok, selection} <- select(request, identity),
+         {:ok, certificate} <-
+           ServerFlight.encode_client_certificate(request.request_context, chain(selection)),
+         transcript = Transcript.append(transcript, certificate),
+         {:ok, transcript, verify} <- maybe_certificate_verify(selection, transcript) do
+      {:ok, transcript, [certificate | verify]}
+    end
+  end
+
+  def messages(_, _, _), do: {:error, :invalid_client_authentication}
 
   @spec select(CertificateRequest.t(), ClientIdentity.t() | nil) ::
           {:ok, nil | {ClientIdentity.t(), non_neg_integer()}} | {:error, term()}
@@ -109,9 +122,9 @@ defmodule SSL.Protocol.ClientAuthentication do
     _, _ -> false
   end
 
-  defp maybe_certificate_verify(nil, transcript, state), do: {:ok, transcript, state, []}
+  defp maybe_certificate_verify(nil, transcript), do: {:ok, transcript, []}
 
-  defp maybe_certificate_verify({identity, scheme}, transcript, state) do
+  defp maybe_certificate_verify({identity, scheme}, transcript) do
     with {:ok, signature} <-
            Signature.sign_client(
              scheme,
@@ -119,9 +132,8 @@ defmodule SSL.Protocol.ClientAuthentication do
              transcript.hash,
              Transcript.digest(transcript)
            ),
-         {:ok, encoded} <- ServerFlight.encode_client_certificate_verify(scheme, signature),
-         {:ok, records, next_state} <- encrypt_message(state, encoded) do
-      {:ok, Transcript.append(transcript, encoded), next_state, records}
+         {:ok, encoded} <- ServerFlight.encode_client_certificate_verify(scheme, signature) do
+      {:ok, Transcript.append(transcript, encoded), [encoded]}
     end
   end
 

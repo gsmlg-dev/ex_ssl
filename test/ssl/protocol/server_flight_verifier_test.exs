@@ -50,6 +50,81 @@ defmodule SSL.Protocol.ServerFlightVerifierTest do
     refute inspected =~ Base.encode16(@capture.client_private)
   end
 
+  test "record-free client core reproduces independently constructed flight secrets and bytes" do
+    core_input = input() |> Map.from_struct() |> Map.delete(:records)
+    assert {:ok, core} = SSL.Protocol.HandshakeCore.start_client(core_input, [])
+    refute Map.has_key?(core.secrets, :client_handshake_state)
+    refute Map.has_key?(core.secrets, :server_handshake_state)
+
+    [ee, cert, cv, finished] = captured_messages()
+    assert {:ok, core} = SSL.Protocol.HandshakeCore.process_message(core, ee)
+    assert {:ok, core} = SSL.Protocol.HandshakeCore.process_message(core, cert)
+    assert {:ok, core} = SSL.Protocol.HandshakeCore.process_message(core, cv)
+
+    assert {:connected, result, [client_finished]} =
+             SSL.Protocol.HandshakeCore.process_message(core, finished)
+
+    assert {:ok, client_state} =
+             KeySchedule.traffic_state(result.suite, result.client_application_secret)
+
+    assert {:ok, server_state} =
+             KeySchedule.traffic_state(result.suite, result.server_application_secret)
+
+    assert client_state.key == @capture.client_app_key
+    assert server_state.key == @capture.server_app_key
+    assert Transcript.digest(result.transcript) == @capture.transcript_digest
+
+    assert {:ok, write} =
+             KeySchedule.traffic_state(result.suite, core.secrets.client_handshake_secret)
+
+    assert {:ok, record, _} = Record.encrypt(write, :handshake, client_finished)
+    assert record == @capture.client_finished_record
+    refute inspect(result) =~ inspect(result.client_application_secret)
+  end
+
+  test "record-free core rejects altered signatures and Finished before returning secrets" do
+    attrs = input() |> Map.from_struct() |> Map.delete(:records)
+    assert {:ok, initial} = SSL.Protocol.HandshakeCore.start_client(attrs, [])
+    [ee, cert, cv, finished] = captured_messages()
+    assert {:ok, core} = SSL.Protocol.HandshakeCore.process_message(initial, ee)
+    assert {:ok, core} = SSL.Protocol.HandshakeCore.process_message(core, cert)
+
+    assert {:error, {:fatal_alert, :decrypt_error, :invalid_certificate_verify}} =
+             SSL.Protocol.HandshakeCore.process_message(core, flip_last_bit(cv))
+
+    assert {:ok, core} = SSL.Protocol.HandshakeCore.process_message(core, cv)
+
+    assert {:error, {:fatal_alert, :decrypt_error, :invalid_finished}} =
+             SSL.Protocol.HandshakeCore.process_message(core, flip_last_bit(finished))
+
+    refute inspect(core) =~ inspect(core.secrets.master_secret)
+    assert core.input.client_key_pair == nil
+    refute inspect(core) =~ inspect(attrs.client_key_pair.private_key)
+  end
+
+  test "record-free core still requires trust and independent reference identity" do
+    [ee, cert | _] = captured_messages()
+
+    for {overrides, expected} <- [
+          {[identity: {:dns_id, "wrong.example.test"}],
+           {:fatal_alert, :certificate_unknown, :hostname_mismatch}},
+          {[trust_source: @wrong_root_pem], :unknown_ca}
+        ] do
+      attrs = input(overrides) |> Map.from_struct() |> Map.delete(:records)
+      assert {:ok, core} = SSL.Protocol.HandshakeCore.start_client(attrs, [])
+      assert {:ok, core} = SSL.Protocol.HandshakeCore.process_message(core, ee)
+      result = SSL.Protocol.HandshakeCore.process_message(core, cert)
+
+      case expected do
+        :unknown_ca ->
+          assert {:error, {:fatal_alert, :unknown_ca, {:path_validation_failed, _}}} = result
+
+        reason ->
+          assert {:error, ^reason} = result
+      end
+    end
+  end
+
   test "verifies a full SHA-384 transcript with RSA-PSS-RSAE-SHA256" do
     flight =
       SSL.TestServerFlightBuilder.build(

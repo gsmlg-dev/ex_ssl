@@ -2,11 +2,11 @@ defmodule SSL.ClientHello.RecordPolicy do
   @moduledoc """
   Declares record handling for a ClientHello wire profile.
 
-  The foundation model exposes only the protocol-default behavior. Record
-  shaping will be added with the ClientHello materializer.
+  TCP uses `:default`; the record-free QUIC profile uses `:none`. Validation
+  accepts only the modes explicitly allowed by the selected transport.
   """
 
-  @type t :: %__MODULE__{mode: :default}
+  @type t :: %__MODULE__{mode: :default | :none}
 
   defstruct mode: :default
 end
